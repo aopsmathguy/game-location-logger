@@ -1,0 +1,46 @@
+{
+  "manifest_version": 3,
+  "name": "2D Shooter Position Logger",
+  "version": "0.2.0",
+  "description": "Injects into the game page, extracts your position and enemy positions, and logs samples.",
+  "permissions": [
+    "storage",
+    "downloads",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "*://survev.io/*",
+    "*://*.survev.io/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Export position log"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://survev.io/*",
+        "*://*.survev.io/*"
+      ],
+      "js": [
+        "inject.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "*://survev.io/*",
+        "*://*.survev.io/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ]
+}

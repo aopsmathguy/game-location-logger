@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(awk 'BEGIN{RS=\"readUint8\"} {n++} END{print n-1}' /Users/min/MIT/enemy-location-logger/js/qA6nK6ES_formatted.js)",
+      "Bash(awk 'BEGIN{RS=\"readUint8\"} {n++} END{print n-1}' /Users/min/MIT/enemy-location-logger/js/gMx0v6wr_formatted.js)",
+      "Read(//Users/min/MIT/enemy-location-logger/**)",
+      "Bash(grep -o '\\\\.zoom[ =\\\\.]\\\\{0,1\\\\}' js/qA6nK6ES.js)",
+      "Bash(grep -oE 't\\\\.zoom[a-zA-Z]*[^,]{0,30}' js/qA6nK6ES.js)",
+      "Bash(grep -oE '[a-zA-Z_$][a-zA-Z0-9_$]*\\\\.zoom[^a-zA-Z_$]' js/gMx0v6wr.js)",
+      "Bash(grep -oE '.{20}e\\\\.zoom,.{20}' js/gMx0v6wr.js)",
+      "Bash(grep -oE '[a-zA-Z_$][a-zA-Z0-9_$]*\\\\.zoom[^a-zA-Z_$]' js/qA6nK6ES.js)",
+      "Bash(node -e ':*)",
+      "WebFetch(domain:survev.io)",
+      "Bash(curl -s https://survev.io/)",
+      "Bash(curl -s https://survev.io/js/qA6nK6ES.js)",
+      "Bash(curl -s https://survev.io/js/gMx0v6wr.js)",
+      "Bash(grep -oE '[a-zA-Z_$][a-zA-Z0-9_$]*\\\\.zoom[^a-zA-Z_$]' /tmp/gMx0v6wr_live.js)",
+      "Bash(grep -oE '.{30}e\\\\.zoom,.{30}' /tmp/gMx0v6wr_live.js)",
+      "Bash(node --check inject.js)",
+      "Bash(grep -oE 'readUint8\\\\b[^a-zA-Z]{0,30}' /tmp/qA6nK6ES_live.js)",
+      "Bash(grep -oE 'readUint8=[^,}]{0,80}' /tmp/qA6nK6ES_live.js)",
+      "Bash(perl -ne 'while \\(/bullet_\\(\\\\w+\\):\\\\s*\\\\{[^}]*?speed:\\\\s*\\(\\\\d+\\)/g\\) { print \"$1: $2\\\\n\" }' /Users/min/MIT/enemy-location-logger/1/qA6nK6ES_formatted.js)",
+      "Bash(perl -ne 'while \\(/bullet_\\(\\\\w+\\):\\\\s*\\\\{[^}]*?speed:\\\\s*\\(\\\\d+\\)/g\\) { print \"$1: $2\\\\n\" }' /Users/min/MIT/enemy-location-logger/2/D7Ckz5tP_formatted.js)",
+      "Bash(python3 -c \"import jsbeautifier\")",
+      "Bash(pip3 install *)",
+      "Bash(python3 fetch_survev_js.py)",
+      "Bash(awk '/^    [A-Za-z_$][A-Za-z0-9_$]*\\\\s*=\\\\s*class\\\\s*\\\\{/{cur=NR; cls=$0} /init\\\\\\(\\\\\\)\\\\s*\\\\{/{ if \\(NR-cur<200\\) {print cur\": \"cls; print NR\": init\\(\\)\"} }' /Users/min/MIT/enemy-location-logger/js_dump/CizGBfZ6_formatted.js)",
+      "Bash(grep -n \"^    [a-zA-Z_$][a-zA-Z0-9_$]* = class\\\\b\" /Users/min/MIT/enemy-location-logger/js_dump/CizGBfZ6_formatted.js)",
+      "Bash(awk -F: '$1 < 14718 && $1 > 14000')",
+      "Bash(grep -n \"= class\\\\b\\\\|class\\\\s\\\\+[A-Za-z_$]\" /Users/min/MIT/enemy-location-logger/js_dump/CizGBfZ6_formatted.js)",
+      "Bash(awk -F: '$1 < 14718')",
+      "Bash(awk -F: '$1 < 11021 && $1 > 10900')"
+    ]
+  }
+}

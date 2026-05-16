@@ -1,0 +1,58 @@
+{
+    "ts": 1775610502288,
+    "url": "https://survev.io/",
+    "isTop": true,
+    "rootName": "prototypeTrap",
+    "self": {
+        "id": 4999,
+        "x": 289.9,
+        "y": 239.18,
+        "xv": 0,
+        "yv": 0,
+        "dirX": -0.0118,
+        "dirY": -1.0001,
+        "weapon": "fists",
+        "bulletSpeed": null,
+        "teamId": 38,
+        "groupId": 38,
+        "name": "Player-12"
+    },
+    "enemies": [
+        {
+            "id": 4755,
+            "x": 335.96,
+            "y": 230.16,
+            "xv": 0,
+            "yv": 0,
+            "dirX": 0.9923,
+            "dirY": 0.0902,
+            "visible": true,
+            "dead": false,
+            "downed": false,
+            "health": null,
+            "role": "",
+            "layer": 0,
+            "teamId": 1,
+            "groupId": 1,
+            "name": "TheyCallMeGalaxy"
+        },
+        {
+            "id": 4715,
+            "x": 551.31,
+            "y": 557.91,
+            "xv": 0,
+            "yv": 0,
+            "dirX": -0.8746,
+            "dirY": 0.4824,
+            "visible": true,
+            "dead": false,
+            "downed": false,
+            "health": null,
+            "role": "",
+            "layer": 0,
+            "teamId": 2,
+            "groupId": 2,
+            "name": "tmrs are sh!t"
+        }
+    ]
+}
