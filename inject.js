@@ -1202,7 +1202,7 @@
     // [min, ∞). 180±40ms matches typical visual-motor reaction-time
     // research; faster players sit around 130–150ms. alpha=0.05 ⇒ τ≈20s,
     // i.e. reaction drifts slowly across a session.
-    reactionMs:       { mean: 180, std: 40, min: 90, alpha: 0.05 },
+    reactionMs:       { mean: 140, std: 40, min: 90, alpha: 0.05 },
     // Same, but for switching from one engaged target to another. Players
     // already in the loop react faster than fresh acquisitions.
     switchReactionMs: { mean: 130, std: 30, min: 60, alpha: 0.05 },
@@ -1220,14 +1220,14 @@
     // 0.012 rad ≈ 0.7° steady-state deviation. alpha=15 ⇒ τ≈67ms, so the
     // tremor varies smoothly across a few frames instead of flipping sign
     // every frame the way an IID draw would.
-    jitterStd:   0.005,
+    jitterStd:   0.002,
     jitterAlpha: 15,
 
     // Per-acquisition offset added to the lead-predicted angle. Drawn from
     // a walk with stationary N(0, aimErrorStd²); autocorrelation across
     // acquisitions models the player's calibration drifting slowly across
     // the session rather than reshuffling at every target switch.
-    aimErrorStd:   0.005,
+    aimErrorStd:   0.003,
     aimErrorAlpha: 0.05,
 
     // Lead-prediction accuracy: actualLead = perfectLead × leadFactor, where
@@ -1633,6 +1633,115 @@
     e.stopImmediatePropagation();
     e.preventDefault();
   }, true);
+
+  // ---------------------------------------------------------------------
+  // Auto-quickswap after firing a slow-firerate gun. When the user
+  // left-clicks while holding a sniper/shotgun, we synthesize a
+  // SwapWeapSlots keydown so the swap fires on the *next* server tick,
+  // right after the shot input. The game zeroes `gunSwitchCooldown` on
+  // a swap input (see CizGBfZ6 line 14804), so the other gun is ready
+  // to fire as soon as its own switchDelay elapses — materially faster
+  // than waiting out the slow gun's fireDelay. Classic two-gun
+  // quickswitch.
+  // ---------------------------------------------------------------------
+
+  // Guns whose fireDelay (CjGi1tJP.js) is ≥ 0.3s and which fire one shot
+  // per click — the regime where quickswapping beats waiting. Burst-fire
+  // weapons (ump9, famas) are excluded because swapping mid-burst
+  // truncates the remaining shots; auto-fire weapons aren't here because
+  // the user would just keep holding the trigger.
+  const SLOW_FIRE_GUNS = new Set([
+    // Bolt/lever-action rifles + DMRs that aim before firing
+    'mosin', 'sv98', 'awc', 'scout_elite', 'blr', 'model94',
+    // Pump-action and semi-auto shotguns
+    'm870', 'm1100', 'spas12', 'spas16', 'mp220', 'saiga', 'm1014', 'usas',
+  ]);
+
+  // Survev collects inputs once per tick (~16ms) and `flush()` advances
+  // `keysOld := keys` at end-of-tick. A 30ms gap between the user's
+  // mousedown and the swap signal guarantees the Fire input lands on
+  // its own tick *before* the SwapWeapSlots input, so the server shoots
+  // first and swaps second.
+  const AUTO_SWAP_FIRE_TO_SWAP_MS = 30;
+
+  function autoSwapOtherSlotHasGun(me) {
+    try {
+      const slots = me?.NjFD?.EcBDWN;
+      const idx = me?.NjFD?.JMs;
+      if (!Array.isArray(slots) || !Number.isFinite(idx)) return false;
+      const other = slots[idx === 0 ? 1 : 0];
+      return !!(other && typeof other.type === 'string' && other.type);
+    } catch {
+      return false;
+    }
+  }
+
+  // Input enum values from CjGi1tJP_formatted.js:21384. Stable because
+  // these are part of the client/server input protocol.
+  const AUTO_SWAP_INPUT_FIRE = 4;
+  const AUTO_SWAP_INPUT_EQUIP_OTHER = 20;
+
+  // EquipOtherGun has no default keybind (CizGBfZ6_formatted.js:15263)
+  // and no UI-flag analog like SwapWeapSlots does — the bundle only
+  // emits it when `Dmk.isBindPressed(I.EquipOtherGun)` returns true
+  // (line 14789-14793). To trigger it without a bind, we wrap
+  // `isBindPressed` and return true for input 20 the next time the
+  // input loop polls — once, then we clear the flag so we don't keep
+  // emitting EquipOtherGun on every subsequent tick.
+  let autoSwapHookedDmk = null;
+  let autoSwapEmitEquipOther = false;
+
+  function autoSwapEnsureHook(binds) {
+    if (!binds || binds === autoSwapHookedDmk) return;
+    if (typeof binds.isBindPressed !== 'function') return;
+    const orig = binds.isBindPressed;
+    binds.isBindPressed = function(input) {
+      if (input === AUTO_SWAP_INPUT_EQUIP_OTHER && autoSwapEmitEquipOther) {
+        autoSwapEmitEquipOther = false;
+        return true;
+      }
+      return orig.call(this, input);
+    };
+    autoSwapHookedDmk = binds;
+  }
+
+  function autoSwapRequestSwap(game) {
+    autoSwapEnsureHook(game?.Dmk);
+    autoSwapEmitEquipOther = true;
+  }
+
+  // Edge-trigger on the user's Fire bind, whatever key/button that is.
+  // `game.Dmk.isBindDown(4)` is the same source of truth the input loop
+  // reads (CizGBfZ6_formatted.js:14788), so this is keybind-agnostic.
+  let autoSwapFireWasDown = false;
+
+  function autoSwapOnFirePressed(game) {
+    const me = findLocalPlayerOnGame(game);
+    if (!me) { console.log('[autoswap] skip: no local player'); return; }
+    const weapon = getCurrentWeapon(me);
+    if (!weapon) { console.log('[autoswap] skip: no current weapon'); return; }
+    if (!SLOW_FIRE_GUNS.has(weapon)) { console.log(`[autoswap] skip: ${weapon} not in slow-fire set`); return; }
+    if (!autoSwapOtherSlotHasGun(me)) { console.log(`[autoswap] skip: other slot empty (holding ${weapon})`); return; }
+    console.log(`[autoswap] queued swap after ${weapon} shot`);
+    setTimeout(() => autoSwapRequestSwap(game), AUTO_SWAP_FIRE_TO_SWAP_MS);
+  }
+
+  function autoSwapFrameTick() {
+    try {
+      const game = capturedGame;
+      const binds = game?.Dmk;
+      if (binds && typeof binds.isBindDown === 'function') {
+        autoSwapEnsureHook(binds);
+        const isDown = !!binds.isBindDown(AUTO_SWAP_INPUT_FIRE);
+        if (isDown && !autoSwapFireWasDown) autoSwapOnFirePressed(game);
+        autoSwapFireWasDown = isDown;
+      } else {
+        autoSwapFireWasDown = false;
+      }
+    } catch {}
+    requestAnimationFrame(autoSwapFrameTick);
+  }
+  requestAnimationFrame(autoSwapFrameTick);
 
   // ---------------------------------------------------------------------
   // Target overlay: a fixed-position canvas above the game canvas that

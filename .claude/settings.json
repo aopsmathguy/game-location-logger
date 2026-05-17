@@ -29,7 +29,8 @@
       "Bash(awk -F: '$1 < 14718 && $1 > 14000')",
       "Bash(grep -n \"= class\\\\b\\\\|class\\\\s\\\\+[A-Za-z_$]\" /Users/min/MIT/enemy-location-logger/js_dump/CizGBfZ6_formatted.js)",
       "Bash(awk -F: '$1 < 14718')",
-      "Bash(awk -F: '$1 < 11021 && $1 > 10900')"
+      "Bash(awk -F: '$1 < 11021 && $1 > 10900')",
+      "Bash(awk '/fireDelay:/ {match\\($0, /fireDelay: ?\\([0-9.e]+\\)/, m\\); print NR, m[1]}' /Users/min/MIT/enemy-location-logger/js_dump/CjGi1tJP_formatted.js)"
     ]
   }
 }
