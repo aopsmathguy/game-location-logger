@@ -1,6 +1,36 @@
 (() => {
   const SOURCE = 'enemy-location-logger';
   // console.log(`[${SOURCE}] inject.js HEAD reached, url=${location.href}, isTop=${window.top === window}`);
+
+  // Mangled-name dictionary loaded from mangled.js (which runs before us
+  // via the manifest's content_scripts ordering). Every survev bundle
+  // identifier we depend on flows through this object — when survev
+  // re-mangles, mangled.js is the only file that needs updating.
+  const M = window.__SURVEV_MANGLED__;
+  if (!M) {
+    console.error(`[${SOURCE}] mangled.js did not run before inject.js — aborting`);
+    return;
+  }
+  // Local short aliases. The semantic name is on the left (kept stable
+  // across bundle re-mangles); the value on the right is the current
+  // mangled key we use for bracket-access. Don't add raw mangled string
+  // literals anywhere else in this file.
+  const PLAYER_NET   = M.player.netData;
+  const PLAYER_LOC   = M.player.localData;
+  const PLAYER_POS   = M.player.pos;
+  const PLAYER_DIR   = M.player.dir;
+  const PLAYER_POS2  = M.player.posAlt;
+  const NET_WEAPON   = M.netData.activeWeapon;
+  const NET_DEAD     = M.netData.dead;
+  const NET_DOWNED   = M.netData.downed;
+  const LOC_ZOOM     = M.localData.zoom;
+  const LOC_CURIDX   = M.localData.curWeapIdx;
+  const LOC_SLOTS    = M.localData.weapons;
+  const GAME_LOCAL   = M.game.localPlayer;
+  const GAME_ROSTER  = M.game.roster;
+  const GAME_BINDS   = M.game.inputBinds;
+  const POOL_GETALL  = M.pool.getAll;
+
   const SAMPLE_MS = 20;
   const STATUS_MS = 3000;
   const DEEP_SEARCH_MS = 4000;
@@ -19,10 +49,11 @@
   const prevSample = new Map();
   const PREV_SAMPLE_TTL_MS = 5000;
 
-  // gun type (as stored in `me.TUfS.yCa`) -> projectile speed in world
-  // units/sec, derived offline from the survev client bundle:
-  //   - js_dump/CjGi1tJP.js holds the bullet definitions (`bullet_xxx: { speed: NN }`)
-  //   - js_dump/CizGBfZ6.js gun definitions reference these via `bulletType`
+  // gun type (as stored in `me[netData].activeWeapon` — see mangled.js)
+  // -> projectile speed in world units/sec, derived offline from the
+  // survev client bundle:
+  //   - the asset/definitions dump holds bullet defs (`bullet_xxx: { speed: NN }`)
+  //   - the gameplay dump's gun definitions reference these via `bulletType`
   // Melees, throwables, and fists are intentionally absent — they have no
   // projectile, and the lookup will return undefined. Dual variants share
   // their base gun's bullet, so they share its speed. This table is static
@@ -96,14 +127,14 @@
   }
 
   function getCurrentWeapon(me) {
-    // `TUfS.yCa` is the active weapon string (e.g. "ak47", "fists",
-    // "machete"). Falls back to walking the slot array (`NjFD.EcBDWN[JMs]`)
+    // netData.activeWeapon is the active weapon string (e.g. "ak47",
+    // "fists", "machete"). Falls back to walking localData.weapons[curWeapIdx]
     // in case the network field hasn't propagated yet.
     try {
-      const fromBzo = me?.TUfS?.yCa;
-      if (typeof fromBzo === 'string' && fromBzo) return fromBzo;
-      const slots = me?.NjFD?.EcBDWN;
-      const idx = me?.NjFD?.JMs;
+      const fromNet = me?.[PLAYER_NET]?.[NET_WEAPON];
+      if (typeof fromNet === 'string' && fromNet) return fromNet;
+      const slots = me?.[PLAYER_LOC]?.[LOC_SLOTS];
+      const idx = me?.[PLAYER_LOC]?.[LOC_CURIDX];
       if (Array.isArray(slots) && Number.isFinite(idx)) {
         const slot = slots[idx];
         if (slot && typeof slot.type === 'string') return slot.type;
@@ -114,13 +145,13 @@
 
   const SCOPE_PATTERN = /^(?:1|2|4|8|15)xscope$/;
 
-  // The active scope string lives on the local player's localData (`NjFD`) or
-  // netData (`TUfS`) under a mangled key we don't know up-front. Walk both
+  // The active scope string lives on the local player's localData or
+  // netData under a mangled key we don't know up-front. Walk both
   // objects' own enumerable string fields looking for any value that matches
   // the scope pattern — adapts automatically across bundle re-mangles.
   function getCurrentScope(me) {
     try {
-      const sources = [me?.NjFD, me?.TUfS, me];
+      const sources = [me?.[PLAYER_LOC], me?.[PLAYER_NET], me];
       for (const src of sources) {
         if (!src || typeof src !== 'object') continue;
         const keys = Object.keys(src);
@@ -171,16 +202,16 @@
   const SCOPE_RADIUS_TABLE = IS_MOBILE_DEVICE ? SCOPE_RADIUS_MOBILE : SCOPE_RADIUS_DESKTOP;
 
   // Set of every legitimate radius across both tables. Used by the direct
-  // NjFD scan below to recognize the zoom field by its value rather than its
-  // (mangled) name.
+  // localData scan below to recognize the zoom field by its value rather
+  // than its (mangled) name.
   const ALL_SCOPE_RADII = new Set([
     ...Object.values(SCOPE_RADIUS_DESKTOP),
     ...Object.values(SCOPE_RADIUS_MOBILE)
   ]);
 
   // Cached mangled key for `m_localData.m_zoom` once we've identified it on
-  // a particular NjFD shape. Reset whenever we swap captured games (different
-  // round / respawn — see swapCapturedGame).
+  // a particular localData shape. Reset whenever we swap captured games
+  // (different round / respawn — see swapCapturedGame).
   let cachedZoomKey = null;
   // Cached mangled own-prop name on the game (Rr) that holds the Camera
   // instance, and the mangled name on the camera for m_zoom. Also reset on
@@ -189,16 +220,16 @@
   let cachedCameraZoomKey = null;
 
   // Read the current scope radius (world units) from the active player's
-  // localData. The bundle stores it via `this.NjFD.<mangled> = e.zoom` (see
-  // js_dump/CizGBfZ6.js — currently `gfAvB`, but we don't pin the name). We scan
-  // for an own number-valued prop whose value matches the EXPECTED radius
-  // for the current scope string — that disambiguates against health/boost,
-  // which can also legitimately equal 40 for mobile 2xscope users at 40%.
-  // Returns null if we can't find it; callers fall back to the table lookup.
+  // localData. The bundle stores it via `this[localData][<mangled>] = e.zoom`.
+  // We scan for an own number-valued prop whose value matches the EXPECTED
+  // radius for the current scope string — that disambiguates against
+  // health/boost, which can also legitimately equal 40 for mobile 2xscope
+  // users at 40%. Returns null if we can't find it; callers fall back to
+  // the table lookup.
   function readZoomRadiusFromPlayer(me, scope) {
     const expected = SCOPE_RADIUS_TABLE[scope];
     if (expected == null) return null;
-    const lzr = me?.NjFD;
+    const lzr = me?.[PLAYER_LOC];
     if (!lzr || typeof lzr !== 'object') return null;
     try {
       if (cachedZoomKey) {
@@ -223,7 +254,7 @@
   }
 
   // Locate the Camera instance on a captured game. The bundle's Camera class
-  // (survev client/src/camera.ts, mangled to `ct` in js_dump/CizGBfZ6.js) has a
+  // (survev client/src/camera.ts, mangled to `ct` in the gameplay bundle) has a
   // very distinct shape: a ppu field initialized to 16, two zoom scalars
   // both initialized to 1.5, and a Vec2 pos. We match by that shape rather
   // than by a pinned mangled name so we survive re-mangling.
@@ -341,7 +372,7 @@
       const game = capturedGame;
       if (game) {
         stage = 'no-player';
-        me = findLocalPlayerOnGame(game) || game?.zSsh || null;
+        me = findLocalPlayerOnGame(game) || game?.[GAME_LOCAL] || null;
         if (me) {
           stage = 'player';
           scope = getCurrentScope(me) || '1xscope';
@@ -368,7 +399,8 @@
   // module-private `var` inside an ES module bundle, so it is not reachable
   // by walking from window/document/canvas. We install a setter trap on
   // Object.prototype for properties that the Rr constructor body assigns
-  // from positional params (`this.WNNSH = e, this.iTj = t, ...`), but which
+  // from positional params (`this.<A> = e, this.<B> = t, ...` — names live
+  // in mangled.js's `seedNames`), but which
   // are NOT pre-declared as class fields — so those assignments walk the
   // prototype chain and fire our setter with `this` = the new game instance.
   // We verify shape before capturing to avoid false positives, then restore
@@ -466,7 +498,8 @@
 
   function looksLikeGame(obj) {
     // An Rr instance holds the roster on one of its own minified fields
-    // (currently `DaWsN`), so we don't anchor on the field NAME — we anchor
+    // (mapped by mangled.js as `game.roster`), so we don't anchor on the
+    // field NAME — we anchor
     // on the field VALUE shape. This survives any future re-mangling of
     // Rr's fields. We scan a bounded number of own props to avoid pathology.
     try {
@@ -513,7 +546,7 @@
           });
           if (this === capturedGame) return;
           // The trap fires on the FIRST line of Rr's constructor body, at
-          // which point the roster (`DaWsN = new tr(...)`) has not been
+          // which point the roster (`<roster> = new tr(...)`) has not been
           // assigned yet — so a synchronous shape check would always fail.
           // Stash the candidate and re-check post-microtask, after the
           // constructor body has finished. The sample loop also re-checks
@@ -538,14 +571,9 @@
   }
 
   function installGameCaptureTrap() {
-    // Seed list: every property name the Rr constructor body assigns from a
-    // positional parameter. Verified against js_dump/CizGBfZ6.js bundle. If
-    // survev re-mangles, the runtime discovery pass below will add more.
-    const seedNames = [
-      'WNNSH', 'iTj', 'ntj', 'TrCLH', 'evqDZ',
-      'Dmk', 'Qepa', 'ugKI', 'eOhlCd'
-    ];
-    for (const name of seedNames) installTrapName(name);
+    // Seed list lives in mangled.js (`seedNames`). If survev re-mangles,
+    // the runtime discovery pass below will add more on top of these.
+    for (const name of M.seedNames) installTrapName(name);
   }
 
   // Async fallback: fetch every <script src> on the page, parse class
@@ -878,16 +906,16 @@
     const game = found.game;
     // Prefer the value-shape lookup over the minified field name; fall back
     // to the minified name only if the walk fails (defensive belt-and-braces).
-    const roster = findRosterOnGame(game) || game?.DaWsN;
+    const roster = findRosterOnGame(game) || game?.[GAME_ROSTER];
     if (!roster) return { reason: 'no-roster' };
 
-    const me = findLocalPlayerOnGame(game) || game?.zSsh;
+    const me = findLocalPlayerOnGame(game) || game?.[GAME_LOCAL];
     if (!me) return { reason: 'no-player' };
 
     const selfId = Number(me.__id ?? me.playerId ?? 0) || null;
-    const selfPos = getXY(me.rvyyT ?? me.pos);
+    const selfPos = getXY(me[PLAYER_POS] ?? me.pos);
     if (!selfPos) return { reason: 'no-pos', selfId };
-    const selfDir = getDir(me.EZOCU);
+    const selfDir = getDir(me[PLAYER_DIR]);
     const sampleTs = Date.now();
     const selfVel = selfId != null
       ? deriveVelocity(selfId, selfPos.x, selfPos.y, sampleTs)
@@ -911,13 +939,14 @@
     const playerStatus = roster.playerStatus ?? {};
     const selfStatus = selfId != null ? playerStatus[selfId] || null : null;
 
-    // Enemies live in the Player entity pool (`DaWsN.playerPool`), not in
-    // `playerStatus`. `playerStatus` only carries minimap state for players on
-    // the local team — it never contains enemies in non-faction modes. The
-    // pool, on the other hand, holds the actual Player objects that the server
-    // has streamed to us (i.e. enemies currently within view radius).
+    // Enemies live in the Player entity pool (`roster.playerPool` — `playerPool`
+    // is a real readable name on `tr`), not in `playerStatus`. `playerStatus`
+    // only carries minimap state for players on the local team — it never
+    // contains enemies in non-faction modes. The pool, on the other hand,
+    // holds the actual Player objects that the server has streamed to us
+    // (i.e. enemies currently within view radius).
     const pool = roster.playerPool;
-    const players = (pool && typeof pool.PcLNdX === 'function' ? pool.PcLNdX() : []) || [];
+    const players = (pool && typeof pool[POOL_GETALL] === 'function' ? pool[POOL_GETALL]() : []) || [];
     const enemies = [];
     const seenIds = new Set();
 
@@ -936,9 +965,9 @@
 
       if (sameGroup || sameTeam) continue;
 
-      const pos = getXY(player.rvyyT ?? player.iUBbYp);
+      const pos = getXY(player[PLAYER_POS] ?? player[PLAYER_POS2]);
       if (!pos) continue;
-      const dir = getDir(player.EZOCU);
+      const dir = getDir(player[PLAYER_DIR]);
 
       // The Player entity doesn't carry health directly; pull it from
       // playerStatus if a minimap entry happens to exist (faction modes,
@@ -956,13 +985,10 @@
         dirX: dir ? dir.x : null,
         dirY: dir ? dir.y : null,
         visible: true,
-        // The Player class has no own `dead`/`downed` fields — they live on
-        // the netData object (`TUfS`) under mangled names. Bundle source:
-        //   `r.dead  = s.TUfS.IAdYkx`
-        //   `r.downed = s.TUfS.QXz`
-        // (`TUfS` is the same netData we already use for `getCurrentWeapon`.)
-        dead: Boolean(player.TUfS?.IAdYkx),
-        downed: Boolean(player.TUfS?.QXz ?? player.downed),
+        // The Player class has no own `dead`/`downed` fields — they live
+        // on the netData object (same one we use for getCurrentWeapon).
+        dead: Boolean(player[PLAYER_NET]?.[NET_DEAD]),
+        downed: Boolean(player[PLAYER_NET]?.[NET_DOWNED] ?? player.downed),
         health: status && typeof status.health === 'number' ? Number(status.health.toFixed(2)) : null,
         role: status?.role || '',
         layer: Number.isFinite(player.layer) ? player.layer : null,
@@ -1041,8 +1067,8 @@
         // built a sample otherwise); the rest are pulled from the same
         // sources we use for enemies.
         visible: true,
-        dead: Boolean(me.TUfS?.IAdYkx),
-        downed: Boolean(me.TUfS?.QXz ?? me.downed),
+        dead: Boolean(me[PLAYER_NET]?.[NET_DEAD]),
+        downed: Boolean(me[PLAYER_NET]?.[NET_DOWNED] ?? me.downed),
         health: selfStatus && typeof selfStatus.health === 'number' ? Number(selfStatus.health.toFixed(2)) : null,
         role: selfStatus?.role || '',
         layer: Number.isFinite(me.layer) ? me.layer : null,
@@ -1087,7 +1113,7 @@
         const reason = sample?.reason || 'unknown';
         const messageByReason = {
           'no-roster': 'Game captured, but the roster (`tr`) is not on it. The bundle field shape may have changed.',
-          'no-player': 'Game captured, but the local player slot is null. Click Play and join a match — `zSsh` only gets populated when the first server update arrives.',
+          'no-player': 'Game captured, but the local player slot is null. Click Play and join a match — `game.localPlayer` only gets populated when the first server update arrives.',
           'no-pos': 'Local player exists, but has no position vector yet. The first server update may not have arrived.',
           'unknown': 'Game found, but sample build failed for an unknown reason.'
         };
@@ -1639,13 +1665,13 @@
   // left-clicks while holding a sniper/shotgun, we synthesize a
   // SwapWeapSlots keydown so the swap fires on the *next* server tick,
   // right after the shot input. The game zeroes `gunSwitchCooldown` on
-  // a swap input (see CizGBfZ6 line 14804), so the other gun is ready
+  // a swap input (server zeros gunSwitchCooldown on SwapWeapSlots), so the other gun is ready
   // to fire as soon as its own switchDelay elapses — materially faster
   // than waiting out the slow gun's fireDelay. Classic two-gun
   // quickswitch.
   // ---------------------------------------------------------------------
 
-  // Guns whose fireDelay (CjGi1tJP.js) is ≥ 0.3s and which fire one shot
+  // Guns whose fireDelay (in the asset/definitions dump) is ≥ 0.3s and which fire one shot
   // per click — the regime where quickswapping beats waiting. Burst-fire
   // weapons (ump9, famas) are excluded because swapping mid-burst
   // truncates the remaining shots; auto-fire weapons aren't here because
@@ -1666,8 +1692,8 @@
 
   function autoSwapOtherSlotHasGun(me) {
     try {
-      const slots = me?.NjFD?.EcBDWN;
-      const idx = me?.NjFD?.JMs;
+      const slots = me?.[PLAYER_LOC]?.[LOC_SLOTS];
+      const idx = me?.[PLAYER_LOC]?.[LOC_CURIDX];
       if (!Array.isArray(slots) || !Number.isFinite(idx)) return false;
       const other = slots[idx === 0 ? 1 : 0];
       return !!(other && typeof other.type === 'string' && other.type);
@@ -1676,15 +1702,15 @@
     }
   }
 
-  // Input enum values from CjGi1tJP_formatted.js:21384. Stable because
+  // Input enum values from the asset/definitions dump. Stable because
   // these are part of the client/server input protocol.
   const AUTO_SWAP_INPUT_FIRE = 4;
   const AUTO_SWAP_INPUT_EQUIP_OTHER = 20;
 
-  // EquipOtherGun has no default keybind (CizGBfZ6_formatted.js:15263)
-  // and no UI-flag analog like SwapWeapSlots does — the bundle only
-  // emits it when `Dmk.isBindPressed(I.EquipOtherGun)` returns true
-  // (line 14789-14793). To trigger it without a bind, we wrap
+  // EquipOtherGun has no default keybind in the bundle and no UI-flag
+  // analog like SwapWeapSlots does — the bundle only emits it when
+  // `game[inputBinds].isBindPressed(N.EquipOtherGun)` returns true in
+  // the input loop. To trigger it without a bind, we wrap
   // `isBindPressed` and return true for input 20 the next time the
   // input loop polls — once, then we clear the flag so we don't keep
   // emitting EquipOtherGun on every subsequent tick.
@@ -1706,13 +1732,13 @@
   }
 
   function autoSwapRequestSwap(game) {
-    autoSwapEnsureHook(game?.Dmk);
+    autoSwapEnsureHook(game?.[GAME_BINDS]);
     autoSwapEmitEquipOther = true;
   }
 
   // Edge-trigger on the user's Fire bind, whatever key/button that is.
-  // `game.Dmk.isBindDown(4)` is the same source of truth the input loop
-  // reads (CizGBfZ6_formatted.js:14788), so this is keybind-agnostic.
+  // `game[inputBinds].isBindDown(4)` is the same source of truth the
+  // input loop reads, so this is keybind-agnostic.
   let autoSwapFireWasDown = false;
 
   function autoSwapOnFirePressed(game) {
@@ -1729,7 +1755,7 @@
   function autoSwapFrameTick() {
     try {
       const game = capturedGame;
-      const binds = game?.Dmk;
+      const binds = game?.[GAME_BINDS];
       if (binds && typeof binds.isBindDown === 'function') {
         autoSwapEnsureHook(binds);
         const isDown = !!binds.isBindDown(AUTO_SWAP_INPUT_FIRE);

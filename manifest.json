@@ -25,6 +25,7 @@
         "*://*.survev.io/*"
       ],
       "js": [
+        "mangled.js",
         "inject.js"
       ],
       "run_at": "document_start",
