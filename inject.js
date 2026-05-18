@@ -1208,6 +1208,20 @@
     const meanLen = Math.hypot(cx, cy) / n;
     return meanLen > SPOOF_BEARING_LOCK;
   }
+  // Survev layer semantics: 0 = aboveground, 1 = underground (bunker),
+  // 2/3 = stair/transition (visible from both). A player on layer 0 can't
+  // see/hit a player on layer 1 and vice versa; players on 2/3 can interact
+  // with both. Returns true when bullets/melee from self can reach enemy.
+  // Treats a null layer as 0 (the survev default for spawn).
+  function canInteract(selfLayer, enemyLayer) {
+    const s = Number.isFinite(selfLayer) ? selfLayer : 0;
+    const e = Number.isFinite(enemyLayer) ? enemyLayer : 0;
+    if (s === 2 || s === 3) return true;
+    if (s === 0) return e !== 1;
+    if (s === 1) return e !== 0;
+    return true;
+  }
+
   // Humanization parameters for the auto-aim. All angles are radians, all
   // times are milliseconds. Tunable live from devtools via `window.__aimHuman`
   // (assigned just below). The point of this block is to give the cheat a
@@ -1424,6 +1438,7 @@
     for (const e of enemies) {
       if (e.dead) continue;
       if (isSpoofedEnemy(e.id, pageSamples)) continue;
+      if (!canInteract(player.layer, e.layer)) continue;
       candidates.push(e);
     }
     if (!candidates.length) return [null, 0];
@@ -1705,25 +1720,28 @@
   // Input enum values from the asset/definitions dump. Stable because
   // these are part of the client/server input protocol.
   const AUTO_SWAP_INPUT_FIRE = 4;
+  const AUTO_SWAP_INPUT_EQUIP_MELEE = 13;
+  const AUTO_SWAP_INPUT_EQUIP_LAST = 19;
   const AUTO_SWAP_INPUT_EQUIP_OTHER = 20;
 
-  // EquipOtherGun has no default keybind in the bundle and no UI-flag
-  // analog like SwapWeapSlots does — the bundle only emits it when
-  // `game[inputBinds].isBindPressed(N.EquipOtherGun)` returns true in
-  // the input loop. To trigger it without a bind, we wrap
-  // `isBindPressed` and return true for input 20 the next time the
-  // input loop polls — once, then we clear the flag so we don't keep
-  // emitting EquipOtherGun on every subsequent tick.
+  // These inputs have no default keybind in the bundle and no UI-flag
+  // analog like SwapWeapSlots does — the bundle only emits them when
+  // `game[inputBinds].isBindPressed(N.<Input>)` returns true in
+  // the input loop. To trigger one without a bind, we wrap
+  // `isBindPressed` and return true for the queued input the next time
+  // the input loop polls it — once, then we drop it from the set so we
+  // don't keep emitting it on every subsequent tick. Using a Set makes
+  // this independent of which keybinds (if any) the user has assigned.
   let autoSwapHookedDmk = null;
-  let autoSwapEmitEquipOther = false;
+  const autoSwapPendingInputs = new Set();
 
   function autoSwapEnsureHook(binds) {
     if (!binds || binds === autoSwapHookedDmk) return;
     if (typeof binds.isBindPressed !== 'function') return;
     const orig = binds.isBindPressed;
     binds.isBindPressed = function(input) {
-      if (input === AUTO_SWAP_INPUT_EQUIP_OTHER && autoSwapEmitEquipOther) {
-        autoSwapEmitEquipOther = false;
+      if (autoSwapPendingInputs.has(input)) {
+        autoSwapPendingInputs.delete(input);
         return true;
       }
       return orig.call(this, input);
@@ -1731,9 +1749,9 @@
     autoSwapHookedDmk = binds;
   }
 
-  function autoSwapRequestSwap(game) {
+  function autoSwapEmitInput(game, input) {
     autoSwapEnsureHook(game?.[GAME_BINDS]);
-    autoSwapEmitEquipOther = true;
+    autoSwapPendingInputs.add(input);
   }
 
   // Edge-trigger on the user's Fire bind, whatever key/button that is.
@@ -1747,9 +1765,25 @@
     const weapon = getCurrentWeapon(me);
     if (!weapon) { console.log('[autoswap] skip: no current weapon'); return; }
     if (!SLOW_FIRE_GUNS.has(weapon)) { console.log(`[autoswap] skip: ${weapon} not in slow-fire set`); return; }
-    if (!autoSwapOtherSlotHasGun(me)) { console.log(`[autoswap] skip: other slot empty (holding ${weapon})`); return; }
-    console.log(`[autoswap] queued swap after ${weapon} shot`);
-    setTimeout(() => autoSwapRequestSwap(game), AUTO_SWAP_FIRE_TO_SWAP_MS);
+    if (autoSwapOtherSlotHasGun(me)) {
+      // Two-gun case: swap to the other gun. SwapWeapSlots/EquipOtherGun
+      // resets gunSwitchCooldown so the other gun is ready as soon as
+      // its own switchDelay elapses — beats waiting out the slow gun's
+      // fireDelay.
+      console.log(`[autoswap] queued swap after ${weapon} shot`);
+      setTimeout(() => autoSwapEmitInput(game, AUTO_SWAP_INPUT_EQUIP_OTHER), AUTO_SWAP_FIRE_TO_SWAP_MS);
+    } else {
+      // Single-gun case: tap melee then return to the gun via
+      // EquipLastWeap. Same gunSwitchCooldown-reset trick — switching
+      // to melee cancels the slow gun's post-fire animation, and
+      // EquipLastWeap brings us back without depending on which slot
+      // index the gun lives in. Stagger the two inputs by one tick
+      // each so Fire/EquipMelee/EquipLastWeap each land on their own
+      // server tick in order.
+      console.log(`[autoswap] queued melee-tap after ${weapon} shot`);
+      setTimeout(() => autoSwapEmitInput(game, AUTO_SWAP_INPUT_EQUIP_MELEE), AUTO_SWAP_FIRE_TO_SWAP_MS);
+      setTimeout(() => autoSwapEmitInput(game, AUTO_SWAP_INPUT_EQUIP_LAST), AUTO_SWAP_FIRE_TO_SWAP_MS * 2);
+    }
   }
 
   function autoSwapFrameTick() {
@@ -1893,9 +1927,12 @@
 
     // While engaged, show the actual committed target (respects stickiness,
     // including the dead-linger window when we're still pinned to a corpse).
+    // If the committed target has become unreachable (layer transition),
+    // fall through to fresh selection so the overlay matches the lock-on
+    // filter in pickTarget.
     if (shiftHeld && aimState.targetId != null) {
       const committed = enemies.find((e) => e.id === aimState.targetId);
-      if (committed && !committed.dead) return committed;
+      if (committed && !committed.dead && canInteract(player.layer, committed.layer)) return committed;
       if (
         committed && committed.dead &&
         aimState.targetDeadAt &&
@@ -1921,6 +1958,7 @@
       if (e.dead) continue;
       if (e.name === "VERY BAD AT GAME") continue;
       if (isSpoofedEnemy(e.id, pageSamples)) continue;
+      if (!canInteract(player.layer, e.layer)) continue;
       const dx = e.x - mwx;
       const dy = e.y - mwy;
       const s = dx * dx + dy * dy;
@@ -1956,7 +1994,9 @@
 
       // Draw a ring around every live enemy so the user can see threats at a
       // glance. The current aim target is drawn last in green so it stays on top.
-      // Downed players get a yellow ring.
+      // Downed players get a yellow ring. Enemies on a layer we can't reach
+      // (e.g. they're in a bunker while we're aboveground) are dimmed to
+      // alpha=0.5 to signal that they're not lockable.
       for (const e of sample.enemies) {
         if (e.dead) continue;
         if (isSpoofedEnemy(e.id, pageSamples)) continue;
@@ -1964,8 +2004,12 @@
         const ei = interpPos(e.id, e.x, e.y);
         const sx = cx + (ei.x - pi.x) * scale;
         const sy = cy - (ei.y - pi.y) * scale;
-        const ringColor = e.downed ? 'rgba(255, 220, 40, 0.90)' : 'rgba(255, 60, 60, 0.85)';
-        const lineColor = e.downed ? 'rgba(255, 220, 40, 0.50)' : 'rgba(255, 60, 60, 0.45)';
+        const reachable = canInteract(player.layer, e.layer);
+        const colorRgb = e.downed ? '255, 220, 40' : '255, 60, 60';
+        const ringAlpha = reachable ? 1 : 0.5;
+        const lineAlpha = reachable ? 0.6 : 0.3;
+        const ringColor = `rgba(${colorRgb}, ${ringAlpha})`;
+        const lineColor = `rgba(${colorRgb}, ${lineAlpha})`;
         ctx.lineWidth = 4;
         ctx.strokeStyle = ringColor;
         ctx.beginPath();
@@ -1973,7 +2017,7 @@
         ctx.stroke();
 
         // Line from player (center) to enemy
-        ctx.lineWidth = 1.5;
+        ctx.lineWidth = 3;
         ctx.strokeStyle = lineColor;
         ctx.beginPath();
         ctx.moveTo(cx, cy);
@@ -1993,7 +2037,7 @@
         ctx.stroke();
 
         // Line from player (center) to aim target
-        ctx.lineWidth = 1.5;
+        ctx.lineWidth = 3;
         ctx.strokeStyle = 'rgba(64, 255, 89, 0.55)';
         ctx.beginPath();
         ctx.moveTo(cx, cy);

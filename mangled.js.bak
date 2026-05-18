@@ -20,9 +20,9 @@ window.__SURVEV_MANGLED__ = {
   player: {
     netData:   'qJm',
     localData: 'TXaUHs',
-    pos:       'pos',
+    pos:       'lxf',
     dir:       'vNoOA',
-    posAlt:    'posTarget',
+    posAlt:    'Iyc',
   },
 
   // ---- Player.netData (the sub-object named by player.netData above) ----
