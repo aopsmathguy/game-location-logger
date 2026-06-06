@@ -1222,113 +1222,32 @@
     return true;
   }
 
-  // Humanization parameters for the auto-aim. All angles are radians, all
-  // times are milliseconds. Tunable live from devtools via `window.__aimHuman`
-  // (assigned just below). The point of this block is to give the cheat a
-  // real player's behavioral fingerprint — reaction latency, biomechanical
-  // jitter, imperfect lead, target stickiness — so a behavioral anti-cheat
-  // can't trivially flag the perfectly-locked, zero-latency snap profile.
+  // Auto-aim humanization. Tunable live from devtools via `window.__aimHuman`.
   const AIM_HUMAN = {
-    // All quantities below that previously drew an IID gaussian sample now
-    // come from an Ornstein–Uhlenbeck-style AR(1) walk whose stationary
-    // distribution is the same N(mean, std²) the IID draw used to target.
-    // Each walk has its own relaxation rate `alpha` (1/sec) — larger alpha
-    // means faster reversion to the mean (shorter autocorrelation time
-    // τ ≈ 1/alpha). Temporally correlated noise matches real human traits
-    // (hand tremor, miscalibration, reaction time) better than white noise.
-    //
-    // Reaction delay between target acquisition and the cursor starting to
-    // move. Drawn from a walk with stationary N(mean, std²), clamped to
-    // [min, ∞). 180±40ms matches typical visual-motor reaction-time
-    // research; faster players sit around 130–150ms. alpha=0.05 ⇒ τ≈20s,
-    // i.e. reaction drifts slowly across a session.
-    reactionMs:       { mean: 140, std: 40, min: 90, alpha: 0.05 },
-    // Same, but for switching from one engaged target to another. Players
-    // already in the loop react faster than fresh acquisitions.
-    switchReactionMs: { mean: 130, std: 30, min: 60, alpha: 0.05 },
-
-    // Maximum angular speed of the cursor in rad/sec. Caps how fast we can
-    // rotate the aim — equivalent to a real player's mouse sensitivity ceiling.
-    // 14 rad/s ≈ 800 deg/s, fast but well within human reach.
-    maxAngularSpeed: 28,
-    // Per-frame fraction of the remaining angular distance to traverse.
-    // With ~16ms RAF, 0.22 closes ~90% of the gap in ~160ms — a fast
-    // human flick-then-track curve.
-    followGain: 0.22,
-
-    // Per-frame noise added to the cursor angle. Models hand tremor.
-    // 0.012 rad ≈ 0.7° steady-state deviation. alpha=15 ⇒ τ≈67ms, so the
-    // tremor varies smoothly across a few frames instead of flipping sign
-    // every frame the way an IID draw would.
-    jitterStd:   0.002,
-    jitterAlpha: 15,
-
-    // Per-acquisition offset added to the lead-predicted angle. Drawn from
-    // a walk with stationary N(0, aimErrorStd²); autocorrelation across
-    // acquisitions models the player's calibration drifting slowly across
-    // the session rather than reshuffling at every target switch.
-    aimErrorStd:   0.003,
-    aimErrorAlpha: 0.05,
-
-    // Lead-prediction accuracy: actualLead = perfectLead × leadFactor, where
-    // leadFactor follows a walk with stationary N(leadFactorMean,
-    // leadFactorStd²), clamped to [0, 1.5]. <1 means under-leading
-    // (typical), >1 means over-leading.
-    leadFactorMean:  0.9,
-    leadFactorStd:   0.15,
-    leadFactorAlpha: 0.05,
-
-    // Target stickiness. Once committed, prefer the current target over a
-    // newly-nearest one unless the new target is at least `switchAdvantage`×
-    // closer. Combined with a minimum hold time.
-    switchAdvantage: 0.70,
-    stickyMs:        500,
-
-    // After the committed target dies, keep the cursor pinned to the corpse
-    // for this long before allowing a switch. Models a real player's
-    // follow-through — humans don't instantly flick away from a kill, they
-    // confirm it for a beat first.
-    deadLingerMs:    400,
-
-    // Idle behavior when no target is visible: the cursor's "desired"
-    // angle drifts around theta along a walk with stationary N(0,
-    // idleWanderStd²). alpha=3 ⇒ τ≈333ms, producing a wandering gaze
-    // rather than a frame-by-frame jitter.
-    idleWanderStd:   0.15,
-    idleWanderAlpha: 3,
-
-    // NOTE: the visible-world width is derived per-frame from the player's
-    // current scope radius (see getViewportWorldUnits above) and published
-    // on `sample.self.viewportWorldUnits`. Downstream scoring reads it from
-    // there instead of a static config value.
+    // Human reaction delay, in ms. We aim using the enemy's state as it was
+    // perceived this many ms ago, then extrapolate that perceived state
+    // *forward* by the same delay along its then-velocity. Net effect: a
+    // target moving at constant velocity is tracked perfectly (the forward
+    // extrapolation exactly cancels the lag), and only a *change* in the
+    // target's motion is reacted to — lagged by reactionMs. "Perfect aim
+    // given lag."
+    reactionMs: 140,
+    // Fraction of the remaining world-space distance between the aim point
+    // and the target point that we close per reference frame (AIM_REF_DT).
+    // dt-corrected each frame so the closing rate is frame-rate independent.
+    // 1.0 ⇒ instant snap; smaller ⇒ a slower glide onto the target.
+    followFraction: 0.30,
   };
-  // Expose for live tuning from the devtools console without reloading.
   window.__aimHuman = AIM_HUMAN;
+  // Frame time the followFraction is calibrated against (60fps).
+  const AIM_REF_DT = 1 / 60;
 
-  // Persistent aim state across animation frames.
   const aimState = {
-    theta: 0,                              // current cursor angle (world space)
-    targetId: null,                        // currently committed enemy id
-    targetAcquiredAt: 0,                   // ms when we committed to current target
-    targetDeadAt: 0,                       // ms when committed target was first seen dead (0 if alive)
-    reactionUntil: 0,                      // ms before which we don't move toward the target
-    aimErrorOffset: 0,                     // aim error used this engagement (rad)
-    leadFactor: AIM_HUMAN.leadFactorMean,  // lead-prediction accuracy used this engagement
-    lastFrameAt: 0,                        // for computing dt between RAF ticks
-    // Walk state for each AR(1) process. Each field carries the most recent
-    // walk value; ouStep mutates it in place each step. Per-frame walks
-    // (jitter, wander) are advanced on every dispatchAim tick using the
-    // RAF dt. Per-acquisition walks (aimError, leadFactor, reaction) are
-    // advanced on each target commit using the elapsed time since the last
-    // commit. Initialized at the walk's mean — ouStep relaxes each toward
-    // stationary within a few time constants.
-    jitterWalk:         0,
-    wanderWalk:         0,
-    aimErrorWalk:       0,
-    leadFactorWalk:     AIM_HUMAN.leadFactorMean,
-    reactionWalk:       AIM_HUMAN.reactionMs.mean,
-    switchReactionWalk: AIM_HUMAN.switchReactionMs.mean,
-    lastAcqAt:          0                  // for computing dt between per-acquisition walk steps
+    theta: 0,        // current aim angle (derived from the aim point each frame)
+    targetId: null,  // committed enemy id
+    aimX: null,      // current aim point on the world map (null until first engage)
+    aimY: null,
+    lastFrameAt: 0,  // Date.now() of the previous frame, for dt
   };
 
   // The user's real mouse position in screen space, kept up-to-date by the
@@ -1364,43 +1283,6 @@
     return window.innerWidth / (sample?.self?.viewportWorldUnits || 56);
   }
 
-  // Box-Muller normal sample. Discards the second output for simplicity.
-  // Only used as the innovation term inside `ouStep`; call sites don't
-  // draw IID gaussians directly anymore.
-  function gaussian(mean, std) {
-    let u = 0, v = 0;
-    while (u === 0) u = Math.random();
-    while (v === 0) v = Math.random();
-    return mean + std * Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
-  }
-
-  // Ornstein–Uhlenbeck-style AR(1) walk step. Given previous value X(t),
-  // elapsed time δ (seconds), relaxation rate α (1/sec), and target mean μ
-  // and std σ, returns X(t+δ) drawn from a process whose stationary
-  // distribution is N(μ, σ²). Derived from the user-supplied update rule
-  //     X(t+δ) = (1 − δα)·X(t) + σ·√(1 − (1−δα)²)·Z,   Z ~ N(0,1)
-  // scaled/shifted for non-zero mean:
-  //     Y(t+δ) = μ + (1−δα)·(Y(t) − μ) + σ·√(1−(1−δα)²)·Z.
-  // The decay factor is clamped to [0, 1] so the walk stays stable even
-  // if a caller passes a large δ (a long pause between target commits,
-  // for instance) — at decay=0 we draw a fresh stationary sample, which
-  // is the correct limit.
-  function ouStep(prev, dt, alpha, mean, sigma) {
-    let decay = 1 - dt * alpha;
-    if (decay < 0) decay = 0;
-    else if (decay > 1) decay = 1;
-    return mean + decay * (prev - mean) + sigma * Math.sqrt(1 - decay * decay) * gaussian(0, 1);
-  }
-
-  // Shortest signed arc from a to b on the unit circle, in (-π, π]. Used for
-  // cursor easing so the slew always rotates the short way around.
-  function shortestArc(a, b) {
-    let d = (b - a) % (2 * Math.PI);
-    if (d > Math.PI) d -= 2 * Math.PI;
-    if (d <= -Math.PI) d += 2 * Math.PI;
-    return d;
-  }
-
   // Pick the enemy whose world position is closest (in Euclidean distance)
   // to the world point under the user's real mouse cursor. Survev keeps the
   // local player viewport-centered, so the mouse offset from screen center
@@ -1408,32 +1290,7 @@
   // from the player. Adding it to the player's world position gives us
   // a "where the user is pointing in the world" point that we score every
   // visible enemy against.
-  //
-  // Stickiness still applies on top: once committed, we hold a target for
-  // `stickyMs` regardless, and past that window we only switch if the new
-  // best is materially closer to the mouse than the current one. This both
-  // humanizes the cheat and prevents frame-to-frame flicker when two enemies
-  // are roughly equidistant from the cursor.
-  function pickTarget(player, enemies, now) {
-    // Dead-linger: if the committed target just died, keep aiming at the
-    // corpse for `deadLingerMs` before releasing. Models a human's
-    // follow-through after a kill. We check this *before* filtering out
-    // dead enemies so the corpse is still a valid return value.
-    if (aimState.targetId != null) {
-      const currentAny = enemies.find((e) => e.id === aimState.targetId);
-      if (currentAny && currentAny.dead) {
-        if (aimState.targetDeadAt === 0) aimState.targetDeadAt = now;
-        if (now - aimState.targetDeadAt < AIM_HUMAN.deadLingerMs) {
-          return [currentAny, dist(player, currentAny)];
-        }
-        // Linger expired — fall through to normal selection (which will
-        // pick a new live target and dispatchAim will clear targetDeadAt).
-      } else if (currentAny && !currentAny.dead) {
-        // Target is alive again (or still alive) — clear any stale death ts.
-        aimState.targetDeadAt = 0;
-      }
-    }
-
+  function pickTarget(player, enemies) {
     const candidates = [];
     for (const e of enemies) {
       if (e.dead) continue;
@@ -1443,11 +1300,6 @@
     }
     if (!candidates.length) return [null, 0];
 
-    // Project the user's real mouse cursor into world space. Screen Y is
-    // flipped because screen-down is world-down for the cursor but our world
-    // angles use positive-Y-up. If the mouse hasn't moved yet, fall back to
-    // "the user is pointing at themselves" so we still pick *some* enemy
-    // until they move the mouse.
     const scale = getLivePxPerWorldUnit(pageSamples[pageSamples.length - 1]);
     let mouseWorldX, mouseWorldY;
     if (realMouse.hasMoved) {
@@ -1458,10 +1310,6 @@
       mouseWorldY = player.y;
     }
 
-    // Score = squared Euclidean distance in world space from the enemy to
-    // the mouse-projected world point. We use squared distance because
-    // sqrt is monotonic — the ordering is identical and we save 60 sqrts
-    // per frame.
     const scoreOf = (e) => {
       const dx = e.x - mouseWorldX;
       const dy = e.y - mouseWorldY;
@@ -1472,46 +1320,59 @@
     let bestScore = scoreOf(best);
     for (let i = 1; i < candidates.length; i++) {
       const s = scoreOf(candidates[i]);
-      if (s < bestScore) {
-        bestScore = s;
-        best = candidates[i];
-      }
+      if (s < bestScore) { bestScore = s; best = candidates[i]; }
     }
-
-    // No commitment yet — take the closest-to-mouse enemy.
-    if (aimState.targetId == null) return [best, dist(player, best)];
-
-    // Current target still alive & in the candidate set?
-    const current = candidates.find((c) => c.id === aimState.targetId);
-    if (!current) return [best, dist(player, best)];
-
-    // Hold during the sticky window regardless of mouse position.
-    if (now - aimState.targetAcquiredAt < AIM_HUMAN.stickyMs) {
-      return [current, dist(player, current)];
-    }
-
-    // Past sticky: only switch if the best is materially closer to the mouse.
-    // switchAdvantage<1 means the new squared-distance must be at least that
-    // fraction of the current squared-distance (e.g. 0.7 → new must be at
-    // ≥√(1-0.7) ≈ 55% the linear distance to switch).
-    if (best.id === current.id) return [current, dist(player, current)];
-    const currentScore = scoreOf(current);
-    if (bestScore < currentScore * AIM_HUMAN.switchAdvantage) {
-      return [best, dist(player, best)];
-    }
-    return [current, dist(player, current)];
+    return [best, dist(player, best)];
   }
 
-  // Compute the lead-predicted angle to an enemy, scaled by `leadFactor` so
-  // we can model imperfect human prediction. With leadFactor=1 this matches
-  // the perfect-aim version; with leadFactor<1 we under-lead (the typical
-  // human failure mode).
-  function leadAngle(player, enemy, distance, leadFactor) {
+  // Reconstruct an enemy's world state (position + velocity) as it was at
+  // wall-clock time `atTs` (Date.now() ms), by linearly interpolating between
+  // the two recorded samples that bracket `atTs`. Used to look up where a
+  // target was perceived `reactionMs` ago. Returns null if the enemy doesn't
+  // appear in any retained sample; clamps to the nearest endpoint when `atTs`
+  // falls outside the recorded window.
+  function enemyStateAt(id, atTs) {
+    let lo = null, hi = null;
+    // pageSamples is in ascending-ts order; walk back from newest.
+    for (let i = pageSamples.length - 1; i >= 0; i--) {
+      const s = pageSamples[i];
+      const e = s.enemies.find((en) => en.id === id);
+      if (!e) continue;
+      if (s.ts <= atTs) { lo = { ts: s.ts, e }; break; }
+      hi = { ts: s.ts, e };
+    }
+    const pick = (h) => ({ x: h.e.x, y: h.e.y, xv: h.e.xv ?? 0, yv: h.e.yv ?? 0 });
+    if (!lo && !hi) return null;
+    if (!lo) return pick(hi);
+    if (!hi) return pick(lo);
+    const span = hi.ts - lo.ts;
+    const f = span > 0 ? (atTs - lo.ts) / span : 0;
+    const lerp = (a, b) => a + (b - a) * f;
+    return {
+      x:  lerp(lo.e.x, hi.e.x),
+      y:  lerp(lo.e.y, hi.e.y),
+      xv: lerp(lo.e.xv ?? 0, hi.e.xv ?? 0),
+      yv: lerp(lo.e.yv ?? 0, hi.e.yv ?? 0),
+    };
+  }
+
+  // The world point "perfect aim given lag" wants the cursor on right now.
+  // Take the enemy's perceived state from `reactionMs` ago, extrapolate it
+  // forward by reactionMs along that perceived velocity (this is the lag
+  // cancellation — constant-velocity targets land exactly on their true
+  // current position), then add bullet lead so the shot connects.
+  function reactionTarget(player, enemy, now) {
+    const past = enemyStateAt(enemy.id, now - AIM_HUMAN.reactionMs)
+      || { x: enemy.x, y: enemy.y, xv: enemy.xv ?? 0, yv: enemy.yv ?? 0 };
+    const D = AIM_HUMAN.reactionMs / 1000;
+    // Reaction-extrapolate the perceived position to the present.
+    const rx = past.x + past.xv * D;
+    const ry = past.y + past.yv * D;
+    // Bullet lead: time for the projectile to travel from me to that point,
+    // then advance the target one more tHit along the perceived velocity.
     const bulletSpeed = player.bulletSpeed ?? 1e8;
-    const tHit = (distance / bulletSpeed) * leadFactor;
-    const tx = enemy.x + (enemy.xv ?? 0) * tHit;
-    const ty = enemy.y + (enemy.yv ?? 0) * tHit;
-    return Math.atan2(ty - player.y, tx - player.x);
+    const tHit = Math.hypot(rx - player.x, ry - player.y) / bulletSpeed;
+    return { x: rx + past.xv * tHit, y: ry + past.yv * tHit };
   }
 
   function dispatchAim() {
@@ -1523,88 +1384,35 @@
     const player = last_sample.self;
     const enemies = last_sample.enemies;
 
-    const now = performance.now();
-    const dt = aimState.lastFrameAt ? Math.max(0.001, (now - aimState.lastFrameAt) / 1000) : 0.016;
+    const now = Date.now();
+    const dt = aimState.lastFrameAt ? Math.max(0.001, (now - aimState.lastFrameAt) / 1000) : AIM_REF_DT;
     aimState.lastFrameAt = now;
 
-    // Advance the per-frame walks (hand tremor and idle wander). Each
-    // carries temporally-correlated noise in place of the IID gaussians
-    // previously drawn here, so successive frames see a smoothly-varying
-    // offset rather than white noise.
-    aimState.jitterWalk = ouStep(
-      aimState.jitterWalk, dt, AIM_HUMAN.jitterAlpha, 0, AIM_HUMAN.jitterStd
-    );
-    aimState.wanderWalk = ouStep(
-      aimState.wanderWalk, dt, AIM_HUMAN.idleWanderAlpha, 0, AIM_HUMAN.idleWanderStd
-    );
-
-    const [enemy, distance] = pickTarget(player, enemies, now);
-    // Acquisition / switch bookkeeping. New commit → advance the
-    // per-acquisition walks (reaction, aim error, lead factor) using the
-    // elapsed time since the previous commit as δ, then snapshot the
-    // walk values into the engagement-scoped fields that dispatchAim reads
-    // below. This models slowly-varying human traits across a session
-    // instead of re-rolling them independently at every target switch.
+    const [enemy] = pickTarget(player, enemies);
     if (enemy) {
-      if (aimState.targetId !== enemy.id) {
-        const isSwitch = aimState.targetId != null;
-        const dtAcq = aimState.lastAcqAt ? (now - aimState.lastAcqAt) / 1000 : 1;
-        aimState.reactionWalk = ouStep(
-          aimState.reactionWalk, dtAcq, AIM_HUMAN.reactionMs.alpha,
-          AIM_HUMAN.reactionMs.mean, AIM_HUMAN.reactionMs.std
-        );
-        aimState.switchReactionWalk = ouStep(
-          aimState.switchReactionWalk, dtAcq, AIM_HUMAN.switchReactionMs.alpha,
-          AIM_HUMAN.switchReactionMs.mean, AIM_HUMAN.switchReactionMs.std
-        );
-        aimState.aimErrorWalk = ouStep(
-          aimState.aimErrorWalk, dtAcq, AIM_HUMAN.aimErrorAlpha,
-          0, AIM_HUMAN.aimErrorStd
-        );
-        aimState.leadFactorWalk = ouStep(
-          aimState.leadFactorWalk, dtAcq, AIM_HUMAN.leadFactorAlpha,
-          AIM_HUMAN.leadFactorMean, AIM_HUMAN.leadFactorStd
-        );
-        aimState.lastAcqAt = now;
-
-        const rawReaction = isSwitch ? aimState.switchReactionWalk : aimState.reactionWalk;
-        const reactionMin = isSwitch ? AIM_HUMAN.switchReactionMs.min : AIM_HUMAN.reactionMs.min;
-        aimState.targetId = enemy.id;
-        aimState.targetAcquiredAt = now;
-        aimState.targetDeadAt = 0;
-        aimState.reactionUntil = now + Math.max(reactionMin, rawReaction);
-        aimState.aimErrorOffset = aimState.aimErrorWalk;
-        aimState.leadFactor = Math.max(0, Math.min(1.5, aimState.leadFactorWalk));
+      aimState.targetId = enemy.id;
+      const tgt = reactionTarget(player, enemy, now);
+      // First frame of an engagement: start the glide from where the user's
+      // real cursor is pointing in the world, not from a stale/zero point.
+      if (aimState.aimX == null) {
+        const scale = getLivePxPerWorldUnit(last_sample);
+        if (realMouse.hasMoved) {
+          aimState.aimX = player.x + (realMouse.x - window.innerWidth / 2) / scale;
+          aimState.aimY = player.y - (realMouse.y - window.innerHeight / 2) / scale;
+        } else {
+          aimState.aimX = player.x;
+          aimState.aimY = player.y;
+        }
       }
+      // Close a frame-rate-independent fraction of the remaining world-space
+      // gap toward the target point this frame.
+      const k = 1 - Math.pow(1 - AIM_HUMAN.followFraction, dt / AIM_REF_DT);
+      aimState.aimX += (tgt.x - aimState.aimX) * k;
+      aimState.aimY += (tgt.y - aimState.aimY) * k;
+      aimState.theta = Math.atan2(aimState.aimY - player.y, aimState.aimX - player.x);
     } else {
       aimState.targetId = null;
     }
-
-    // Decide where the cursor *wants* to be this frame.
-    let desired;
-    if (enemy && now >= aimState.reactionUntil) {
-      desired = leadAngle(player, enemy, distance, aimState.leadFactor) + aimState.aimErrorOffset;
-    } else if (enemy) {
-      // In reaction window — cursor stays put (still drifting via jitter/idle).
-      desired = aimState.theta;
-    } else {
-      // No target — offset the desired angle by the wander walk so theta
-      // drifts smoothly instead of sitting perfectly still.
-      desired = aimState.theta + aimState.wanderWalk;
-    }
-
-    // Slew toward desired with a per-frame fraction, capped by max angular
-    // speed. This produces the flick-then-settle curve real players show
-    // instead of a 1-frame teleport.
-    const arc = shortestArc(aimState.theta, desired);
-    const maxStep = AIM_HUMAN.maxAngularSpeed * dt;
-    let step = arc * AIM_HUMAN.followGain;
-    if (step > maxStep) step = maxStep;
-    else if (step < -maxStep) step = -maxStep;
-    aimState.theta += step;
-
-    // Hand tremor.
-    aimState.theta += aimState.jitterWalk;
 
     const x = Math.round(window.innerWidth / 2 + Math.cos(aimState.theta) * SHIFT_AIM_RADIUS);
     const y = Math.round(window.innerHeight / 2 - Math.sin(aimState.theta) * SHIFT_AIM_RADIUS);
@@ -1631,15 +1439,11 @@
     if (e.key !== 'Shift') return;
     if (!shiftHeld) {
       shiftHeld = true;
-      // Snap the synthetic cursor to wherever the user's real mouse currently
-      // points so the slew starts from "where I'm looking" instead of from
-      // last session's leftover theta. Without this, the very first frame
-      // of a new hold flicks across the screen.
-      if (realMouse.hasMoved) {
-        const mdx = realMouse.x - window.innerWidth / 2;
-        const mdy = -(realMouse.y - window.innerHeight / 2);
-        aimState.theta = Math.atan2(mdy, mdx);
-      }
+      // Fresh hold: drop the prior aim point so dispatchAim re-seeds the glide
+      // from wherever the user's real cursor currently points.
+      aimState.aimX = null;
+      aimState.aimY = null;
+      aimState.lastFrameAt = 0;
       if (!shiftRafId) shiftRafId = requestAnimationFrame(shiftFrame);
     }
     // Suppress the browser's default Shift behavior so it doesn't steal
@@ -1651,10 +1455,9 @@
     if (e.key !== 'Shift') return;
     shiftHeld = false;
     if (shiftRafId) { cancelAnimationFrame(shiftRafId); shiftRafId = 0; }
-    // Drop per-session aim state so the next hold starts with a fresh
-    // reaction delay and a sensible dt on frame 0.
     aimState.targetId = null;
-    aimState.targetDeadAt = 0;
+    aimState.aimX = null;
+    aimState.aimY = null;
     aimState.lastFrameAt = 0;
   }, true);
 
@@ -1695,7 +1498,9 @@
     // Bolt/lever-action rifles + DMRs that aim before firing
     'mosin', 'sv98', 'awc', 'scout_elite', 'blr', 'model94',
     // Pump-action and semi-auto shotguns
-    'm870', 'm1100', 'spas12', 'spas16', 'mp220', 'saiga', 'm1014', 'usas',
+    'm870', 'spas12', 'm1014', 'usas',
+    // Potato cannon (slow single-shot)
+    'potato_cannon',
   ]);
 
   // Survev collects inputs once per tick (~16ms) and `flush()` advances
@@ -1925,21 +1730,9 @@
     const enemies = sample.enemies;
     if (!enemies || !enemies.length) return null;
 
-    // While engaged, show the actual committed target (respects stickiness,
-    // including the dead-linger window when we're still pinned to a corpse).
-    // If the committed target has become unreachable (layer transition),
-    // fall through to fresh selection so the overlay matches the lock-on
-    // filter in pickTarget.
     if (shiftHeld && aimState.targetId != null) {
       const committed = enemies.find((e) => e.id === aimState.targetId);
       if (committed && !committed.dead && canInteract(player.layer, committed.layer)) return committed;
-      if (
-        committed && committed.dead &&
-        aimState.targetDeadAt &&
-        performance.now() - aimState.targetDeadAt < AIM_HUMAN.deadLingerMs
-      ) {
-        return committed;
-      }
     }
 
     // Otherwise compute fresh best-by-mouse-distance with no commitment.
