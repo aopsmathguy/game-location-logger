@@ -1236,8 +1236,14 @@
     // and the target point that we close per reference frame (AIM_REF_DT).
     // dt-corrected each frame so the closing rate is frame-rate independent.
     // 1.0 ⇒ instant snap; smaller ⇒ a slower glide onto the target.
-    followFraction: 0.30,
+    followFraction: 0.15,
+    // After an enemy dies it stays lockable (acts alive) for this many ms,
+    // so its corpse/last position can still be aimed at briefly.
+    deadLingerMs: 600,
   };
+  // id -> Date.now() when the enemy was first observed dead; lets pickTarget
+  // keep a just-killed target lockable for AIM_HUMAN.deadLingerMs.
+  const deadSince = new Map();
   window.__aimHuman = AIM_HUMAN;
   // Frame time the followFraction is calibrated against (60fps).
   const AIM_REF_DT = 1 / 60;
@@ -1290,10 +1296,17 @@
   // from the player. Adding it to the player's world position gives us
   // a "where the user is pointing in the world" point that we score every
   // visible enemy against.
-  function pickTarget(player, enemies) {
+  function pickTarget(player, enemies, now) {
     const candidates = [];
     for (const e of enemies) {
-      if (e.dead) continue;
+      if (e.dead) {
+        // Keep a just-killed enemy lockable for a short linger window. Record
+        // when we first saw it dead, then drop it once the window elapses.
+        if (!deadSince.has(e.id)) deadSince.set(e.id, now);
+        if (now - deadSince.get(e.id) >= AIM_HUMAN.deadLingerMs) continue;
+      } else {
+        deadSince.delete(e.id);
+      }
       if (isSpoofedEnemy(e.id, pageSamples)) continue;
       if (!canInteract(player.layer, e.layer)) continue;
       candidates.push(e);
@@ -1388,7 +1401,7 @@
     const dt = aimState.lastFrameAt ? Math.max(0.001, (now - aimState.lastFrameAt) / 1000) : AIM_REF_DT;
     aimState.lastFrameAt = now;
 
-    const [enemy] = pickTarget(player, enemies);
+    const [enemy] = pickTarget(player, enemies, now);
     if (enemy) {
       aimState.targetId = enemy.id;
       const tgt = reactionTarget(player, enemy, now);
@@ -1472,11 +1485,92 @@
       realMouse.x = e.clientX;
       realMouse.y = e.clientY;
       realMouse.hasMoved = true;
+      updateAimMenuVisibility(e.clientX, e.clientY);
     }
     if (!shiftHeld || !e.isTrusted) return;
     e.stopImmediatePropagation();
     e.preventDefault();
   }, true);
+
+  // ---------------------------------------------------------------------
+  // Top-right settings menu for live-tuning the AIM_HUMAN parameters.
+  // Hidden by default; revealed only while the real cursor is in the
+  // top-right corner zone (or while the user is dragging one of its
+  // controls). Each row is a slider bound to one AIM_HUMAN key, so edits
+  // take effect on the very next frame.
+  // ---------------------------------------------------------------------
+  const AIM_MENU_SPECS = [
+    { key: 'reactionMs',     label: 'Reaction (ms)',  min: 0,   max: 400,  step: 5,    decimals: 0 },
+    { key: 'followFraction', label: 'Follow frac',    min: 0.01, max: 1,    step: 0.01, decimals: 2 },
+    { key: 'deadLingerMs',   label: 'Dead linger (ms)', min: 0, max: 2000, step: 50,   decimals: 0 },
+  ];
+  // px from the top-right corner within which the menu reveals itself.
+  const AIM_MENU_ZONE_W = 280;
+  const AIM_MENU_ZONE_H = 220;
+  let aimMenuEl = null;
+  let aimMenuInteracting = false; // true while a slider is being dragged
+
+  function ensureAimMenu() {
+    if (aimMenuEl && aimMenuEl.isConnected) return aimMenuEl;
+    const parent = document.body || document.documentElement;
+    if (!parent) return null;
+    const panel = document.createElement('div');
+    panel.style.cssText = [
+      'position:fixed', 'top:8px', 'right:8px', 'width:220px',
+      'padding:10px 12px', 'box-sizing:border-box',
+      'background:rgba(15,17,22,0.92)', 'color:#e6e6e6',
+      'font:12px/1.4 system-ui,sans-serif', 'border:1px solid #3a3f4b',
+      'border-radius:8px', 'z-index:2147483647', 'pointer-events:auto',
+      'display:none', 'user-select:none', 'box-shadow:0 4px 16px rgba(0,0,0,0.4)'
+    ].join(';');
+    const title = document.createElement('div');
+    title.textContent = 'Aim humanization';
+    title.style.cssText = 'font-weight:600;margin-bottom:8px;opacity:0.85';
+    panel.appendChild(title);
+
+    for (const spec of AIM_MENU_SPECS) {
+      const row = document.createElement('label');
+      row.style.cssText = 'display:block;margin:8px 0';
+      const head = document.createElement('div');
+      head.style.cssText = 'display:flex;justify-content:space-between;margin-bottom:3px';
+      const name = document.createElement('span');
+      name.textContent = spec.label;
+      const val = document.createElement('span');
+      val.style.cssText = 'opacity:0.8;font-variant-numeric:tabular-nums';
+      val.textContent = Number(AIM_HUMAN[spec.key]).toFixed(spec.decimals);
+      head.appendChild(name); head.appendChild(val);
+      const slider = document.createElement('input');
+      slider.type = 'range';
+      slider.min = String(spec.min); slider.max = String(spec.max); slider.step = String(spec.step);
+      slider.value = String(AIM_HUMAN[spec.key]);
+      slider.style.cssText = 'width:100%;cursor:pointer;accent-color:#5b9dff';
+      slider.addEventListener('input', () => {
+        const v = Number(slider.value);
+        AIM_HUMAN[spec.key] = v;
+        val.textContent = v.toFixed(spec.decimals);
+      });
+      row.appendChild(head); row.appendChild(slider);
+      panel.appendChild(row);
+    }
+
+    // Keep the menu open across a drag even if the cursor strays out of the
+    // corner zone, and never let menu interaction reach the game canvas.
+    panel.addEventListener('mousedown', (e) => { aimMenuInteracting = true; e.stopPropagation(); });
+    panel.addEventListener('click', (e) => e.stopPropagation());
+    panel.addEventListener('wheel', (e) => e.stopPropagation());
+    window.addEventListener('mouseup', () => { aimMenuInteracting = false; });
+
+    parent.appendChild(panel);
+    aimMenuEl = panel;
+    return panel;
+  }
+
+  function updateAimMenuVisibility(x, y) {
+    const inZone = x >= window.innerWidth - AIM_MENU_ZONE_W && y <= AIM_MENU_ZONE_H;
+    const menu = ensureAimMenu();
+    if (!menu) return;
+    menu.style.display = (inZone || aimMenuInteracting) ? 'block' : 'none';
+  }
 
   // ---------------------------------------------------------------------
   // Auto-quickswap after firing a slow-firerate gun. When the user
