@@ -2453,21 +2453,41 @@
   // measures both settings; see the trade note at the bottom of it.
   // ---------------------------------------------------------------------
 
-  const NET_CLOCK_HIST = 256;      // packets retained for the fit (~13s at 20Hz)
-
+  // The fit is kept as mean-centred sufficient statistics that each arrival
+  // updates in place, rather than as a buffer of arrivals re-summed per packet.
+  // Decaying the accumulated moments by `lam` and folding the new sample in at
+  // weight 1 is algebraically the same weighted least squares, so this is a
+  // form change, not a behaviour change — except that the taper now runs over
+  // every packet ever seen instead of stopping at a window edge.
+  //
+  // Centring is what makes the running form safe. Accumulating raw Σn² would
+  // lose the fit to rounding within minutes, exactly as the batch version's
+  // per-packet re-centring existed to prevent; carrying deviations from the
+  // running weighted mean instead keeps every stored quantity bounded — `cnn`
+  // settles at the weighted spread of the index and stays there, however long
+  // the match runs. The means themselves grow, but only linearly, and only as
+  // the operands of small differences.
   const netClock = {
     n: 0,             // next packet index
-    hist: [],         // [{ n, t }] recent arrivals
+    count: 0,         // arrivals folded in, for the warm-up gate
+    sw: 0,            // Σ w
+    mn: 0,            // weighted mean packet index
+    mt: 0,            // weighted mean arrival time (ms)
+    cnn: 0,           // Σ w (n - mn)^2
+    cnt: 0,           // Σ w (n - mn)(t - mt)
     slope: 0,         // ms per tick
-    intercept: 0,
     ready: false,
   };
 
   function resetNetClock() {
     netClock.n = 0;
-    netClock.hist.length = 0;
+    netClock.count = 0;
+    netClock.sw = 0;
+    netClock.mn = 0;
+    netClock.mt = 0;
+    netClock.cnn = 0;
+    netClock.cnt = 0;
     netClock.slope = 0;
-    netClock.intercept = 0;
     netClock.ready = false;
     // Packet indices restart, so every retained snapshot's index now points at
     // the wrong pseudotime. (Declared below, beside the ring it indexes.)
@@ -2477,38 +2497,40 @@
   // Fold one arrival into the clock. Called once per update packet.
   function clockOnPacket(nowMs) {
     const n = netClock.n++;
-    netClock.hist.push({ n, t: nowMs });
-    if (netClock.hist.length > NET_CLOCK_HIST) netClock.hist.shift();
-
-    const h = netClock.hist;
-    if (h.length < 4) {
-      if (netClock.slope > 0) netClock.intercept = nowMs - netClock.slope * n;
-      return;
-    }
-    // Re-centre on the newest sample before fitting. Regressing raw indices
-    // means the n^2 term grows without bound and the normal equations lose
-    // precision within a few minutes of play.
+    // `clockHalfLife` is live-tunable. Moments already banked stay weighted as
+    // the old horizon banked them, so a slider move re-converges over a few
+    // half-lives rather than landing instantly. The slope is a ratio of two
+    // moments carrying the same stale weighting, so the transit is smooth.
     const lam = Math.pow(0.5, 1 / Math.max(NETCODE.clockHalfLife, 1));
-    const n0 = h[h.length - 1].n;
-    const t0 = h[h.length - 1].t;
-    let sw = 0, sn = 0, stt = 0, snn = 0, snt = 0;
-    for (let i = h.length - 1; i >= 0; i--) {
-      const dn = h[i].n - n0;          // <= 0
-      const dtv = h[i].t - t0;
-      const w = Math.pow(lam, -dn);    // decays into the past
-      sw += w; sn += w * dn; stt += w * dtv; snn += w * dn * dn; snt += w * dn * dtv;
-    }
-    const denom = sw * snn - sn * sn;
-    if (!Number.isFinite(denom) || Math.abs(denom) < 1e-9) return;
-    const slope = (sw * snt - sn * stt) / denom;
+
+    // Weighted Welford: decay, then fold the new sample in at weight 1. The
+    // deviations are taken against the *old* mean and closed against the
+    // *new* one, which is what makes the centred moments update exactly
+    // rather than approximately.
+    const dn = n - netClock.mn;
+    const dt = nowMs - netClock.mt;
+    const sw = lam * netClock.sw + 1;
+    const k = 1 / sw;                  // share of the mean the new sample takes
+    const mn = netClock.mn + k * dn;
+    const mt = netClock.mt + k * dt;
+    netClock.cnn = lam * netClock.cnn + dn * (n - mn);
+    netClock.cnt = lam * netClock.cnt + dn * (nowMs - mt);
+    netClock.sw = sw;
+    netClock.mn = mn;
+    netClock.mt = mt;
+    netClock.count++;
+
+    if (netClock.count < 4 || !(netClock.cnn > 1e-9)) return;
+    const slope = netClock.cnt / netClock.cnn;
     if (!Number.isFinite(slope)) return;
-    const b = (stt - slope * sn) / sw;
     netClock.slope = slope;
-    netClock.intercept = (t0 + b) - slope * n0;
     netClock.ready = true;
   }
 
-  const pseudotimeOf = (n) => netClock.slope * n + netClock.intercept;
+  // Evaluated about the fit's centroid rather than about n = 0. The affine
+  // form needs an intercept reconstructed as `mt - slope * mn`, two large
+  // numbers differencing to a small one; this asks for no such cancellation.
+  const pseudotimeOf = (n) => netClock.mt + netClock.slope * (n - netClock.mn);
 
   // The pseudotime the *render* is taken at, as opposed to the true clock time
   // everything else asks about. Held `renderLag` ticks behind now, so the lerp

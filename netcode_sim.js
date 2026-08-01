@@ -68,7 +68,6 @@ const NET_MIN_UPDATE_MS = grabConst('NET_MIN_UPDATE_MS');
 const NET_MAX_UPDATE_MS = grabConst('NET_MAX_UPDATE_MS');
 const NET_EWMA_ALPHA = grabConst('NET_EWMA_ALPHA');
 const NET_SNAP_CAP = grabConst('NET_SNAP_CAP');
-const NET_CLOCK_HIST = grabConst('NET_CLOCK_HIST');
 const NETCODE = eval('(' + /const NETCODE = (\{[\s\S]*?\n  \});/.exec(src)[1] + ')');
 
 // The Player field names the extracted code reads through. In the browser
@@ -93,8 +92,9 @@ const bundle = eval(`(function () {
 })()`);
 const { recordUpdateInterval, clockOnPacket, renderOnClock, updatePlayerSmoothing } = bundle;
 function resetClock() {
-  netClock.n = 0; netClock.hist.length = 0; netClock.slope = 0;
-  netClock.intercept = 0; netClock.ready = false;
+  netClock.n = 0; netClock.count = 0; netClock.sw = 0;
+  netClock.mn = 0; netClock.mt = 0; netClock.cnn = 0; netClock.cnt = 0;
+  netClock.slope = 0; netClock.ready = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -257,7 +257,7 @@ function metrics(samples) {
 console.log('Driving inject.js\'s own smoother through a simulated survev render loop.\n');
 console.log(`defaults:  ${JSON.stringify(NETCODE)}`);
 console.log(`constants: gap=[${NET_MIN_UPDATE_MS},${NET_MAX_UPDATE_MS}]ms alpha=${NET_EWMA_ALPHA} `
-  + `clockHist=${NET_CLOCK_HIST} snaps=${NET_SNAP_CAP}\n`);
+  + `snaps=${NET_SNAP_CAP}\n`);
 console.log('jerk = stutter (lower better) | froz = frozen frames % | err = shape error (world units)\n');
 
 let worstRegression = 0;

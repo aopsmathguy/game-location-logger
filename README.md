@@ -145,8 +145,10 @@ Two things follow the moment the link is imperfect:
 `inject.js` replaces that render path with a recovered server clock.
 
 Updates are numbered by arrival, and arrival time is fit against that index
-with a slow exponentially-weighted linear regression. The fit gives every
-packet a **pseudotime** — when it would have arrived on a jitter-free link.
+with a slow exponentially-weighted linear regression, carried as mean-centred
+moments that each packet updates in a few arithmetic ops rather than as a
+buffer re-summed per arrival. The fit gives every packet a **pseudotime** —
+when it would have arrived on a jitter-free link.
 Players are rendered by lerping between the last two snapshots on that clock:
 given `p1@t1` and `p2@t2` in pseudotime,
 
