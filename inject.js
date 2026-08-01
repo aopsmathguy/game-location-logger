@@ -1425,11 +1425,6 @@
     // After an enemy dies it stays lockable (acts alive) for this many ms,
     // so its corpse/last position can still be aimed at briefly.
     deadLingerMs: 600,
-    // Read target motion off the recovered server clock (the netcode section's
-    // pseudotime) instead of the 20ms sample ring. 0 falls the whole aim path
-    // back to enemyStateAt(). See clockPairAt() for why this is not just a
-    // smoothing preference.
-    clockAim: 1,
     // How much of the measured round trip to lead by, as a fraction. The state
     // we can see is one one-way delay old and a shot fired now arrives one
     // one-way delay later, so an un-compensated server resolves the shot
@@ -1643,7 +1638,7 @@
   // answers "what is under the cursor" against the sprite the user is actually
   // looking at. Falls back to the position carried by the sample.
   function livePos(id, fallback) {
-    return (AIM_HUMAN.clockAim ? stateOnClock(id, renderNowMs()) : null) || fallback;
+    return stateOnClock(id, renderNowMs()) || fallback;
   }
 
   // The local player as drawn. The game centres the camera on the rendered
@@ -1654,7 +1649,7 @@
   function liveSelf(sample) {
     const self = sample?.self;
     if (!self || self.id == null) return self;
-    const s = AIM_HUMAN.clockAim ? stateOnClock(self.id, renderNowMs()) : null;
+    const s = stateOnClock(self.id, renderNowMs());
     return s ? { ...self, x: s.x, y: s.y, xv: s.xv, yv: s.yv } : self;
   }
 
@@ -1713,10 +1708,10 @@
     const viewMs = tNow - AIM_HUMAN.reactionMs;      // what we let ourselves know
     const leadMs = AIM_HUMAN.reactionMs + pingMs;    // and what that costs us
 
-    const pair = AIM_HUMAN.clockAim ? clockPairAt(enemy.id, viewMs) : null;
-    // Off-clock fallback: the sample ring's state at the same viewpoint,
-    // carried forward on the velocity perceived there. Same timeline, coarser
-    // instrument.
+    const pair = clockPairAt(enemy.id, viewMs);
+    // Off-clock fallback, for a clock that cannot answer yet: the sample ring's
+    // state at the same viewpoint, carried forward on the velocity perceived
+    // there. Same timeline, coarser instrument.
     const seen = pair ? null : (enemyStateAt(enemy.id, now - AIM_HUMAN.reactionMs)
       || { x: enemy.x, y: enemy.y, xv: enemy.xv ?? 0, yv: enemy.yv ?? 0 });
     const at = pair
@@ -1730,8 +1725,7 @@
     // viewpoint: reaction time is a limit on tracking a target, not on knowing
     // where we ourselves are standing. It is still evaluated at spawn time,
     // which is the same instant either way.
-    const selfPair = (AIM_HUMAN.clockAim && player.id != null)
-      ? clockPairAt(player.id, tNow) : null;
+    const selfPair = player.id != null ? clockPairAt(player.id, tNow) : null;
     const from = selfPair
       ? pairAt(selfPair, viewMs + leadMs)
       : { x: player.x, y: player.y };
@@ -1878,7 +1872,6 @@
     // affects those other entities. Kept small because a window wider than the
     // real gap leaves each lerp unfinished, which is its own discontinuity.
     jitterK: 0.5,
-    forceInterp: 1,    // hold survev's own interpolation setting on
     // Weight half-life of the clock regression, in packets (~5s at 20Hz).
     // Deliberately long: we are recovering a clock, and the whole point is
     // that individual arrivals barely move it.
@@ -1931,7 +1924,6 @@
     { store: AIM_HUMAN, key: 'followFraction', label: 'Follow',                min: 0.01, max: 1,    step: 0.01, decimals: 2 },
     { store: AIM_HUMAN, key: 'deadLingerMs',   label: 'Linger',    unit: 'ms', min: 0,    max: 2000, step: 50,   decimals: 0 },
     { store: AIM_HUMAN, key: 'pingLeadK',      label: 'Ping lead',             min: 0,    max: 1.5,  step: 0.05, decimals: 2 },
-    { store: AIM_HUMAN, key: 'clockAim',       label: 'Clock aim', kind: 'toggle' },
     { store: AUTO_SWAP, key: 'slowFireThreshold', label: 'Slow-fire', unit: 's', min: 0.1, max: 2,   step: 0.05, decimals: 2,
       section: 'Auto-quickswap' },
     { store: NETCODE,   key: 'enabled',        label: 'Smoothing', kind: 'toggle',
@@ -1939,7 +1931,6 @@
     { store: NETCODE,   key: 'jitterK',        label: 'Jitter buf',            min: 0,    max: 5,    step: 0.1,  decimals: 1 },
     { store: NETCODE,   key: 'clockHalfLife',  label: 'Clock',     unit: ' pkt', min: 5,  max: 400,  step: 5,    decimals: 0 },
     { store: NETCODE,   key: 'renderLag',      label: 'Playout',   unit: ' tick', min: 0, max: 2,   step: 0.05, decimals: 2 },
-    { store: NETCODE,   key: 'forceInterp',    label: 'Force interp', kind: 'toggle' },
     { store: PING_UI,   key: 'enabled',        label: 'Ping readout', kind: 'toggle',
       section: 'HUD' },
   ];
@@ -2718,8 +2709,10 @@
     try {
       const camera = installCameraInterpHook(game);
       // survev exposes interpolation as a user setting; with it off the client
-      // snaps to each packet and there is nothing for us to smooth.
-      if (camera && NETCODE.forceInterp && CAM_INTERP_ON && camera[CAM_INTERP_ON] !== true) {
+      // snaps to each packet and there is nothing for us to smooth, so it is
+      // held on. Re-asserted every tick so it survives the user toggling it,
+      // and a new round swapping in a fresh camera.
+      if (camera && CAM_INTERP_ON && camera[CAM_INTERP_ON] !== true) {
         camera[CAM_INTERP_ON] = true;
       }
       const roster = findRosterOnGame(game) || game?.[GAME_ROSTER];
@@ -2967,12 +2960,11 @@
   // Where the overlay should draw an entity: the recovered clock's position,
   // which is what the game itself renders from, with the sample interpolator
   // above as the fallback for anything the clock can't place (still
-  // converging, just came into view, smoothing toggled off). Drawing rings
+  // converging, or just came into view). Drawing rings
   // from a different position source than the sprites they circle is visible
   // as a lag between the two on any jittery link.
   function overlayPos(id, fallbackX, fallbackY) {
-    const s = AIM_HUMAN.clockAim ? stateOnClock(id, renderNowMs()) : null;
-    return s || interpPos(id, fallbackX, fallbackY);
+    return stateOnClock(id, renderNowMs()) || interpPos(id, fallbackX, fallbackY);
   }
 
   // Create the overlay element on demand. Returns true if the canvas is
@@ -3063,7 +3055,7 @@
     if (sample && sample.self && sample.enemies && sample.enemies.length) {
       const player = sample.self;
       // Rendered player position, i.e. what the camera is centred on.
-      const pi = (AIM_HUMAN.clockAim ? stateOnClock(player.id, renderNowMs()) : null)
+      const pi = stateOnClock(player.id, renderNowMs())
         || interpPos('__self__', player.x, player.y);
       const scale = getLivePxPerWorldUnit(sample);
       // Survev player hitbox is ~1 world unit; 1.6× makes the ring sit just
@@ -3264,7 +3256,7 @@
     const self = sample.self;
     const now = Date.now();
     const tNow = performance.now();
-    const pair = AIM_HUMAN.clockAim ? clockPairAt(target.id, tNow - AIM_HUMAN.reactionMs) : null;
+    const pair = clockPairAt(target.id, tNow - AIM_HUMAN.reactionMs);
     const seen = stateOnClock(target.id, tNow) || { xv: 0, yv: 0 };
     const aimAt = reactionTarget(self, target, now);
     const drawn = livePos(target.id, target);

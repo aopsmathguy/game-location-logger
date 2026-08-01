@@ -291,10 +291,10 @@ Target *selection* and the screen↔world conversions use clock positions too,
 so the cheat engages the enemy whose sprite is under the cursor, and the
 bearing it sends is measured from the position the camera is actually centred
 on. Every lookup falls back to the sample ring when the clock can't answer —
-still converging, an enemy that just came into view, or `clockAim` switched
-off — so nothing depends on the clock being ready. `window.__aimDiag()` reports
-which path is live, the three lead terms in ms, and how far ahead of the drawn
-sprite the crosshair is being placed.
+still converging, or an enemy that just came into view — so nothing depends on
+the clock being ready. `window.__aimDiag()` reports which path is live, the
+lead terms in ms, and how far ahead of the drawn sprite the crosshair is being
+placed.
 
 ## Notes
 
