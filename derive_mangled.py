@@ -239,6 +239,73 @@ def derive_player_pos_alt(text: str, pos_field: str, player_start: int) -> str:
     )
 
 
+def derive_game_camera(text: str, game_start: int) -> str:
+    """Game.camera. The update handler records the packet inter-arrival time in
+    two places on the same line — the camera's interpolation window and the
+    debug HUD's graph:
+        this.<CAMERA>.<interpWindow> = <p> / 1e3, this.debugHUD.updateIntervalGraph.addEntry(<p>)
+    `debugHUD`, `updateIntervalGraph` and `addEntry` are all real readable
+    names, which makes this line a strong joint anchor for both fields.
+    """
+    pat = (
+        rf"this\.({IDENT})\.{IDENT}\s*=\s*[a-z]\s*/\s*(?:1e3|1000)\s*,\s*"
+        rf"this\.debugHUD\.updateIntervalGraph\.addEntry\("
+    )
+    return must_match("game.camera", text, pat, start=game_start)
+
+
+def derive_camera_interp_window(text: str, game_start: int) -> str:
+    """Camera.interpWindow — the seconds-per-server-update figure every entity
+    divides its `posInterpTicker` by to get its 0..1 lerp fraction.
+
+    Cross-checked across four independent shapes, which must agree:
+      1. the write in the update handler (see derive_game_camera)
+      2. the gas renderer:      <cam>.<ABS> && (n = clamp(this.interpolationT / <cam>.<WIN>, 0, 1))
+      3. `this.posInterpTicker` render sites (Player, Obstacle)
+      4. `<v>.posInterpTicker` render sites (Loot, Projectile)
+    `interpolationT` and `posInterpTicker` are real readable names.
+    """
+    candidates = (
+        all_matches(
+            text,
+            rf"this\.{IDENT}\.({IDENT})\s*=\s*[a-z]\s*/\s*(?:1e3|1000)\s*,\s*"
+            rf"this\.debugHUD\.updateIntervalGraph\.addEntry\(",
+            start=game_start,
+        )
+        + all_matches(
+            text,
+            rf"[a-z]\.{IDENT}\s*&&\s*\({IDENT}\s*=\s*{IDENT}\.clamp\("
+            rf"this\.interpolationT\s*/\s*[a-z]\.({IDENT})\s*,\s*0\s*,\s*1\)\)",
+        )
+        + all_matches(
+            text,
+            rf"this\.posInterpTicker\s*\+=\s*[a-z]\s*[,;]\s*(?:let\s+)?{IDENT}\s*=\s*"
+            rf"{IDENT}\.clamp\(this\.posInterpTicker\s*/\s*{IDENT}\.({IDENT})\s*,\s*0\s*,\s*1\)",
+        )
+        + all_matches(
+            text,
+            rf"([a-z])\.posInterpTicker\s*\+=\s*[a-z]\s*[,;]\s*(?:let\s+)?{IDENT}\s*=\s*"
+            rf"{IDENT}\.clamp\(\1\.posInterpTicker\s*/\s*{IDENT}\.({IDENT})\s*,\s*0\s*,\s*1\)",
+            group=2,
+        )
+    )
+    return majority_value("camera.interpWindow", candidates, min_count=3)
+
+
+def derive_camera_interp_enabled(text: str) -> str:
+    """Camera.interpEnabled — the user-facing "interpolation" setting. Every
+    interpolation site is guarded by it. Anchored on the gas renderer, the one
+    guard site that sits next to a readable field (`interpolationT`):
+        <cam>.<ENABLED> && (n = clamp(this.interpolationT / <cam>.<window>, 0, 1))
+    The same local must appear on both sides, so it is backreferenced.
+    """
+    pat = (
+        rf"([a-z])\.({IDENT})\s*&&\s*\({IDENT}\s*=\s*{IDENT}\.clamp\("
+        rf"this\.interpolationT\s*/\s*\1\.{IDENT}\s*,\s*0\s*,\s*1\)\)"
+    )
+    return must_match("camera.interpEnabled", text, pat, group=2)
+
+
 def derive_net_data(text: str, player_start: int) -> str:
     """The Player.netData sub-object. The network-update method writes many
     fields onto it; we anchor on activeWeapon/dead/downed (real names) and
@@ -395,11 +462,11 @@ window.__SURVEV_MANGLED__ = {{
   // Anchor: class declaring `bodySprite`, `helmetSprite`, `meleeSprite`,
   // `footLSprite`, `handLContainer`, etc. as own fields.
   player: {{
-    netData:   {q("player.netData")},
-    localData: {q("player.localData")},
-    pos:       {q("player.pos")},
-    dir:       {q("player.dir")},
-    posAlt:    {q("player.posAlt")},
+    netData:      {q("player.netData")},
+    localData:    {q("player.localData")},
+    pos:          {q("player.pos")},
+    dir:          {q("player.dir")},
+    posAlt:       {q("player.posAlt")},
   }},
 
   // ---- Player.netData (the sub-object named by player.netData above) ----
@@ -421,6 +488,18 @@ window.__SURVEV_MANGLED__ = {{
     localPlayer: {q("game.localPlayer")},
     roster:      {q("game.roster")},
     inputBinds:  {q("game.inputBinds")},
+    camera:      {q("game.camera")},
+  }},
+
+  // ---- Camera class (`ct` in bundle) ----
+  // `interpWindow` is seconds-per-server-update: the game overwrites it with
+  // the RAW last packet inter-arrival on every update, and every entity
+  // divides its `posInterpTicker` by it to get a 0..1 lerp fraction. inject.js
+  // replaces it with a jitter-buffered estimate — see the netcode smoothing
+  // block there.
+  camera: {{
+    interpWindow:  {q("camera.interpWindow")},
+    interpEnabled: {q("camera.interpEnabled")},
   }},
 
   // ---- Pool class (entity pools) ----
@@ -534,6 +613,9 @@ def main() -> None:
         ("game.localPlayer",      lambda: derive_game_local_player(text, g_start)),
         ("game.roster",           lambda: derive_game_roster(text, g_start)),
         ("game.inputBinds",       lambda: derive_game_input_binds(text, g_start)),
+        ("game.camera",           lambda: derive_game_camera(text, g_start)),
+        ("camera.interpWindow",   lambda: derive_camera_interp_window(text, g_start)),
+        ("camera.interpEnabled",  lambda: derive_camera_interp_enabled(text)),
         ("pool.getAll",           lambda: derive_pool_get_all(text)),
     ]
 

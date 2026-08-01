@@ -18,11 +18,11 @@ window.__SURVEV_MANGLED__ = {
   // Anchor: class declaring `bodySprite`, `helmetSprite`, `meleeSprite`,
   // `footLSprite`, `handLContainer`, etc. as own fields.
   player: {
-    netData:   'GATSOq',
-    localData: 'SujaN',
-    pos:       'JXy',
-    dir:       'SFg',
-    posAlt:    'WlKQJ',
+    netData:      'GATSOq',
+    localData:    'SujaN',
+    pos:          'JXy',
+    dir:          'SFg',
+    posAlt:       'WlKQJ',
   },
 
   // ---- Player.netData (the sub-object named by player.netData above) ----
@@ -44,6 +44,18 @@ window.__SURVEV_MANGLED__ = {
     localPlayer: 'iGQ',
     roster:      'uhx',
     inputBinds:  'KEC',
+    camera:      'tGah',
+  },
+
+  // ---- Camera class (`ct` in bundle) ----
+  // `interpWindow` is seconds-per-server-update: the game overwrites it with
+  // the RAW last packet inter-arrival on every update, and every entity
+  // divides its `posInterpTicker` by it to get a 0..1 lerp fraction. inject.js
+  // replaces it with a jitter-buffered estimate — see the netcode smoothing
+  // block there.
+  camera: {
+    interpWindow:  'GxXEfD',
+    interpEnabled: 'ABS',
   },
 
   // ---- Pool class (entity pools) ----

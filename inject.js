@@ -29,6 +29,9 @@
   const GAME_LOCAL   = M.game.localPlayer;
   const GAME_ROSTER  = M.game.roster;
   const GAME_BINDS   = M.game.inputBinds;
+  const GAME_CAMERA  = M.game.camera;
+  const CAM_INTERP_W = M.camera?.interpWindow;
+  const CAM_INTERP_ON = M.camera?.interpEnabled;
   const POOL_GETALL  = M.pool.getAll;
 
   const SAMPLE_MS = 20;
@@ -1236,6 +1239,9 @@
 
   function sampleLoop() {
     logZoomTick();
+    // Cheap no-op once attached; survev's menu markup is static, so this only
+    // does work on the first tick and after any rebuild.
+    try { ensureElgTab(); } catch {}
     const found = findRoot();
     const now = Date.now();
 
@@ -1279,6 +1285,12 @@
       }
       return;
     }
+
+    // Keep the render-smoothing hooks attached to the live Game. Runs before
+    // buildSample so a match that is still missing a roster/local player (the
+    // lobby, the first moments of a round) still gets its camera hooked.
+    netcodeTick(found.game);
+    try { updatePingUI(found.game, now); } catch {}
 
     const sample = buildSample(found);
     if (!sample || !sample.self) {
@@ -1409,10 +1421,22 @@
     // and the target point that we close per reference frame (AIM_REF_DT).
     // dt-corrected each frame so the closing rate is frame-rate independent.
     // 1.0 ⇒ instant snap; smaller ⇒ a slower glide onto the target.
-    followFraction: 0.15,
+    followFraction: 0.3,
     // After an enemy dies it stays lockable (acts alive) for this many ms,
     // so its corpse/last position can still be aimed at briefly.
     deadLingerMs: 600,
+    // Read target motion off the recovered server clock (the netcode section's
+    // pseudotime) instead of the 20ms sample ring. 0 falls the whole aim path
+    // back to enemyStateAt(). See clockPairAt() for why this is not just a
+    // smoothing preference.
+    clockAim: 1,
+    // How much of the measured round trip to lead by, as a fraction. The state
+    // we can see is one one-way delay old and a shot fired now arrives one
+    // one-way delay later, so an un-compensated server resolves the shot
+    // against a world a full RTT ahead of anything on screen — hence 1. Drop
+    // to 0 against a server that rewinds (lag compensation), where the shot is
+    // judged against the world we actually saw and any ping lead is overshoot.
+    pingLeadK: 1,
   };
   // id -> Date.now() when the enemy was first observed dead; lets pickTarget
   // keep a just-killed target lockable for AIM_HUMAN.deadLingerMs.
@@ -1496,9 +1520,13 @@
       mouseWorldY = player.y;
     }
 
+    // Score against where each enemy is on the clock, not where the last
+    // sample caught them: the user aims at the sprite, and the sprite is drawn
+    // from the clock.
     const scoreOf = (e) => {
-      const dx = e.x - mouseWorldX;
-      const dy = e.y - mouseWorldY;
+      const p = livePos(e.id, e);
+      const dx = p.x - mouseWorldX;
+      const dy = p.y - mouseWorldY;
       return dx * dx + dy * dy;
     };
 
@@ -1542,23 +1570,178 @@
     };
   }
 
-  // The world point "perfect aim given lag" wants the cursor on right now.
-  // Take the enemy's perceived state from `reactionMs` ago, extrapolate it
-  // forward by reactionMs along that perceived velocity (this is the lag
-  // cancellation — constant-velocity targets land exactly on their true
-  // current position), then add bullet lead so the shot connects.
+  // The snapshot pair on the recovered server clock (the netcode section
+  // below) that brackets pseudotime `tMs`: the two points p1@t1, p2@t2 that
+  // the target's motion is believed to run through, in the same timebase and
+  // off the same per-tick rings the renderer draws from.
+  //
+  // The aim path reads these rather than the 20ms sample ring because the
+  // sample ring is the wrong instrument for motion. Positions arrive at the
+  // server tick rate (~20Hz) and we sample them every SAMPLE_MS, so most
+  // sample gaps see the position unchanged and the occasional one sees a whole
+  // tick of movement at once: any velocity differenced from that is a comb —
+  // runs of zero punched through by spikes of 2-3x true speed — and every lead
+  // point built from it inherits the spikes. A snapshot pair spans exactly one
+  // tick of real motion over an exactly-known interval, with the arrival
+  // jitter already taken out by the clock fit.
+  //
+  // Returns null when the clock has not converged, the id has no ring, the
+  // ring belongs to a different (recycled) entity, or it has gone stale —
+  // callers fall back to the sample path.
+  function clockPairAt(id, tMs) {
+    if (!netClock.ready) return null;
+    const st = netSnapsById.get(id);
+    if (!st || st.id !== id) return null;
+    const s = st.snaps;
+    if (!s || s.length < 2) return null;
+    // A ring that stopped being written is a player the server is no longer
+    // streaming to us; extending its line would walk a ghost across the map.
+    // NET_SNAP_CAP ticks is ~400ms at 20Hz.
+    if (netClock.n - 1 - s[s.length - 1].n > NET_SNAP_CAP) return null;
+    let i = s.length - 2;
+    while (i > 0 && pseudotimeOf(s[i].n) > tMs) i--;
+    const p1 = s[i];
+    const p2 = s[i + 1];
+    const t1 = pseudotimeOf(p1.n);
+    const t2 = pseudotimeOf(p2.n);
+    if (t1 === t2) return null;
+    return { p1, p2, t1, t2 };
+  }
+
+  // Evaluate a pair at any pseudotime:
+  //
+  //     p1 * (t - t2)/(t1 - t2) + p2 * (t1 - t)/(t1 - t2)
+  //
+  // the same unclamped two-point lerp renderOnClock draws with, so a `t` past
+  // t2 continues the line the renderer is already extending rather than
+  // stopping at the last thing the server said. Asking for a *future* t is
+  // what makes this the aim primitive: the point we want to shoot at is the
+  // target's position at the pseudotime the bullet gets there.
+  function pairAt(pair, tMs) {
+    const d = pair.t1 - pair.t2;
+    const w1 = (tMs - pair.t2) / d;
+    const w2 = (pair.t1 - tMs) / d;
+    return {
+      x: pair.p1.x * w1 + pair.p2.x * w2,
+      y: pair.p1.y * w1 + pair.p2.y * w2,
+    };
+  }
+
+  // Position + velocity on the clock at `tMs`, for callers that want a state
+  // rather than a line (target selection, the overlay, diagnostics).
+  function stateOnClock(id, tMs) {
+    const pair = clockPairAt(id, tMs);
+    if (!pair) return null;
+    const p = pairAt(pair, tMs);
+    const perSec = 1000 / (pair.t2 - pair.t1);
+    p.xv = (pair.p2.x - pair.p1.x) * perSec;
+    p.yv = (pair.p2.y - pair.p1.y) * perSec;
+    return p;
+  }
+
+  // Where an entity is *as drawn* — render time, not true clock time, so this
+  // answers "what is under the cursor" against the sprite the user is actually
+  // looking at. Falls back to the position carried by the sample.
+  function livePos(id, fallback) {
+    return (AIM_HUMAN.clockAim ? stateOnClock(id, renderNowMs()) : null) || fallback;
+  }
+
+  // The local player as drawn. The game centres the camera on the rendered
+  // position, and every screen↔world conversion in the aim path is relative to
+  // that centre, so this has to be on render time too — the sampled position
+  // is up to a sample old, and true clock time is half a tick ahead of the
+  // camera. The shot's own origin is solved separately, on true time.
+  function liveSelf(sample) {
+    const self = sample?.self;
+    if (!self || self.id == null) return self;
+    const s = AIM_HUMAN.clockAim ? stateOnClock(self.id, renderNowMs()) : null;
+    return s ? { ...self, x: s.x, y: s.y, xv: s.xv, yv: s.yv } : self;
+  }
+
+  // The world point perfect aim wants the shot to go through, and the point it
+  // has to be aimed *from*.
+  //
+  // Both sides of the shot are read off the clock at the pseudotime they
+  // actually happen at, rather than being extrapolated by hand:
+  //
+  //   the shot spawns at   t_now + ping   — the input we send now reaches the
+  //                                         server one one-way delay later,
+  //                                         and the state we are looking at
+  //                                         already left it one one-way delay
+  //                                         ago, so the world the server
+  //                                         resolves the shot in is a full
+  //                                         round trip ahead of this frame;
+  //   it connects at       t_now + ping + travel.
+  //
+  // So with the target's line running through p1@t1 and p2@t2, perfect aim is
+  // that line evaluated at `t_now + ping + travel`:
+  //
+  //     p1 * (T - t2)/(t1 - t2) + p2 * (t1 - T)/(t1 - t2),  T = t_now+ping+travel
+  //
+  // and the origin is our own line evaluated at `t_now + ping` — spawn time,
+  // not impact time: the bullet leaves when the input lands, and where we walk
+  // during its flight cannot change where it was fired from.
+  //
+  // `travel` depends on the answer, so it is solved by fixed-point iteration.
+  // Each pass shrinks the residual by the target-to-bullet speed ratio (~0.12
+  // for a sprinting player and a mid-tier gun), so three passes land within a
+  // few millimetres against a ~1 unit player radius.
+  //
+  // reactionMs is latency, not a shorter lead — it is fake ping, and is
+  // carried alongside the real one. A human reacting late is acting on a view
+  // of the world reactionMs old, and pays for that by having to lead
+  // reactionMs further, so the two moves cancel on a target holding a constant
+  // velocity and only a *change* in its motion is picked up late. Both halves
+  // are needed: delaying the view without extending the lead would aim behind
+  // every moving target, and extending the lead without delaying the view
+  // would aim past it. Written out, the viewpoint is
+  //
+  //     t_v  = t_now - reactionMs
+  //
+  // and the lead from it is `reactionMs + ping + travel`, which puts the
+  // evaluation back at t_now + ping + travel — the shot's real impact time,
+  // reached with information we are only allowed to have had reactionMs ago.
+  // At reactionMs = 0 the viewpoint is now, the pair is the newest, and the
+  // expression above is exactly perfect aim.
+  //
+  // pingLeadK scales the round trip, and `player` is the local player's sample
+  // (its id is what puts our own line on the clock; x/y are the fallback).
   function reactionTarget(player, enemy, now) {
-    const past = enemyStateAt(enemy.id, now - AIM_HUMAN.reactionMs)
-      || { x: enemy.x, y: enemy.y, xv: enemy.xv ?? 0, yv: enemy.yv ?? 0 };
-    const D = AIM_HUMAN.reactionMs / 1000;
-    // Reaction-extrapolate the perceived position to the present.
-    const rx = past.x + past.xv * D;
-    const ry = past.y + past.yv * D;
-    // Bullet lead: time for the projectile to travel from me to that point,
-    // then advance the target one more tHit along the perceived velocity.
+    const tNow = performance.now();
+    const pingMs = AIM_HUMAN.pingLeadK ? (medianPingMs() ?? 0) * AIM_HUMAN.pingLeadK : 0;
     const bulletSpeed = player.bulletSpeed ?? 1e8;
-    const tHit = Math.hypot(rx - player.x, ry - player.y) / bulletSpeed;
-    return { x: rx + past.xv * tHit, y: ry + past.yv * tHit };
+    const viewMs = tNow - AIM_HUMAN.reactionMs;      // what we let ourselves know
+    const leadMs = AIM_HUMAN.reactionMs + pingMs;    // and what that costs us
+
+    const pair = AIM_HUMAN.clockAim ? clockPairAt(enemy.id, viewMs) : null;
+    // Off-clock fallback: the sample ring's state at the same viewpoint,
+    // carried forward on the velocity perceived there. Same timeline, coarser
+    // instrument.
+    const seen = pair ? null : (enemyStateAt(enemy.id, now - AIM_HUMAN.reactionMs)
+      || { x: enemy.x, y: enemy.y, xv: enemy.xv ?? 0, yv: enemy.yv ?? 0 });
+    const at = pair
+      ? (travelMs) => pairAt(pair, viewMs + leadMs + travelMs)
+      : (travelMs) => {
+        const d = (leadMs + travelMs) / 1000;
+        return { x: seen.x + seen.xv * d, y: seen.y + seen.yv * d };
+      };
+
+    // Our own line is taken at the newest pair rather than the delayed
+    // viewpoint: reaction time is a limit on tracking a target, not on knowing
+    // where we ourselves are standing. It is still evaluated at spawn time,
+    // which is the same instant either way.
+    const selfPair = (AIM_HUMAN.clockAim && player.id != null)
+      ? clockPairAt(player.id, tNow) : null;
+    const from = selfPair
+      ? pairAt(selfPair, viewMs + leadMs)
+      : { x: player.x, y: player.y };
+
+    let hit = at(0);
+    for (let i = 0; i < 3; i++) {
+      const travelMs = Math.hypot(hit.x - from.x, hit.y - from.y) / bulletSpeed * 1000;
+      hit = at(travelMs);
+    }
+    return { x: hit.x, y: hit.y, fromX: from.x, fromY: from.y };
   }
 
   function dispatchAim() {
@@ -1567,8 +1750,9 @@
     if (!pageSamples.length) return;
 
     const last_sample = pageSamples[pageSamples.length - 1];
-    const player = last_sample.self;
+    const player = liveSelf(last_sample);
     const enemies = last_sample.enemies;
+    if (!player) return;
 
     const now = Date.now();
     const dt = aimState.lastFrameAt ? Math.max(0.001, (now - aimState.lastFrameAt) / 1000) : AIM_REF_DT;
@@ -1595,7 +1779,12 @@
       const k = 1 - Math.pow(1 - AIM_HUMAN.followFraction, dt / AIM_REF_DT);
       aimState.aimX += (tgt.x - aimState.aimX) * k;
       aimState.aimY += (tgt.y - aimState.aimY) * k;
-      aimState.theta = Math.atan2(aimState.aimY - player.y, aimState.aimX - player.x);
+      // Bearing from where the shot will actually be fired from, not from
+      // where we are drawn this frame — the game only ever gets the direction,
+      // and the server pairs it with our position at the moment the input
+      // lands. Over a 100ms round trip at full sprint those two origins are a
+      // world unit apart, which is a couple of degrees at duel range.
+      aimState.theta = Math.atan2(aimState.aimY - tgt.fromY, aimState.aimX - tgt.fromX);
     } else {
       aimState.targetId = null;
     }
@@ -1658,7 +1847,6 @@
       realMouse.x = e.clientX;
       realMouse.y = e.clientY;
       realMouse.hasMoved = true;
-      updateAimMenuVisibility(e.clientX, e.clientY);
     }
     if (!shiftHeld || !e.isTrusted) return;
     e.stopImmediatePropagation();
@@ -1666,8 +1854,8 @@
   }, true);
 
   // Live-tunable auto-quickswap settings. Declared here (rather than beside
-  // the auto-quickswap code below) because AIM_MENU_SPECS binds a slider to
-  // it and would hit the temporal dead zone otherwise.
+  // the auto-quickswap code below) because SETTINGS_SPECS binds a slider to it
+  // and would hit the temporal dead zone otherwise.
   const AUTO_SWAP = {
     // Minimum fireDelay, in seconds, for a gun to be treated as
     // slow-firing. The default sits just under the 0.5s USAS-12 so the
@@ -1678,96 +1866,288 @@
     slowFireThreshold: 0.5,
   };
 
+  // Live-tunable netcode-smoothing settings — hoisted up here for the same
+  // temporal-dead-zone reason as AUTO_SWAP. What each knob does, and why the
+  // smoothing is needed at all, is documented at the netcode section below.
+  const NETCODE = {
+    enabled: 1,        // master switch; 0 = stock survev behaviour
+    // Window handed to survev's own lerp for everything that is NOT a player
+    // — loot, obstacles, projectiles, the gas circle — as
+    // `mean gap + jitterK * mean-abs-deviation`. Players bypass that lerp
+    // entirely and render on the recovered clock instead, so this only ever
+    // affects those other entities. Kept small because a window wider than the
+    // real gap leaves each lerp unfinished, which is its own discontinuity.
+    jitterK: 0.5,
+    forceInterp: 1,    // hold survev's own interpolation setting on
+    // Weight half-life of the clock regression, in packets (~5s at 20Hz).
+    // Deliberately long: we are recovering a clock, and the whole point is
+    // that individual arrivals barely move it.
+    clockHalfLife: 100,
+    // Playout delay, in ticks: the render is taken at `t_now - renderLag *
+    // tick` instead of at t_now. Half a tick is the natural setting — the
+    // newest snapshot's pseudotime is on average half a tick old by the time
+    // any given frame renders, so this is the offset that centres the render
+    // on the data instead of leaning permanently past its end. 0 restores
+    // rendering at t_now (pure extrapolation, lowest latency, worst overshoot
+    // on turns and stops); netcode_sim.js measures the trade either way. Aim
+    // is unaffected — it solves on true clock time, not render time.
+    renderLag: 0.5,
+  };
+
+  // Ping readout shown above the team panel. Hoisted for the same
+  // temporal-dead-zone reason as AUTO_SWAP and NETCODE.
+  const PING_UI = {
+    enabled: 1,
+  };
+
   // ---------------------------------------------------------------------
-  // Top-right settings menu for live-tuning the AIM_HUMAN parameters and
-  // the auto-quickswap threshold. Hidden by default; revealed only while
-  // the real cursor is in the top-right corner zone (or while the user is
-  // dragging one of its controls). Each row is a slider bound to one key
-  // on a settings object, so edits take effect on the very next frame.
+  // Settings UI, injected as a third tab in survev's own Escape menu next to
+  // Settings and Keybinds.
+  //
+  // survev's menu is plain DOM: `#btn-game-tabs` holds one `.btn-game-tab-select`
+  // per tab, each pane is a `#ui-game-tab-<name>.ui-game-tab`, and switching
+  // does
+  //     gameTabs.css('display','none'); gameTabBtns.removeClass('btn-game-menu-selected');
+  //     $('#ui-game-tab-' + tab).css('display','block');
+  //     $('#btn-game-' + tab).addClass('btn-game-menu-selected');
+  //
+  // The catch is that `gameTabs`/`gameTabBtns` are jQuery collections captured
+  // once when the Game is constructed, so anything injected afterwards is
+  // invisible to them: survev would neither hide our pane when switching away
+  // nor fire its handler for our button. So we run our own switching logic
+  // over live queries. Once a new round re-runs init() our elements *are* in
+  // its collections and it drives them natively — both paths converge on the
+  // same DOM state, so it doesn't matter which is in charge.
+  //
+  // Everything is built from survev's own classes so it looks native, and the
+  // pane is re-attached on demand because the menu markup can be rebuilt.
   // ---------------------------------------------------------------------
-  const AIM_MENU_SPECS = [
-    { store: AIM_HUMAN, key: 'reactionMs',     label: 'Reaction (ms)',  min: 0,   max: 400,  step: 5,    decimals: 0 },
-    { store: AIM_HUMAN, key: 'followFraction', label: 'Follow frac',    min: 0.01, max: 1,    step: 0.01, decimals: 2 },
-    { store: AIM_HUMAN, key: 'deadLingerMs',   label: 'Dead linger (ms)', min: 0, max: 2000, step: 50,   decimals: 0 },
-    { store: AUTO_SWAP, key: 'slowFireThreshold', label: 'Slow-fire ≥ (s)', min: 0.1, max: 2, step: 0.05, decimals: 2,
+
+  // One row per tunable. `kind: 'toggle'` renders a button, anything else a
+  // slider; `section` starts a new heading above the row.
+  const SETTINGS_SPECS = [
+    { store: AIM_HUMAN, key: 'reactionMs',     label: 'Reaction',  unit: 'ms', min: 0,    max: 400,  step: 5,    decimals: 0,
+      section: 'Aim humanization' },
+    { store: AIM_HUMAN, key: 'followFraction', label: 'Follow',                min: 0.01, max: 1,    step: 0.01, decimals: 2 },
+    { store: AIM_HUMAN, key: 'deadLingerMs',   label: 'Linger',    unit: 'ms', min: 0,    max: 2000, step: 50,   decimals: 0 },
+    { store: AIM_HUMAN, key: 'pingLeadK',      label: 'Ping lead',             min: 0,    max: 1.5,  step: 0.05, decimals: 2 },
+    { store: AIM_HUMAN, key: 'clockAim',       label: 'Clock aim', kind: 'toggle' },
+    { store: AUTO_SWAP, key: 'slowFireThreshold', label: 'Slow-fire', unit: 's', min: 0.1, max: 2,   step: 0.05, decimals: 2,
       section: 'Auto-quickswap' },
+    { store: NETCODE,   key: 'enabled',        label: 'Smoothing', kind: 'toggle',
+      section: 'Netcode smoothing' },
+    { store: NETCODE,   key: 'jitterK',        label: 'Jitter buf',            min: 0,    max: 5,    step: 0.1,  decimals: 1 },
+    { store: NETCODE,   key: 'clockHalfLife',  label: 'Clock',     unit: ' pkt', min: 5,  max: 400,  step: 5,    decimals: 0 },
+    { store: NETCODE,   key: 'renderLag',      label: 'Playout',   unit: ' tick', min: 0, max: 2,   step: 0.05, decimals: 2 },
+    { store: NETCODE,   key: 'forceInterp',    label: 'Force interp', kind: 'toggle' },
+    { store: PING_UI,   key: 'enabled',        label: 'Ping readout', kind: 'toggle',
+      section: 'HUD' },
   ];
-  // px from the top-right corner within which the menu reveals itself. The
-  // zone has to cover the whole panel, or moving the cursor down toward the
-  // lowest slider hides the menu before you can grab it — hence the extra
-  // height for the auto-quickswap section.
-  const AIM_MENU_ZONE_W = 280;
-  const AIM_MENU_ZONE_H = 320;
-  let aimMenuEl = null;
-  let aimMenuInteracting = false; // true while a slider is being dragged
 
-  function ensureAimMenu() {
-    if (aimMenuEl && aimMenuEl.isConnected) return aimMenuEl;
-    const parent = document.body || document.documentElement;
-    if (!parent) return null;
-    const panel = document.createElement('div');
-    panel.style.cssText = [
-      'position:fixed', 'top:8px', 'right:8px', 'width:220px',
-      'padding:10px 12px', 'box-sizing:border-box',
-      'background:rgba(15,17,22,0.92)', 'color:#e6e6e6',
-      'font:12px/1.4 system-ui,sans-serif', 'border:1px solid #3a3f4b',
-      'border-radius:8px', 'z-index:2147483647', 'pointer-events:auto',
-      'display:none', 'user-select:none', 'box-shadow:0 4px 16px rgba(0,0,0,0.4)'
-    ].join(';');
-    const title = document.createElement('div');
-    title.textContent = 'Aim humanization';
-    title.style.cssText = 'font-weight:600;margin-bottom:8px;opacity:0.85';
-    panel.appendChild(title);
+  const ELG_TAB = 'elg';
+  const ELG_TAB_BTN_ID = `btn-game-${ELG_TAB}`;
+  const ELG_TAB_PANE_ID = `ui-game-tab-${ELG_TAB}`;
+  const ELG_LIST_ID = `ui-${ELG_TAB}-list`;
+  const ELG_STYLE_ID = `${ELG_TAB}-style`;
 
-    for (const spec of AIM_MENU_SPECS) {
+  // survev's stylesheet only targets its own two tabs by id, so ours gets an
+  // equivalent rule rather than inheriting one. Values are copied from the
+  // shipped CSS so the tab is dimensionally identical to the others:
+  //
+  //   #ui-game-tab-keybinds>#ui-keybind-list { pointer-events:all; height:295px; overflow-y:scroll }
+  //
+  // Keybinds is the model rather than Settings because Settings gets its height
+  // from `ui-game-tab-settings-desktop`, a class the bundle adds and removes as
+  // the layout switches between desktop and mobile — copying that would mean
+  // tracking the layout too. Keybinds sizes its inner list unconditionally.
+  //
+  // `pointer-events:all` is load-bearing: the whole `#ui-game` HUD is
+  // click-through, so a pane that doesn't opt back in cannot be scrolled or
+  // clicked at all.
+  //
+  // The slider rows themselves get no rules at all: they use survev's exact
+  // markup, so `.ui-slider-container > p { width:75px }` and
+  // `.ui-slider-container > .slider { width:260px }` style them identically to
+  // the volume sliders. That 75px label column wraps to two lines for survev's
+  // own labels too, which is why ours are kept to a comparable length rather
+  // than the column being widened — widening it is what made them stop
+  // matching.
+  const ELG_STYLE = `
+    #${ELG_TAB_PANE_ID} > #${ELG_LIST_ID} {
+      pointer-events: all;
+      height: 295px;
+      overflow-y: scroll;
+      /* Belt-and-braces against the same promotion: nothing in the pane is
+         wider than the track, so clipping here can only ever hide a stray
+         pixel, never content. */
+      overflow-x: hidden;
+    }
+    #${ELG_LIST_ID} .elg-heading {
+      display: block;
+      width: auto;
+      margin: 14px 0 2px;
+      font-size: 12px;
+      opacity: 0.75;
+      text-transform: uppercase;
+      /* #ui-game-menu p nudges labels up by 4px to sit beside their slider;
+         a block heading has no slider to line up with. */
+      bottom: 0;
+    }
+    #${ELG_LIST_ID} .elg-heading:first-child { margin-top: 0; }
+    /* Tab buttons are 30px tall but #btn-game-tabs sets line-height:36px,
+       which is invisible on survev's icon-only tabs and off-centre on ours. */
+    #${ELG_TAB_BTN_ID} { line-height: 30px; }
+  `;
+
+  function ensureElgStyles() {
+    if (document.getElementById(ELG_STYLE_ID)) return;
+    const head = document.head || document.documentElement;
+    if (!head) return;
+    const style = document.createElement('style');
+    style.id = ELG_STYLE_ID;
+    style.textContent = ELG_STYLE;
+    head.appendChild(style);
+  }
+
+  // Show the named tab and hide every other one, using live queries so our
+  // injected pane participates.
+  function elgSelectTab(tab) {
+    document.querySelectorAll('.ui-game-tab').forEach((el) => {
+      el.style.display = el.id === `ui-game-tab-${tab}` ? 'block' : 'none';
+    });
+    document.querySelectorAll('.btn-game-tab-select').forEach((el) => {
+      el.classList.toggle('btn-game-menu-selected', el.id === `btn-game-${tab}`);
+    });
+  }
+
+  function buildElgPane() {
+    const pane = document.createElement('div');
+    pane.id = ELG_TAB_PANE_ID;
+    pane.className = 'ui-game-tab';
+    pane.style.display = 'none';
+
+    // Rows live in an inner scroll container, mirroring how the keybinds tab
+    // wraps its list — the pane itself stays unsized so the menu lays out
+    // exactly as it does for survev's own tabs.
+    const list = document.createElement('div');
+    list.id = ELG_LIST_ID;
+    pane.appendChild(list);
+
+    for (const spec of SETTINGS_SPECS) {
       if (spec.section) {
-        const heading = document.createElement('div');
+        const heading = document.createElement('p');
+        heading.className = 'slider-text elg-heading';
         heading.textContent = spec.section;
-        heading.style.cssText = 'font-weight:600;margin:12px 0 4px;padding-top:8px;'
-          + 'border-top:1px solid #3a3f4b;opacity:0.85';
-        panel.appendChild(heading);
+        list.appendChild(heading);
       }
-      const row = document.createElement('label');
-      row.style.cssText = 'display:block;margin:8px 0';
-      const head = document.createElement('div');
-      head.style.cssText = 'display:flex;justify-content:space-between;margin-bottom:3px';
-      const name = document.createElement('span');
-      name.textContent = spec.label;
-      const val = document.createElement('span');
-      val.style.cssText = 'opacity:0.8;font-variant-numeric:tabular-nums';
-      val.textContent = Number(spec.store[spec.key]).toFixed(spec.decimals);
-      head.appendChild(name); head.appendChild(val);
+
+      // Toggles reuse the menu-button look; sliders reuse the volume-slider
+      // markup, so both inherit survev's styling rather than fighting it.
+      if (spec.kind === 'toggle') {
+        const btn = document.createElement('a');
+        btn.className = 'btn-game-menu btn-darken';
+        const paint = () => {
+          btn.textContent = `${spec.label}: ${spec.store[spec.key] ? 'ON' : 'OFF'}`;
+        };
+        paint();
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          spec.store[spec.key] = spec.store[spec.key] ? 0 : 1;
+          paint();
+        });
+        list.appendChild(btn);
+        continue;
+      }
+
+      const row = document.createElement('div');
+      row.className = 'slider-container ui-slider-container';
+      const label = document.createElement('p');
+      label.className = 'slider-text';
+      // Kept terse so it wraps no worse than survev's own "Master Volume" in
+      // the shared 75px label column.
+      const paintLabel = (v) => {
+        label.textContent = `${spec.label}: ${Number(v).toFixed(spec.decimals)}${spec.unit || ''}`;
+      };
+      paintLabel(spec.store[spec.key]);
       const slider = document.createElement('input');
       slider.type = 'range';
-      slider.min = String(spec.min); slider.max = String(spec.max); slider.step = String(spec.step);
+      slider.className = 'slider';
+      slider.min = String(spec.min);
+      slider.max = String(spec.max);
+      slider.step = String(spec.step);
       slider.value = String(spec.store[spec.key]);
-      slider.style.cssText = 'width:100%;cursor:pointer;accent-color:#5b9dff';
       slider.addEventListener('input', () => {
         const v = Number(slider.value);
         spec.store[spec.key] = v;
-        val.textContent = v.toFixed(spec.decimals);
+        paintLabel(v);
       });
-      row.appendChild(head); row.appendChild(slider);
-      panel.appendChild(row);
+      // The menu sits over the game canvas; keep drags from reaching it.
+      slider.addEventListener('mousedown', (e) => e.stopPropagation());
+      row.appendChild(label);
+      // A whitespace text node between the two inline-blocks, exactly as
+      // survev's own markup has from its source indentation. It is the only
+      // soft-wrap opportunity in the row, and without it the 75px label plus
+      // the 260px track (335px) cannot break inside the menu's 320px content
+      // box — the line overflows, and since `overflow-y: scroll` promotes
+      // `overflow-x` from `visible` to `auto` (CSS Overflow 3), that surfaces
+      // as a horizontal scrollbar. With it, the track wraps below the label
+      // and the row matches the volume sliders.
+      row.appendChild(document.createTextNode(' '));
+      row.appendChild(slider);
+      list.appendChild(row);
     }
-
-    // Keep the menu open across a drag even if the cursor strays out of the
-    // corner zone, and never let menu interaction reach the game canvas.
-    panel.addEventListener('mousedown', (e) => { aimMenuInteracting = true; e.stopPropagation(); });
-    panel.addEventListener('click', (e) => e.stopPropagation());
-    panel.addEventListener('wheel', (e) => e.stopPropagation());
-    window.addEventListener('mouseup', () => { aimMenuInteracting = false; });
-
-    parent.appendChild(panel);
-    aimMenuEl = panel;
-    return panel;
+    return pane;
   }
 
-  function updateAimMenuVisibility(x, y) {
-    const inZone = x >= window.innerWidth - AIM_MENU_ZONE_W && y <= AIM_MENU_ZONE_H;
-    const menu = ensureAimMenu();
-    if (!menu) return;
-    menu.style.display = (inZone || aimMenuInteracting) ? 'block' : 'none';
+  function buildElgTabButton() {
+    const container = document.createElement('div');
+    container.className = 'btn-game-container';
+    const btn = document.createElement('a');
+    btn.id = ELG_TAB_BTN_ID;
+    btn.className = 'btn-game-tab-select btn-game-menu btn-darken';
+    btn.dataset.tab = ELG_TAB;
+    // survev's own tabs are empty anchors with a sprite layered on top; we have
+    // no sprite to reuse, so this one carries a text label instead.
+    btn.textContent = 'MOD';
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      elgSelectTab(ELG_TAB);
+    });
+    container.appendChild(btn);
+    return container;
+  }
+
+  // Attach (or re-attach) the tab. Cheap no-op once present, so it can be
+  // called from the sample loop without any lifecycle tracking of its own.
+  function ensureElgTab() {
+    ensureElgStyles();
+    const tabs = document.getElementById('btn-game-tabs');
+    const menu = document.getElementById('ui-game-menu');
+    if (!tabs || !menu) return;
+
+    if (!document.getElementById(ELG_TAB_BTN_ID)) {
+      tabs.appendChild(buildElgTabButton());
+      // survev's handler can't hide a pane it never captured, so mirror its
+      // switch whenever one of its own tabs is clicked.
+      tabs.addEventListener('click', (e) => {
+        const btn = e.target.closest?.('.btn-game-tab-select');
+        if (!btn || btn.id === ELG_TAB_BTN_ID) return;
+        const pane = document.getElementById(ELG_TAB_PANE_ID);
+        if (pane) pane.style.display = 'none';
+        document.getElementById(ELG_TAB_BTN_ID)?.classList.remove('btn-game-menu-selected');
+      });
+    }
+    if (!document.getElementById(ELG_TAB_PANE_ID)) {
+      // "Return to Game" is not part of any tab — it is a sibling pinned after
+      // all of them, so every pane renders above it. Appending to the menu puts
+      // our pane *below* it instead; insert before it to sit where survev's own
+      // panes do. Falling back to append keeps this working if that button is
+      // ever renamed or removed.
+      const resume = document.getElementById('btn-game-resume');
+      const pane = buildElgPane();
+      if (resume && resume.parentElement === menu) menu.insertBefore(pane, resume);
+      else menu.appendChild(pane);
+    }
   }
 
   // ---------------------------------------------------------------------
@@ -1941,6 +2321,540 @@
   requestAnimationFrame(autoSwapFrameTick);
 
   // ---------------------------------------------------------------------
+  // Netcode smoothing: kill the stutter survev shows on a jittery link.
+  //
+  // How survev renders motion. Positions only ever arrive in server update
+  // packets. On each packet the client records the raw inter-arrival gap on
+  // the camera:
+  //     camera[interpWindow] = (now - lastUpdateTime) / 1000
+  // and every entity (players, loot, obstacles, projectiles, the gas circle)
+  // renders itself at
+  //     lerp(clamp(posInterpTicker / camera[interpWindow], 0, 1),
+  //          visualPosOld, pos)
+  // where `posInterpTicker` accumulates frame dt and resets to 0 whenever a
+  // packet brings a *different* position. Segments are chained, so
+  // `visualPosOld` of one segment is the `pos` of the previous one.
+  //
+  // Two things go wrong the moment the link is anything but perfect:
+  //
+  //   1. The window is the RAW previous gap, so it is wrong for the interval
+  //      it is actually used on. On a link jittering 20/80/20/80ms the client
+  //      spends the 80ms intervals playing back at 4x and then sitting frozen
+  //      for 60ms, and the 20ms intervals crawling at 1/4 speed and snapping.
+  //      That alternating sprint/freeze *is* the stutter.
+  //   2. `clamp(..., 0, 1)` means a late packet freezes every entity dead
+  //      until it lands, then teleports it.
+  //
+  // The fix has two independent parts.
+  //
+  //   A. A recovered server clock, which is what actually removes the stutter.
+  //      Updates are numbered by arrival, and arrival time is fit against that
+  //      index with a slow exponentially-weighted linear regression. The fit
+  //      gives each packet a `pseudotime`: when it would have arrived on a
+  //      jitter-free link. Players are then rendered by lerping between the
+  //      last two snapshots on that clock, so the render time advances
+  //      smoothly and is never yanked by one late arrival. The discontinuities
+  //      stop existing rather than being blended away afterwards.
+  //
+  //      Numbering by arrival is exact here: survev runs over a WebSocket, so
+  //      TCP guarantees no loss and no reordering, and the arrival count *is*
+  //      the tick index. That would not hold over UDP.
+  //
+  //   B. A jitter-buffered window for everything that is not a player — loot,
+  //      obstacles, projectiles, the gas circle. Those still go through
+  //      survev's own lerp, so the raw inter-arrival gap it divides by is
+  //      replaced with an EWMA of the mean plus an allowance proportional to
+  //      measured deviation. One accessor on one camera field reaches all of
+  //      them at once.
+  //
+  //   The render is deliberately unclamped — a render time past the newest
+  //   snapshot extrapolates along the same line rather than freezing — but it
+  //   is taken half a tick behind the clock rather than at `t_now`, so most
+  //   frames interpolate between two snapshots we hold instead of extending
+  //   past the newest one. That halves the overshoot on direction changes and
+  //   on stops, for a playout delay that still leaves the render ahead of
+  //   stock survev's. `renderLag` tunes it; netcode_sim.js has the numbers at
+  //   either setting.
+  //
+  // Everything here is a pure render-path change: no input, no packet, and no
+  // gameplay state is touched, and `enabled = 0` restores stock behaviour live.
+  // ---------------------------------------------------------------------
+
+  // (NETCODE itself is declared up beside AUTO_SWAP so the settings menu can
+  // bind to it without hitting the temporal dead zone.)
+
+  // Bounds on a *plausible* server update gap. Outside this band the sample is
+  // a tab-blur, a round change or a join hitch rather than a real tick, and is
+  // kept out of the average (the extrapolator covers the gap instead).
+  const NET_MIN_UPDATE_MS = 10;
+  const NET_MAX_UPDATE_MS = 400;
+  const NET_EWMA_ALPHA = 0.1;   // ~10-packet horizon, matching the overlay's
+  // Snapshots retained per player. Only the newest two are rendered from; the
+  // rest are headroom so a TCP burst can be recorded without dropping ticks.
+  const NET_SNAP_CAP = 8;
+
+  const netStats = {
+    hookedCamera: null,
+    rawMs: 0,       // last raw inter-arrival the game handed us
+    meanMs: 0,      // EWMA of the gap
+    devMs: 0,       // EWMA of |gap - mean|, our jitter measure
+    windowMs: 0,    // what we hand back in place of the raw gap
+    updates: 0,
+    playersHooked: 0,   // cumulative across rounds, not a live count
+  };
+
+  // Fold one server-update gap into the jitter-buffer estimate. Called from
+  // the camera setter, i.e. exactly once per update packet.
+  function recordUpdateInterval(sec) {
+    const ms = Number(sec) * 1000;
+    if (!Number.isFinite(ms)) return;
+    netStats.rawMs = ms;
+    netStats.updates++;
+    if (ms < NET_MIN_UPDATE_MS || ms > NET_MAX_UPDATE_MS) return;
+    if (!netStats.meanMs) {
+      // Seed straight from the first gap rather than ramping up from zero.
+      netStats.meanMs = ms;
+      netStats.devMs = 0;
+    } else {
+      // Deviation is folded against the pre-update mean, so a step change in
+      // the link shows up as jitter for a few packets and widens the buffer
+      // before the mean has finished chasing it.
+      netStats.devMs = NET_EWMA_ALPHA * Math.abs(ms - netStats.meanMs)
+        + (1 - NET_EWMA_ALPHA) * netStats.devMs;
+      netStats.meanMs = NET_EWMA_ALPHA * ms + (1 - NET_EWMA_ALPHA) * netStats.meanMs;
+    }
+    const target = netStats.meanMs + NETCODE.jitterK * netStats.devMs;
+    // Floor at exactly the mean, with no inflation. A window wider than the
+    // gap leaves each lerp unfinished when the next packet starts a new
+    // segment, which is a seam the blend then has to hide — so on a link with
+    // no jitter to absorb, any padding here is pure cost: it manufactures the
+    // very discontinuity the smoother exists to remove. At dev == 0 this makes
+    // the window equal the gap, t reach exactly 1, and the whole path collapse
+    // to stock behaviour.
+    netStats.windowMs = Math.min(Math.max(target, netStats.meanMs), NET_MAX_UPDATE_MS);
+  }
+
+  // ---------------------------------------------------------------------
+  // Pseudotime clock.
+  //
+  // The window estimate above fixes the *rate* at which we play positions
+  // back, but not the *phase*: survev restarts each entity's lerp the instant
+  // a packet lands (`posInterpTicker = 0`), so every arrival's jitter is
+  // injected straight into the render. Blending the resulting discontinuity
+  // away treats the symptom.
+  //
+  // Instead, recover the server's tick clock. Updates are numbered by arrival
+  // — safe here because survev runs over a WebSocket, so TCP guarantees no
+  // loss and no reordering, and the arrival count *is* the tick index — and we
+  // fit arrival time against that index with an exponentially-weighted least
+  // squares. The fit gives every packet a `pseudotime`: when it would have
+  // arrived on a jitter-free link. Rendering against that clock means the
+  // render time advances smoothly and is never yanked by one late arrival, so
+  // the discontinuities stop existing rather than being hidden.
+  //
+  // The render is unclamped, so a stall is extrapolated through rather than
+  // frozen, and it is taken at `t_now - renderLag * tick` rather than at
+  // t_now. Rendering at t_now exactly means the newest snapshot's pseudotime
+  // is always a little in the past, so every frame leans past the end of the
+  // data; half a tick of playout centres the render on the data instead. The
+  // extrapolation is still there when it is needed — during a stall there is
+  // nothing else — but it stops being the steady state. netcode_sim.js
+  // measures both settings; see the trade note at the bottom of it.
+  // ---------------------------------------------------------------------
+
+  const NET_CLOCK_HIST = 256;      // packets retained for the fit (~13s at 20Hz)
+
+  const netClock = {
+    n: 0,             // next packet index
+    hist: [],         // [{ n, t }] recent arrivals
+    slope: 0,         // ms per tick
+    intercept: 0,
+    ready: false,
+  };
+
+  function resetNetClock() {
+    netClock.n = 0;
+    netClock.hist.length = 0;
+    netClock.slope = 0;
+    netClock.intercept = 0;
+    netClock.ready = false;
+    // Packet indices restart, so every retained snapshot's index now points at
+    // the wrong pseudotime. (Declared below, beside the ring it indexes.)
+    netSnapsById.clear();
+  }
+
+  // Fold one arrival into the clock. Called once per update packet.
+  function clockOnPacket(nowMs) {
+    const n = netClock.n++;
+    netClock.hist.push({ n, t: nowMs });
+    if (netClock.hist.length > NET_CLOCK_HIST) netClock.hist.shift();
+
+    const h = netClock.hist;
+    if (h.length < 4) {
+      if (netClock.slope > 0) netClock.intercept = nowMs - netClock.slope * n;
+      return;
+    }
+    // Re-centre on the newest sample before fitting. Regressing raw indices
+    // means the n^2 term grows without bound and the normal equations lose
+    // precision within a few minutes of play.
+    const lam = Math.pow(0.5, 1 / Math.max(NETCODE.clockHalfLife, 1));
+    const n0 = h[h.length - 1].n;
+    const t0 = h[h.length - 1].t;
+    let sw = 0, sn = 0, stt = 0, snn = 0, snt = 0;
+    for (let i = h.length - 1; i >= 0; i--) {
+      const dn = h[i].n - n0;          // <= 0
+      const dtv = h[i].t - t0;
+      const w = Math.pow(lam, -dn);    // decays into the past
+      sw += w; sn += w * dn; stt += w * dtv; snn += w * dn * dn; snt += w * dn * dtv;
+    }
+    const denom = sw * snn - sn * sn;
+    if (!Number.isFinite(denom) || Math.abs(denom) < 1e-9) return;
+    const slope = (sw * snt - sn * stt) / denom;
+    if (!Number.isFinite(slope)) return;
+    const b = (stt - slope * sn) / sw;
+    netClock.slope = slope;
+    netClock.intercept = (t0 + b) - slope * n0;
+    netClock.ready = true;
+  }
+
+  const pseudotimeOf = (n) => netClock.slope * n + netClock.intercept;
+
+  // The pseudotime the *render* is taken at, as opposed to the true clock time
+  // everything else asks about. Held `renderLag` ticks behind now, so the lerp
+  // spends most of its time interpolating between two snapshots it actually
+  // has rather than extending past the newest one. Anything that has to agree
+  // with what is on screen — the overlay's rings, "which sprite is under the
+  // cursor" — reads this; the aim solution does not, because a shot is
+  // resolved against the server's present, not against our playout.
+  const renderNowMs = () => performance.now() - netClock.slope * NETCODE.renderLag;
+
+
+  // Entity id -> the smoothing state holding that player's snapshot ring, so
+  // the aim path can read the same per-tick positions the renderer draws from
+  // without holding a Player reference. Populated by snapshotPlayers below;
+  // entries can outlive the entity, which is why every read revalidates
+  // `st.id` (a pooled Player object gets recycled onto a new entity, and its
+  // ring goes with it).
+  const netSnapsById = new Map();
+
+  // Record where every player was as of the packet that has just *finished*
+  // being applied. The camera write we hook sits at the top of survev's update
+  // handler, before the entity updates, so netData still holds the previous
+  // packet's positions at this point — hence index n-1. Sampling here rather
+  // than on a render frame is what keeps a TCP burst intact: eight packets
+  // landing together still produce eight snapshots a tick apart, which is
+  // exactly what the clock needs to play them back at the right rate.
+  function snapshotPlayers(game) {
+    const idx = netClock.n - 1;
+    if (idx < 0) return;
+    const roster = findRosterOnGame(game) || game?.[GAME_ROSTER];
+    const pool = roster?.playerPool;
+    if (!pool || typeof pool[POOL_GETALL] !== 'function') return;
+    const players = pool[POOL_GETALL]() || [];
+    for (const player of players) {
+      const st = netSmoothState.get(player);
+      if (!st) continue;
+      const pos = player[PLAYER_NET]?.[PLAYER_POS];
+      if (!pos || typeof pos.x !== 'number' || typeof pos.y !== 'number') continue;
+      // The pool hands the same Player object to a new entity when the old one
+      // is released, so a ring is only this id's history from the tick the id
+      // last changed. Without the reset the first snapshot pair after a recycle
+      // spans two different players and reads as a teleport-speed velocity.
+      const id = Number(player.__id ?? 0);
+      if (st.id !== id) {
+        st.id = id;
+        st.snaps.length = 0;
+        if (id) netSnapsById.set(id, st);
+      }
+      const last = st.snaps[st.snaps.length - 1];
+      if (last && last.n === idx) continue;
+      // Discard a ring whose newest entry can no longer be read against the
+      // current clock: indices running backwards mean the clock was reset
+      // under us (new round, new camera), and a long gap means the entity was
+      // out of the pool for a while, so the pair straddling the gap would
+      // report the whole absence as one tick of movement.
+      if (last && (last.n > idx || idx - last.n > NET_SNAP_CAP)) st.snaps.length = 0;
+      st.snaps.push({ n: idx, x: pos.x, y: pos.y });
+      if (st.snaps.length > NET_SNAP_CAP) st.snaps.shift();
+    }
+  }
+
+  // Position on the recovered clock. Given the last two snapshots p1@t1 and
+  // p2@t2 in pseudotime, render at
+  //     p1 * (t_now - t2)/(t1 - t2) + p2 * (t1 - t_now)/(t1 - t2)
+  // which is the standard two-point lerp written over (t1 - t2); the weights
+  // sum to 1 for any t_now. It is deliberately unclamped, so t_now past t2
+  // extrapolates along the same line rather than freezing.
+  //
+  // Returns null before the clock has converged or while a player has fewer
+  // than two snapshots, in which case the caller falls back to survev's lerp.
+  function renderOnClock(st, nowMs) {
+    if (!netClock.ready) return null;
+    const s = st.snaps;
+    if (s.length < 2) return null;
+    const p1 = s[s.length - 2];
+    const p2 = s[s.length - 1];
+    const t1 = pseudotimeOf(p1.n);
+    const t2 = pseudotimeOf(p2.n);
+    const d = t1 - t2;
+    if (!d) return null;
+    const w1 = (nowMs - t2) / d;
+    const w2 = (t1 - nowMs) / d;
+    return { x: p1.x * w1 + p2.x * w2, y: p1.y * w1 + p2.y * w2 };
+  }
+
+  // Swap the camera's interpolation-window field for an accessor: the game
+  // still writes the raw gap (which we meter), but every reader gets the
+  // jitter-buffered value instead. Re-runs when a new round swaps in a fresh
+  // Camera; the old one is garbage either way.
+  function installCameraInterpHook(game) {
+    if (!CAM_INTERP_W) return null;
+    const camera = findCameraOnGame(game);
+    if (!camera) return null;
+    if (camera === netStats.hookedCamera) return camera;
+    let raw = Number(camera[CAM_INTERP_W]) || 0;
+    try {
+      const desc = Object.getOwnPropertyDescriptor(camera, CAM_INTERP_W);
+      if (desc && !desc.configurable) return;
+      Object.defineProperty(camera, CAM_INTERP_W, {
+        configurable: true,
+        enumerable: true,
+        get() {
+          if (!NETCODE.enabled || !netStats.windowMs) return raw;
+          return netStats.windowMs / 1000;
+        },
+        // This fires exactly once per server update packet, which makes it our
+        // packet clock as well as the window measurement.
+        set(v) {
+          raw = v;
+          recordUpdateInterval(v);
+          try {
+            clockOnPacket(performance.now());
+            snapshotPlayers(game);
+          } catch {}
+        },
+      });
+    } catch {
+      return null;
+    }
+    // Fresh camera, fresh link statistics.
+    netStats.hookedCamera = camera;
+    netStats.meanMs = 0;
+    netStats.devMs = 0;
+    netStats.windowMs = 0;
+    netStats.updates = 0;
+    resetNetClock();
+    return camera;
+  }
+
+  // Per-player smoothing state, keyed off the Player instance itself so pooled
+  // entities that go inactive drop out with no bookkeeping.
+  const netSmoothState = new WeakMap();
+
+  // Recompute a player's rendered position. Driven from the property setter
+  // rather than a rAF loop because the game assigns the interpolated position
+  // exactly once per frame per player, immediately before everything that
+  // reads it (sprite placement, camera follow, minimap) — so this runs once
+  // per frame with the right ordering and no loop of our own.
+  function updatePlayerSmoothing(st, base) {
+    st.out = renderOnClock(st, renderNowMs()) || base;
+    st.haveOut = true;
+  }
+
+  // Replace a Player's interpolated-position field with an accessor. It has to
+  // be per-instance: survev declares it as a class field, so every Player gets
+  // its own data property that would shadow anything installed on the
+  // prototype (the same reason the constructor setter traps stopped firing —
+  // see the capture notes at the top of this file).
+  function installPlayerSmoothing(player) {
+    if (!player || netSmoothState.has(player)) return;
+    let desc;
+    try {
+      desc = Object.getOwnPropertyDescriptor(player, PLAYER_POS2);
+    } catch {
+      return;
+    }
+    if (desc && !desc.configurable) return;
+    const st = {
+      base: player[PLAYER_POS2] || { x: 0, y: 0 },
+      out: null,
+      haveOut: false,
+      snaps: [],            // [{ n, x, y }] positions tagged by packet index
+      id: 0,                // entity id the ring belongs to; see snapshotPlayers
+    };
+    try {
+      Object.defineProperty(player, PLAYER_POS2, {
+        configurable: true,
+        enumerable: true,
+        get() {
+          // Passthrough when disabled, so the toggle is live and total.
+          return (NETCODE.enabled && st.haveOut) ? st.out : st.base;
+        },
+        set(v) {
+          st.base = v;
+          if (!NETCODE.enabled || !v) {
+            st.haveOut = false;
+            return;
+          }
+          try {
+            updatePlayerSmoothing(st, v);
+          } catch {
+            st.haveOut = false;
+          }
+        },
+      });
+    } catch {
+      return;
+    }
+    netSmoothState.set(player, st);
+    netStats.playersHooked++;
+  }
+
+  // Called from the sample loop: keep the camera hook attached to the live
+  // Game and make sure every Player in the pool is smoothed. Both guards are
+  // cheap no-ops once installed.
+  function netcodeTick(game) {
+    if (!game) return;
+    try {
+      const camera = installCameraInterpHook(game);
+      // survev exposes interpolation as a user setting; with it off the client
+      // snaps to each packet and there is nothing for us to smooth.
+      if (camera && NETCODE.forceInterp && CAM_INTERP_ON && camera[CAM_INTERP_ON] !== true) {
+        camera[CAM_INTERP_ON] = true;
+      }
+      const roster = findRosterOnGame(game) || game?.[GAME_ROSTER];
+      const pool = roster?.playerPool;
+      const players = (pool && typeof pool[POOL_GETALL] === 'function' ? pool[POOL_GETALL]() : []) || [];
+      for (const player of players) installPlayerSmoothing(player);
+    } catch {}
+  }
+
+  // ---------------------------------------------------------------------
+  // Ping readout, pinned above the team panel in the top-left HUD.
+  //
+  // survev already measures round-trip time: it stamps `seqSendTime` when it
+  // sends an input carrying a sequence number, and on the update that acks
+  // that sequence it pushes `now - seqSendTime` onto `game.pings`. It just
+  // never surfaces the number — the array only feeds a console summary and
+  // the debug HUD graph. So we read the samples it is already collecting
+  // rather than generating traffic of our own.
+  //
+  // `pings` is one of the field names survev leaves readable (like
+  // `posInterpTicker` and `playerPool`), so it needs no mangled.js entry.
+  //
+  // The element is inserted as the first child of `#ui-top-left`, which is the
+  // container holding `#ui-team` — so it sits directly above the team panel,
+  // whose first row is the local player. It inherits that container's
+  // click-through behaviour and is explicitly pointer-events:none so it can
+  // never eat a click meant for the game.
+  // ---------------------------------------------------------------------
+
+  const PING_SAMPLE_CAP = 12;    // recent RTT samples kept for the median
+  const PING_REFRESH_MS = 250;   // redraw cadence; faster just makes it flicker
+  const PING_GOOD_MS = 60;
+  const PING_OK_MS = 120;
+
+  const pingState = {
+    el: null,
+    dot: null,
+    text: null,
+    samples: [],
+    sourceArray: null,   // identity of the game's array, to spot replacement
+    consumed: 0,         // how much of it we've already folded in
+    lastRenderAt: 0,
+    currentMs: null,
+  };
+
+  // Pull any new RTT samples out of the game's own array. survev sorts it and
+  // then replaces it wholesale every 20 seconds (after logging a summary), so
+  // tracking length alone would both miss the reset and mistake the sorted
+  // leftovers for fresh data — hence the identity check.
+  function harvestPings(game) {
+    const arr = game?.pings;
+    if (!Array.isArray(arr)) return;
+    if (arr !== pingState.sourceArray) {
+      pingState.sourceArray = arr;
+      pingState.consumed = 0;
+    }
+    if (arr.length < pingState.consumed) pingState.consumed = 0;
+    for (let i = pingState.consumed; i < arr.length; i++) {
+      const v = Number(arr[i]);
+      if (!Number.isFinite(v) || v < 0) continue;
+      pingState.samples.push(v);
+      if (pingState.samples.length > PING_SAMPLE_CAP) pingState.samples.shift();
+    }
+    pingState.consumed = arr.length;
+  }
+
+  // Median rather than mean or latest: a single retransmit or GC pause
+  // otherwise makes the number leap around and read as unreliable.
+  function medianPingMs() {
+    if (!pingState.samples.length) return null;
+    const sorted = pingState.samples.slice().sort((a, b) => a - b);
+    return sorted[Math.floor(sorted.length / 2)];
+  }
+
+  function ensurePingEl() {
+    const host = document.getElementById('ui-top-left');
+    if (!host) return null;
+    if (pingState.el && pingState.el.isConnected && pingState.el.parentElement === host) {
+      return pingState.el;
+    }
+    const el = document.createElement('div');
+    el.style.cssText = [
+      'display:flex', 'align-items:center', 'gap:6px',
+      'margin:0 0 4px 2px', 'padding:0',
+      'font:700 13px/1.2 system-ui,sans-serif',
+      'color:#fff', 'text-shadow:0 1px 2px rgba(0,0,0,0.9)',
+      'pointer-events:none', 'user-select:none', 'white-space:nowrap',
+    ].join(';');
+    const dot = document.createElement('span');
+    dot.style.cssText = [
+      'width:8px', 'height:8px', 'border-radius:50%',
+      'background:#7f8c8d', 'box-shadow:0 0 3px rgba(0,0,0,0.8)',
+      'flex:0 0 auto',
+    ].join(';');
+    const text = document.createElement('span');
+    el.appendChild(dot);
+    el.appendChild(text);
+    // First child of #ui-top-left puts it directly above #ui-team.
+    host.insertBefore(el, host.firstChild);
+    pingState.el = el;
+    pingState.dot = dot;
+    pingState.text = text;
+    return el;
+  }
+
+  function updatePingUI(game, now) {
+    // Harvest before the enabled check: the aim path leads by this RTT (see
+    // reactionTarget), so hiding the readout must not also stop measuring it.
+    harvestPings(game);
+    if (!PING_UI.enabled) {
+      if (pingState.el) pingState.el.style.display = 'none';
+      return;
+    }
+    if (now - pingState.lastRenderAt < PING_REFRESH_MS) return;
+    pingState.lastRenderAt = now;
+
+    const el = ensurePingEl();
+    if (!el) return;
+    const ms = medianPingMs();
+    pingState.currentMs = ms;
+    if (ms == null) {
+      // In a match but no acked input yet — say so rather than showing a stale
+      // or invented number.
+      el.style.display = 'flex';
+      pingState.dot.style.background = '#7f8c8d';
+      pingState.text.textContent = '– ms';
+      return;
+    }
+    el.style.display = 'flex';
+    pingState.dot.style.background =
+      ms < PING_GOOD_MS ? '#2ecc71' : ms < PING_OK_MS ? '#f1c40f' : '#e74c3c';
+    pingState.text.textContent = `${Math.round(ms)} ms`;
+  }
+
+  // ---------------------------------------------------------------------
   // Target overlay: a fixed-position canvas above the game canvas that
   // draws a circle around whichever enemy the cheat is currently aiming
   // at (or *would* aim at if Shift were pressed). Used as a debugging /
@@ -2050,6 +2964,17 @@
     };
   }
 
+  // Where the overlay should draw an entity: the recovered clock's position,
+  // which is what the game itself renders from, with the sample interpolator
+  // above as the fallback for anything the clock can't place (still
+  // converging, just came into view, smoothing toggled off). Drawing rings
+  // from a different position source than the sprites they circle is visible
+  // as a lag between the two on any jittery link.
+  function overlayPos(id, fallbackX, fallbackY) {
+    const s = AIM_HUMAN.clockAim ? stateOnClock(id, renderNowMs()) : null;
+    return s || interpPos(id, fallbackX, fallbackY);
+  }
+
   // Create the overlay element on demand. Returns true if the canvas is
   // attached to the DOM and ready to draw. We re-attach if the SPA has
   // ripped it out (some game UIs nuke unrecognized children of body).
@@ -2088,9 +3013,9 @@
   // the circle tracks the user's mouse in real time before they engage.
   function getCurrentAimTarget(sample) {
     if (!sample) return null;
-    const player = sample.self;
+    const player = liveSelf(sample);
     const enemies = sample.enemies;
-    if (!enemies || !enemies.length) return null;
+    if (!player || !enemies || !enemies.length) return null;
 
     if (shiftHeld && aimState.targetId != null) {
       const committed = enemies.find((e) => e.id === aimState.targetId);
@@ -2114,8 +3039,9 @@
       if (e.name === "VERY BAD AT GAME") continue;
       if (isSpoofedEnemy(e.id, pageSamples)) continue;
       if (!canInteract(player.layer, e.layer)) continue;
-      const dx = e.x - mwx;
-      const dy = e.y - mwy;
+      const p = livePos(e.id, e);
+      const dx = p.x - mwx;
+      const dy = p.y - mwy;
       const s = dx * dx + dy * dy;
       if (s < bestScore) {
         bestScore = s;
@@ -2136,8 +3062,9 @@
     const sample = pageSamples[pageSamples.length - 1];
     if (sample && sample.self && sample.enemies && sample.enemies.length) {
       const player = sample.self;
-      // Interpolated player position for smooth camera.
-      const pi = interpPos('__self__', player.x, player.y);
+      // Rendered player position, i.e. what the camera is centred on.
+      const pi = (AIM_HUMAN.clockAim ? stateOnClock(player.id, renderNowMs()) : null)
+        || interpPos('__self__', player.x, player.y);
       const scale = getLivePxPerWorldUnit(sample);
       // Survev player hitbox is ~1 world unit; 1.6× makes the ring sit just
       // outside the body sprite at default zoom.
@@ -2156,7 +3083,7 @@
         if (e.dead) continue;
         if (isSpoofedEnemy(e.id, pageSamples)) continue;
         if (e.id === targetId) continue;
-        const ei = interpPos(e.id, e.x, e.y);
+        const ei = overlayPos(e.id, e.x, e.y);
         const sx = cx + (ei.x - pi.x) * scale;
         const sy = cy - (ei.y - pi.y) * scale;
         const reachable = canInteract(player.layer, e.layer);
@@ -2181,7 +3108,7 @@
       }
 
       if (target) {
-        const ti = interpPos(target.id, target.x, target.y);
+        const ti = overlayPos(target.id, target.x, target.y);
         const sx = cx + (ti.x - pi.x) * scale;
         const sy = cy - (ti.y - pi.y) * scale;
 
@@ -2207,21 +3134,16 @@
         ctx.lineTo(sx, sy + 4);
         ctx.stroke();
 
-        // Aim-assist X: lead point accounting for bullet travel time and
-        // target velocity. Only meaningful when the player holds a projectile
-        // weapon with a known bullet speed.
+        // Aim-assist X: the lead point reactionTarget solves for — reaction
+        // lag, round-trip lead and bullet flight — drawn from the same
+        // function the bot steers by, so what is on screen is the actual
+        // solution and not a second, prettier model of it. Only meaningful
+        // when the player holds a projectile weapon with a known bullet speed.
         const selfBulletSpeed = player.bulletSpeed;
         if (selfBulletSpeed && selfBulletSpeed > 0) {
-          const tvx = ti.xv ?? 0;
-          const tvy = ti.yv ?? 0;
-          const dxw = ti.x - pi.x;
-          const dyw = ti.y - pi.y;
-          const distW = Math.sqrt(dxw * dxw + dyw * dyw);
-          const tHit = distW / selfBulletSpeed;
-          const ax = ti.x + tvx * tHit;
-          const ay = ti.y + tvy * tHit;
-          const axs = cx + (ax - pi.x) * scale;
-          const ays = cy - (ay - pi.y) * scale;
+          const lead = reactionTarget(player, target, Date.now());
+          const axs = cx + (lead.x - pi.x) * scale;
+          const ays = cy - (lead.y - pi.y) * scale;
           const xSize = 10;
           ctx.lineWidth = 3;
           ctx.strokeStyle = 'rgba(255, 255, 255, 0.95)';
@@ -2301,6 +3223,71 @@
       pendingCandidatesRemaining: trapState.pendingCandidates.length
     }
   });
+
+  // Netcode-smoothing diagnostics. `cameraHooked: false` while in a match
+  // means the camera field lookup failed — re-derive mangled.js. A `windowMs`
+  // that sits far above `meanMs` means the link is genuinely jittery and the
+  // buffer has widened to cover it; if that costs too much latency, lower
+  // `jitterK` in the settings panel.
+  window.__netcodeDiag = () => ({
+    settings: { ...NETCODE },
+    cameraHooked: !!netStats.hookedCamera,
+    updates: netStats.updates,
+    rawMs: Number(netStats.rawMs.toFixed(1)),
+    meanMs: Number(netStats.meanMs.toFixed(1)),
+    jitterMs: Number(netStats.devMs.toFixed(1)),
+    windowMs: Number(netStats.windowMs.toFixed(1)),
+    playersHooked: netStats.playersHooked,
+    // Reported straight from the sample buffer rather than from the readout's
+    // cached value, so it is right even with the readout switched off.
+    pingMs: medianPingMs(),
+    pingSamples: pingState.samples.length,
+    clockReady: netClock.ready,
+    // Recovered tick length. Should sit at the server tick (~50ms) regardless
+    // of how much the link is jittering; if it doesn't, the fit is being
+    // dragged by something other than the tick rate.
+    tickMs: netClock.ready ? Number(netClock.slope.toFixed(2)) : null,
+    snapRings: netSnapsById.size,
+  });
+
+  // What the aim path is doing right now, for the enemy it would engage if
+  // Shift went down this instant. `source: 'sample'` means the clock declined
+  // the lookup and it fell back to the 20ms ring — expected for the first
+  // second of a round or an enemy that just came into view, a standing problem
+  // otherwise. `leadMs` is reactionTarget's lead broken into its parts: the
+  // first two are the delay we hold ourselves to plus the measured round trip
+  // (both measured from the delayed viewpoint), the third is bullet flight.
+  window.__aimDiag = () => {
+    const sample = pageSamples[pageSamples.length - 1];
+    const target = sample ? getCurrentAimTarget(sample) : null;
+    if (!target) return { target: null, clockReady: netClock.ready };
+    const self = sample.self;
+    const now = Date.now();
+    const tNow = performance.now();
+    const pair = AIM_HUMAN.clockAim ? clockPairAt(target.id, tNow - AIM_HUMAN.reactionMs) : null;
+    const seen = stateOnClock(target.id, tNow) || { xv: 0, yv: 0 };
+    const aimAt = reactionTarget(self, target, now);
+    const drawn = livePos(target.id, target);
+    const pingMs = medianPingMs();
+    return {
+      target: { id: target.id, name: target.name },
+      source: pair ? 'clock' : 'sample',
+      tickMs: pair ? Number((pair.t2 - pair.t1).toFixed(2)) : null,
+      speed: Number(Math.hypot(seen.xv, seen.yv).toFixed(2)),
+      leadMs: {
+        reaction: AIM_HUMAN.reactionMs,
+        ping: Number(((pingMs ?? 0) * AIM_HUMAN.pingLeadK).toFixed(1)),
+        travel: self.bulletSpeed
+          ? Number((Math.hypot(aimAt.x - aimAt.fromX, aimAt.y - aimAt.fromY)
+            / self.bulletSpeed * 1000).toFixed(1))
+          : null,
+      },
+      // How far ahead of the drawn sprite the crosshair is being placed, and
+      // how far the firing origin sits ahead of where we are drawn.
+      leadUnits: Number(Math.hypot(aimAt.x - drawn.x, aimAt.y - drawn.y).toFixed(2)),
+      originAheadUnits: Number(Math.hypot(aimAt.fromX - self.x, aimAt.fromY - self.y).toFixed(2)),
+    };
+  };
 
   post('status', { ok: true, message: 'Injector loaded.', url: location.href, isTop: window.top === window });
   // console.log(`[${SOURCE}] inject.js TAIL reached, starting sampleLoop @ ${SAMPLE_MS}ms`);
