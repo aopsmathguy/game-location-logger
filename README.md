@@ -14,7 +14,10 @@ authorized deployment of survev.
   closest enemy under the user's real cursor.
 - **Auto-quickswap** — after firing a slow-firerate gun (sniper, pump
   shotgun, etc.) the extension synthesizes a `SwapWeapSlots` input on the
-  next server tick so the other gun is ready immediately.
+  next server tick so the other gun is ready immediately. "Slow" means a
+  gun whose `fireDelay` is at or above a threshold that defaults to 0.5s;
+  the settings panel in the top-right corner has a slider to retune it
+  live.
 - **Position log** — periodic snapshots of self + enemy positions are sent
   to the service worker; click the toolbar icon to export as JSON
   (see `sample.json` for the schema).
@@ -74,15 +77,35 @@ overwriting, so re-running is safe.
 
 ## How inject.js finds the game
 
-survev keeps its `Rr` (Game) instance in a module-private `var` that's not
-reachable from `window`. inject.js installs setter traps on
-`Object.prototype` for the property names that the `Rr` constructor body
-assigns from positional parameters (the `seedNames` list in `mangled.js`),
-so the first time any `Rr` is constructed, the trap fires with `this` ==
-the new game instance and we capture it. A runtime script-scan adds extra
-trap names from any class on the page whose constructor matches the same
-pattern, for cases where positional-param names change but the structure
-doesn't.
+survev keeps its entire object graph module-private: the app singleton is an
+anonymous `Ri = new class { … }` and the Game instance lives on its `game`
+field, so neither is reachable by walking from `window`.
+
+**Primary path — `Function.prototype.bind` wrapper.** The app singleton wires
+its callbacks through `.bind(this)` (e.g.
+`this.onTeamMenuJoinGame.bind(this)` in its own constructor, and
+`this.onConfigModified.bind(this)` in `tryLoad`). inject.js installs a thin
+wrapper around `Function.prototype.bind` at `document_start`, recognizes the
+app by its own class fields (`game`, `pixi`, `config`, `localization`,
+`audioManager`, `teamMenu` — all real readable names), keeps the reference,
+and uninstalls itself immediately. `app.game` is then re-read live on every
+sample tick, so a Game swapped in for a new round is picked up for free.
+
+**Fallback path — `Object.prototype` setter traps.** The original approach:
+trap the property names that the Game constructor body assigns from
+positional parameters (the `seedNames` list in `mangled.js`), so constructing
+a Game fires the setter with `this` == the new instance. This **no longer
+fires on current builds**, because they pre-declare every one of those names
+as a class field (`var Jr = class { nHb; GHBZo; … }`), and class fields are
+installed with `[[DefineOwnProperty]]` before the constructor body runs — the
+assignment hits an existing own slot and never walks the prototype chain. It
+is kept because it costs nothing and still works on builds that don't declare
+their fields. Same for the runtime script-scan that adds extra trap names
+(it already skips names it sees declared as class fields).
+
+If the console reports `App singleton not captured`, that's the real
+breakage signal: the app's field shape changed. Check
+`window.__enemyLocationLogger.getDiagnostics()` for the capture state.
 
 ## Notes
 

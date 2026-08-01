@@ -18,10 +18,12 @@ match somewhere else in the bundle can't poison the result.
 
 from __future__ import annotations
 
+import argparse
 import re
 import shutil
 import sys
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 
 JS_DUMP = Path(__file__).parent / "js_dump"
@@ -41,17 +43,30 @@ class DeriveError(RuntimeError):
 # Bundle selection
 # ---------------------------------------------------------------------------
 
-def find_gameplay_dump() -> tuple[Path, str]:
+def find_gameplay_dump(preferred: str | None = None) -> tuple[Path, str]:
     """Return (path, contents) for the gameplay bundle (Player + Game classes).
 
     survev currently ships two JS files: a small ~18k-line gameplay bundle and
     a large ~73k-line asset/definitions bundle. We pick the gameplay bundle by
     looking for the Player class's un-mangled sprite-field declarations, which
     are stable across builds because survev declares them with real names.
+
+    fetch_survev_js.py normally prunes previous fetches, so js_dump/ holds one
+    build and exactly one file matches. It skips that cleanup after a partial
+    fetch and when run with --keep-old, and dumps predating that behaviour may
+    still be lying around — in any of those cases several content-hashed
+    gameplay bundles match at once. We then take the most recently written one
+    (the fetch just run) rather than making the caller hand-clean the
+    directory. `preferred` (--bundle) overrides the choice.
     """
     candidates = sorted(JS_DUMP.glob("*_formatted.js"))
     if not candidates:
         raise DeriveError(f"no *_formatted.js in {JS_DUMP}/ — run fetch_survev_js.py first")
+
+    if preferred is not None:
+        candidates = [p for p in candidates if p.name == preferred or p.stem == preferred]
+        if not candidates:
+            raise DeriveError(f"--bundle {preferred!r} matched nothing in {JS_DUMP}/")
 
     matches: list[tuple[Path, str]] = []
     for path in candidates:
@@ -71,12 +86,24 @@ def find_gameplay_dump() -> tuple[Path, str]:
             "no gameplay bundle found in js_dump/ — looked for files containing "
             "bodySprite/helmetSprite/meleeSprite Player-class declarations."
         )
-    if len(matches) > 1:
-        names = ", ".join(p.name for p, _ in matches)
+    if len(matches) == 1:
+        return matches[0]
+
+    # Newest first; break equal mtimes by name only to keep the order stable.
+    matches.sort(key=lambda pair: (-pair[0].stat().st_mtime, pair[0].name))
+    newest_mtime = matches[0][0].stat().st_mtime
+    tied = [p.name for p, _ in matches if p.stat().st_mtime == newest_mtime]
+    if len(tied) > 1:
+        # Same-mtime candidates can't be ordered (e.g. after a fresh clone or a
+        # bulk copy), and guessing risks deriving against a stale build.
         raise DeriveError(
-            f"multiple gameplay-bundle candidates ({names}). "
-            "Delete stale dumps from js_dump/ and re-run."
+            f"multiple gameplay bundles share the newest timestamp ({', '.join(tied)}), "
+            "so the current one can't be identified. Delete the stale dumps from "
+            "js_dump/, or pick one explicitly with --bundle <name>."
         )
+
+    skipped = ", ".join(p.name for p, _ in matches[1:])
+    print(f"note: {len(matches)} gameplay bundles in js_dump/ — using newest, ignoring {skipped}")
     return matches[0]
 
 
@@ -155,29 +182,34 @@ def majority_value(label: str, values: list[str], min_count: int = 2) -> str:
 def derive_player_pos(text: str, player_start: int) -> str:
     """Player position field. The network-update method sets up interpolation
     via:
-        <V>.eq(e.pos, this.<posInterp>) || (this.<posInterp> = <V>.copy(n ? e.pos : this.<POS>), this.posInterpTicker = 0)
+        <V>.eq(<p>.pos, this.<posInterp>) || (this.<posInterp> = <V>.copy(<f> ? <p>.pos : this.<POS>), this.posInterpTicker = 0)
     `posInterpTicker` is a real readable name. Other classes (Obstacle, Loot,
     Decal) share this shape — we constrain the search to start at the Player
     class declaration to pick the right one.
+
+    `<p>` (the network-update param) and `<f>` (the snapshot flag) are mangled
+    to single-letter locals that rotate every build (e.g. `e`/`n` one build,
+    `t`/`r` the next), so we match any letter and backreference the param.
     """
     pat = (
-        rf"\.eq\(e\.pos,\s*this\.{IDENT}\)\s*\|\|\s*"
-        rf"\(this\.{IDENT}\s*=\s*\w+\.copy\(n\s*\?\s*e\.pos\s*:\s*this\.({IDENT})\)"
+        rf"\.eq\((?P<p>[a-z])\.pos,\s*this\.{IDENT}\)\s*\|\|\s*"
+        rf"\(this\.{IDENT}\s*=\s*\w+\.copy\([a-z]\s*\?\s*(?P=p)\.pos\s*:\s*this\.(?P<field>{IDENT})\)"
         rf"\s*,\s*this\.posInterpTicker\s*=\s*0"
     )
-    return must_match("player.pos", text, pat, start=player_start)
+    return must_match("player.pos", text, pat, group="field", start=player_start)
 
 
 def derive_player_dir(text: str, player_start: int) -> str:
     """Player direction field — same shape as pos with dirInterpolationTicker.
     `dirInterpolationTicker` actually appears to be Player-class-unique, but we
-    still scope the search for consistency."""
+    still scope the search for consistency. See derive_player_pos for why the
+    param/flag letters are matched generically rather than hardcoded."""
     pat = (
-        rf"\.eq\(e\.dir,\s*this\.{IDENT}\)\s*\|\|\s*"
-        rf"\(this\.{IDENT}\s*=\s*\w+\.copy\(n\s*\?\s*e\.dir\s*:\s*this\.({IDENT})\)"
+        rf"\.eq\((?P<p>[a-z])\.dir,\s*this\.{IDENT}\)\s*\|\|\s*"
+        rf"\(this\.{IDENT}\s*=\s*\w+\.copy\([a-z]\s*\?\s*(?P=p)\.dir\s*:\s*this\.(?P<field>{IDENT})\)"
         rf"\s*,\s*this\.dirInterpolationTicker\s*=\s*0"
     )
-    return must_match("player.dir", text, pat, start=player_start)
+    return must_match("player.dir", text, pat, group="field", start=player_start)
 
 
 def derive_player_pos_alt(text: str, pos_field: str, player_start: int) -> str:
@@ -212,9 +244,9 @@ def derive_net_data(text: str, player_start: int) -> str:
     fields onto it; we anchor on activeWeapon/dead/downed (real names) and
     require majority agreement on the mangled parent field across all three."""
     candidates = (
-        all_matches(text, rf"this\.({IDENT})\.{IDENT}\s*=\s*e\.activeWeapon\b", start=player_start)
-        + all_matches(text, rf"this\.({IDENT})\.{IDENT}\s*=\s*e\.dead\b", start=player_start)
-        + all_matches(text, rf"this\.({IDENT})\.{IDENT}\s*=\s*e\.downed\b", start=player_start)
+        all_matches(text, rf"this\.({IDENT})\.{IDENT}\s*=\s*[a-z]\.activeWeapon\b", start=player_start)
+        + all_matches(text, rf"this\.({IDENT})\.{IDENT}\s*=\s*[a-z]\.dead\b", start=player_start)
+        + all_matches(text, rf"this\.({IDENT})\.{IDENT}\s*=\s*[a-z]\.downed\b", start=player_start)
     )
     return majority_value("player.netData", candidates, min_count=2)
 
@@ -223,16 +255,19 @@ def derive_local_data(text: str, player_start: int) -> str:
     """The Player.localData sub-object. Anchored on e.zoom, e.health,
     e.curWeapIdx (all real readable names) with majority cross-check."""
     candidates = (
-        all_matches(text, rf"this\.({IDENT})\.{IDENT}\s*=\s*e\.zoom\b", start=player_start)
-        + all_matches(text, rf"this\.({IDENT})\.{IDENT}\s*=\s*e\.health\b", start=player_start)
-        + all_matches(text, rf"this\.({IDENT})\.{IDENT}\s*=\s*e\.curWeapIdx\b", start=player_start)
+        all_matches(text, rf"this\.({IDENT})\.{IDENT}\s*=\s*[a-z]\.zoom\b", start=player_start)
+        + all_matches(text, rf"this\.({IDENT})\.{IDENT}\s*=\s*[a-z]\.health\b", start=player_start)
+        + all_matches(text, rf"this\.({IDENT})\.{IDENT}\s*=\s*[a-z]\.curWeapIdx\b", start=player_start)
     )
     return majority_value("player.localData", candidates, min_count=2)
 
 
 def derive_field_on(text: str, parent: str, readable: str, label: str, start: int = 0) -> str:
-    """Find `this.<parent>.<X> = e.<readable>` and return X."""
-    pat = rf"this\.{re.escape(parent)}\.({IDENT})\s*=\s*e\.{re.escape(readable)}\b"
+    """Find `this.<parent>.<X> = <p>.<readable>` and return X.
+
+    `<p>` is the mangled update param, a single-letter local that rotates
+    every build, so we match any letter rather than hardcoding it."""
+    pat = rf"this\.{re.escape(parent)}\.({IDENT})\s*=\s*[a-z]\.{re.escape(readable)}\b"
     return must_match(label, text, pat, start=start)
 
 
@@ -294,6 +329,14 @@ def derive_seed_names(text: str) -> list[str]:
         this.<A> = e, this.<B> = t, this.<C> = n, ..., this.onJoin = l, this.onQuit = u, ...
     `onJoin`/`onQuit` are real readable names. We anchor on them and collect
     every `this.<X> = <singleLetter>,` immediately preceding.
+
+    NOTE: these names only feed inject.js's FALLBACK capture path. Current
+    builds pre-declare all of them as class fields, which are installed with
+    [[DefineOwnProperty]] before the constructor body runs — so the
+    Object.prototype setter traps seeded from this list can never fire. The
+    game is captured via the Function.prototype.bind hook instead (see the
+    "Primary capture" block in inject.js). If capture breaks, that hook and
+    the app singleton's field shape are what to look at, not this list.
     """
     anchor = (
         rf"((?:this\.{IDENT}\s*=\s*[a-z]\s*,\s*){{5,30}})"
@@ -456,8 +499,16 @@ def print_diff(old: dict[str, str] | None, new_values: dict, new_seeds: list[str
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument(
+        "--bundle",
+        metavar="NAME",
+        help="derive against this js_dump/ file instead of the newest gameplay bundle",
+    )
+    args = ap.parse_args()
+
     try:
-        path, text = find_gameplay_dump()
+        path, text = find_gameplay_dump(args.bundle)
     except DeriveError as e:
         sys.exit(f"error: {e}")
 
@@ -468,7 +519,7 @@ def main() -> None:
     print(f"  Player class @ char {p_start:,}, Game class @ char {g_start:,}")
 
     values: dict[str, str] = {}
-    steps: list[tuple[str, callable]] = [
+    steps: list[tuple[str, Callable[[], str]]] = [
         ("player.netData",        lambda: derive_net_data(text, p_start)),
         ("player.localData",      lambda: derive_local_data(text, p_start)),
         ("player.pos",            lambda: derive_player_pos(text, p_start)),

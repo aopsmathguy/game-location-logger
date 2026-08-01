@@ -64,14 +64,15 @@
     m249: 125, qbb97: 118, scout_elite: 164, ak47: 100, scar: 108,
     scarssr: 108, an94: 110, groza: 104, grozas: 106, dp28: 110, bar: 114,
     imbel: 92, pkp: 120, model94: 156, mkg45: 126, blr: 160, mosin: 178,
-    sv98: 182, awc: 136, m39: 125, svd: 127, garand: 144,
+    sv98: 182, awc: 136, m39: 125, svd: 127, garand: 144, barrett: 214,
+    ash12: 85,
     m870: 66, m1100: 66, mp220: 66, saiga: 66,
     spas12: 88, spas16: 88, m1014: 118, usas: 72,
     m9: 85, m9_dual: 85, m9_cursed: 85, m93r: 85, m93r_dual: 85,
     glock: 70, glock_dual: 70, p30l: 94, p30l_dual: 94,
     ot38: 112, ot38_dual: 112, ots38: 115, ots38_dual: 115,
     colt45: 106, colt45_dual: 106, m1911: 80, m1911_dual: 80, m1a1: 80,
-    deagle: 115, deagle_dual: 115,
+    deagle: 115, deagle_dual: 115, sw500: 150,
     flare_gun: 4, flare_gun_dual: 4,
     potato_cannon: 100, potato_smg: 100, potato_lmg: 100, bugle: 100
   };
@@ -395,16 +396,158 @@
     // );
   }
 
-  // The game class instance (`Mi.game`, internally `Rr`) is held in a
-  // module-private `var` inside an ES module bundle, so it is not reachable
-  // by walking from window/document/canvas. We install a setter trap on
-  // Object.prototype for properties that the Rr constructor body assigns
-  // from positional params (`this.<A> = e, this.<B> = t, ...` — names live
-  // in mangled.js's `seedNames`), but which
-  // are NOT pre-declared as class fields — so those assignments walk the
-  // prototype chain and fire our setter with `this` = the new game instance.
-  // We verify shape before capturing to avoid false positives, then restore
-  // Object.prototype on success.
+  // ---------------------------------------------------------------------
+  // Primary capture: the app singleton, via a temporary Function.prototype
+  // .bind() wrapper.
+  //
+  // survev keeps its whole object graph module-private. The app singleton is
+  // an anonymous `Ri = new class { … }` and the Game instance lives on its
+  // `game` field, so nothing reachable from window/document/canvas leads to
+  // either one.
+  //
+  // We used to capture the Game purely by trapping Object.prototype setters
+  // for the names its constructor assigns (see installGameCaptureTrap below).
+  // That stopped working, because the current bundle declares every one of
+  // those names as a CLASS FIELD:
+  //
+  //     var Jr = class { nHb; GHBZo; PZa; RPY; … game-class fields …
+  //         constructor(e, t, n, …) { this.nHb = e, this.GHBZo = t, … } }
+  //
+  // Class fields are installed with [[DefineOwnProperty]] before the
+  // constructor body runs, so `this.nHb = e` writes into an own slot that
+  // already exists and never walks the prototype chain — our setter cannot
+  // fire. The app singleton's `game = null` field has the same problem.
+  //
+  // What the bundle does still route through a real builtin is `.bind()`:
+  //
+  //     this.teamMenu = new Li(…, this.onTeamMenuJoinGame.bind(this), …)
+  //     this.config.addModifiedListener(this.onConfigModified.bind(this))
+  //
+  // Both pass the app singleton as bind's `thisArg`, the first from the app's
+  // own constructor at module-evaluation time. A thin wrapper around
+  // Function.prototype.bind sees it, and from there we read `app.game` live
+  // on every sample tick — `game` is a real readable field name, in the same
+  // stable-across-builds class as `playerInfo` / `bodySprite`, not a mangled
+  // one. The wrapper uninstalls itself as soon as it captures (and
+  // unconditionally after BIND_HOOK_TTL_MS) so we don't sit on a hot builtin.
+  // ---------------------------------------------------------------------
+  let capturedApp = null;
+  const BIND_HOOK_TTL_MS = 120000;
+  const bindHookState = { installed: false, uninstalledReason: '', calls: 0 };
+  let originalBindDescriptor = null;
+
+  // Own fields the app singleton declares. All real readable names.
+  const APP_FIELDS = ['game', 'pixi', 'config', 'localization', 'audioManager', 'teamMenu'];
+
+  function hasOwnProp(obj, key) {
+    try {
+      return Object.prototype.hasOwnProperty.call(obj, key);
+    } catch {
+      return false;
+    }
+  }
+
+  function looksLikeApp(obj) {
+    if (!obj || typeof obj !== 'object') return false;
+    // Cheap gate first — .bind() is hot and almost nothing else on the page
+    // owns a `game` property. Note we check OWN props rather than using
+    // `in`: the Object.prototype traps below can add inherited names.
+    if (!hasOwnProp(obj, 'game')) return false;
+    for (let i = 0; i < APP_FIELDS.length; i++) {
+      if (!hasOwnProp(obj, APP_FIELDS[i])) return false;
+    }
+    return true;
+  }
+
+  function uninstallBindHook(reason) {
+    if (!bindHookState.installed) return;
+    try {
+      if (originalBindDescriptor) {
+        Object.defineProperty(Function.prototype, 'bind', originalBindDescriptor);
+      }
+    } catch {}
+    bindHookState.installed = false;
+    bindHookState.uninstalledReason = reason;
+  }
+
+  function noteBindThisArg(thisArg) {
+    bindHookState.calls++;
+    if (capturedApp) return;
+    if (!looksLikeApp(thisArg)) return;
+    capturedApp = thisArg;
+    uninstallBindHook('captured');
+  }
+
+  function installBindHook() {
+    try {
+      const originalBind = Function.prototype.bind;
+      if (typeof originalBind !== 'function') return;
+      originalBindDescriptor = Object.getOwnPropertyDescriptor(Function.prototype, 'bind');
+      // Non-arrow so `arguments` forwards verbatim; `arguments[0]` is bind's
+      // thisArg (the receiver is the function being bound, not what we want).
+      const hook = function bind() {
+        try { noteBindThisArg(arguments[0]); } catch {}
+        return originalBind.apply(this, arguments);
+      };
+      // Keep the wrapper indistinguishable from the builtin for any code that
+      // feature-detects on name/arity.
+      Object.defineProperty(hook, 'length', { value: 1, configurable: true });
+      Object.defineProperty(hook, 'name', { value: 'bind', configurable: true });
+      Object.defineProperty(Function.prototype, 'bind', {
+        value: hook,
+        writable: true,
+        enumerable: false,
+        configurable: true
+      });
+      bindHookState.installed = true;
+      setTimeout(
+        () => uninstallBindHook(capturedApp ? 'captured' : 'timeout'),
+        BIND_HOOK_TTL_MS
+      );
+    } catch {}
+  }
+
+  installBindHook();
+
+  // Read the live Game ref off the captured app singleton. `app.game` is
+  // assigned once the bundle finishes loading and could in principle be
+  // reassigned per round, so we re-read it every call instead of caching.
+  // Returns null until the Game has been init()'d — the roster (and hence
+  // the game-like shape) only exists after the user joins a match.
+  function gameFromApp() {
+    const app = capturedApp;
+    if (!app) return null;
+    const direct = safeRead(app, 'game');
+    if (isGameLike(direct)) return direct;
+    // A truthy-but-not-game-like `app.game` is the normal pre-join state
+    // (the roster only exists after Game.init()), so don't burn a scan of
+    // every app field on it each tick. Only fall back to the value-shape
+    // walk when there is no `game` field at all — i.e. it got mangled.
+    if (direct) return null;
+    try {
+      const names = Object.getOwnPropertyNames(app);
+      for (let i = 0; i < names.length; i++) {
+        const v = safeRead(app, names[i]);
+        if (v && typeof v === 'object' && isGameLike(v)) return v;
+      }
+    } catch {}
+    return null;
+  }
+
+  // Fallback capture: Object.prototype setter traps.
+  //
+  // This is the pre-existing path, kept because it costs nothing and still
+  // works on any build that does NOT pre-declare its constructor-assigned
+  // names as class fields. On the current bundle it never fires — see the
+  // block above for why.
+  //
+  // We install a setter trap on Object.prototype for properties that the
+  // game class's constructor body assigns from positional params
+  // (`this.<A> = e, this.<B> = t, …` — names live in mangled.js's
+  // `seedNames`). Where those are not pre-declared as class fields, the
+  // assignments walk the prototype chain and fire our setter with `this` =
+  // the new game instance. We verify shape before capturing to avoid false
+  // positives, then restore Object.prototype on success.
   //
   // Two robustness features:
   //
@@ -418,10 +561,11 @@
   //     install traps on those names too. This auto-adapts when survev ships
   //     a new build.
   //
-  // We also rely on this script being loaded as a `world: "MAIN"` content
-  // script (see manifest.json) so it runs at document_start in the page
-  // world, BEFORE survev's bundle parses — otherwise `new Rr(...)` could
-  // race ahead of us during cached reloads.
+  // Both capture paths rely on this script being loaded as a `world: "MAIN"`
+  // content script (see manifest.json) so it runs at document_start in the
+  // page world, BEFORE survev's bundle parses — otherwise the app singleton's
+  // constructor (and its `.bind()` calls) could race ahead of us during
+  // cached reloads.
   const trapState = {
     installed: new Set(),
     originals: new Map(),
@@ -857,6 +1001,16 @@
   function findRoot() {
     if (lastFound?.game && isGameLike(lastFound.game)) return lastFound;
 
+    // Primary path: read the live game ref off the captured app singleton.
+    // Goes first so that if the bundle ever swaps in a fresh Game instance
+    // (new round / rejoin) we follow it rather than clinging to a stale one.
+    const fromApp = gameFromApp();
+    if (fromApp) {
+      swapCapturedGame(fromApp);
+      lastFound = { rootName: 'appSingleton', game: fromApp };
+      return lastFound;
+    }
+
     // Belt-and-braces: re-run the deferred shape check on any candidates
     // that fired the trap but weren't recognizable at trap-fire time.
     if (!capturedGame && trapState.pendingCandidates.length) {
@@ -1087,11 +1241,30 @@
 
     if (!found) {
       if (now - lastStatusAt > STATUS_MS) {
+        // Distinguish "we can't reach the app at all" (a real breakage —
+        // the bundle changed shape) from "we have the app, the Game just
+        // hasn't been init()'d yet" (normal: the user is still in the menu,
+        // the roster only exists once a match is joined).
+        const appGame = capturedApp ? safeRead(capturedApp, 'game') : null;
+        const message = !capturedApp
+          ? 'App singleton not captured. The bundle may have changed shape — re-run fetch_survev_js.py + derive_mangled.py, and reload the page (the capture hook must be installed before survev\'s bundle runs).'
+          : appGame
+            ? 'App captured and the Game object exists, but it has not been initialized yet. Click Play and join a match.'
+            : 'App captured, but it has no Game object yet. The bundle is still loading.';
         post('status', {
           ok: false,
-          message: 'Game root not found yet.',
+          message,
           url: location.href,
           isTop: window.top === window,
+          app: {
+            captured: !!capturedApp,
+            hasGame: !!appGame,
+            bindHook: {
+              installed: bindHookState.installed,
+              calls: bindHookState.calls,
+              uninstalledReason: bindHookState.uninstalledReason
+            }
+          },
           trap: {
             installedNames: Array.from(trapState.installed),
             extraCandidatesAdded: trapState.candidatesAdded,
@@ -1492,21 +1665,39 @@
     e.preventDefault();
   }, true);
 
+  // Live-tunable auto-quickswap settings. Declared here (rather than beside
+  // the auto-quickswap code below) because AIM_MENU_SPECS binds a slider to
+  // it and would hit the temporal dead zone otherwise.
+  const AUTO_SWAP = {
+    // Minimum fireDelay, in seconds, for a gun to be treated as
+    // slow-firing. The default sits just under the 0.5s USAS-12 so the
+    // set is snipers, pump/semi shotguns, the S&W 500 and the potato
+    // cannon — weapons whose post-shot dead time comfortably exceeds a
+    // sidearm's switchDelay. Lower it toward 0.3 to also catch the M1014,
+    // Saiga-12, SPAS-16 and M1100; raise it to restrict to bolt-actions.
+    slowFireThreshold: 0.5,
+  };
+
   // ---------------------------------------------------------------------
-  // Top-right settings menu for live-tuning the AIM_HUMAN parameters.
-  // Hidden by default; revealed only while the real cursor is in the
-  // top-right corner zone (or while the user is dragging one of its
-  // controls). Each row is a slider bound to one AIM_HUMAN key, so edits
-  // take effect on the very next frame.
+  // Top-right settings menu for live-tuning the AIM_HUMAN parameters and
+  // the auto-quickswap threshold. Hidden by default; revealed only while
+  // the real cursor is in the top-right corner zone (or while the user is
+  // dragging one of its controls). Each row is a slider bound to one key
+  // on a settings object, so edits take effect on the very next frame.
   // ---------------------------------------------------------------------
   const AIM_MENU_SPECS = [
-    { key: 'reactionMs',     label: 'Reaction (ms)',  min: 0,   max: 400,  step: 5,    decimals: 0 },
-    { key: 'followFraction', label: 'Follow frac',    min: 0.01, max: 1,    step: 0.01, decimals: 2 },
-    { key: 'deadLingerMs',   label: 'Dead linger (ms)', min: 0, max: 2000, step: 50,   decimals: 0 },
+    { store: AIM_HUMAN, key: 'reactionMs',     label: 'Reaction (ms)',  min: 0,   max: 400,  step: 5,    decimals: 0 },
+    { store: AIM_HUMAN, key: 'followFraction', label: 'Follow frac',    min: 0.01, max: 1,    step: 0.01, decimals: 2 },
+    { store: AIM_HUMAN, key: 'deadLingerMs',   label: 'Dead linger (ms)', min: 0, max: 2000, step: 50,   decimals: 0 },
+    { store: AUTO_SWAP, key: 'slowFireThreshold', label: 'Slow-fire ≥ (s)', min: 0.1, max: 2, step: 0.05, decimals: 2,
+      section: 'Auto-quickswap' },
   ];
-  // px from the top-right corner within which the menu reveals itself.
+  // px from the top-right corner within which the menu reveals itself. The
+  // zone has to cover the whole panel, or moving the cursor down toward the
+  // lowest slider hides the menu before you can grab it — hence the extra
+  // height for the auto-quickswap section.
   const AIM_MENU_ZONE_W = 280;
-  const AIM_MENU_ZONE_H = 220;
+  const AIM_MENU_ZONE_H = 320;
   let aimMenuEl = null;
   let aimMenuInteracting = false; // true while a slider is being dragged
 
@@ -1529,6 +1720,13 @@
     panel.appendChild(title);
 
     for (const spec of AIM_MENU_SPECS) {
+      if (spec.section) {
+        const heading = document.createElement('div');
+        heading.textContent = spec.section;
+        heading.style.cssText = 'font-weight:600;margin:12px 0 4px;padding-top:8px;'
+          + 'border-top:1px solid #3a3f4b;opacity:0.85';
+        panel.appendChild(heading);
+      }
       const row = document.createElement('label');
       row.style.cssText = 'display:block;margin:8px 0';
       const head = document.createElement('div');
@@ -1537,16 +1735,16 @@
       name.textContent = spec.label;
       const val = document.createElement('span');
       val.style.cssText = 'opacity:0.8;font-variant-numeric:tabular-nums';
-      val.textContent = Number(AIM_HUMAN[spec.key]).toFixed(spec.decimals);
+      val.textContent = Number(spec.store[spec.key]).toFixed(spec.decimals);
       head.appendChild(name); head.appendChild(val);
       const slider = document.createElement('input');
       slider.type = 'range';
       slider.min = String(spec.min); slider.max = String(spec.max); slider.step = String(spec.step);
-      slider.value = String(AIM_HUMAN[spec.key]);
+      slider.value = String(spec.store[spec.key]);
       slider.style.cssText = 'width:100%;cursor:pointer;accent-color:#5b9dff';
       slider.addEventListener('input', () => {
         const v = Number(slider.value);
-        AIM_HUMAN[spec.key] = v;
+        spec.store[spec.key] = v;
         val.textContent = v.toFixed(spec.decimals);
       });
       row.appendChild(head); row.appendChild(slider);
@@ -1583,19 +1781,52 @@
   // quickswitch.
   // ---------------------------------------------------------------------
 
-  // Guns whose fireDelay (in the asset/definitions dump) is ≥ 0.3s and which fire one shot
-  // per click — the regime where quickswapping beats waiting. Burst-fire
-  // weapons (ump9, famas) are excluded because swapping mid-burst
-  // truncates the remaining shots; auto-fire weapons aren't here because
-  // the user would just keep holding the trigger.
-  const SLOW_FIRE_GUNS = new Set([
-    // Bolt/lever-action rifles + DMRs that aim before firing
-    'mosin', 'sv98', 'awc', 'scout_elite', 'blr', 'model94',
-    // Pump-action and semi-auto shotguns
-    'm870', 'spas12', 'm1014', 'usas',
-    // Potato cannon (slow single-shot)
-    'potato_cannon',
+  // Every gun's fireDelay in seconds, transcribed from the gun defs in the
+  // asset/definitions dump. A weapon counts as slow-firing when its delay
+  // is at or above AUTO_SWAP.slowFireThreshold, so this table (not a
+  // hand-picked list) decides membership and the threshold slider retunes
+  // it live. Static, like GUN_BULLET_SPEED — re-derive when survev ships
+  // new guns or rebalances existing ones. Guns absent from the table never
+  // auto-swap.
+  const GUN_FIRE_DELAY = {
+    // SMGs / ARs / LMGs
+    mp5: 0.09, mac10: 0.045, ump9: 0.35, vector: 0.038, vector45: 0.044,
+    scorpion: 0.055, vss: 0.16, famas: 0.35, hk416: 0.075, m4a1: 0.082,
+    mk12: 0.18, l86: 0.19, m249: 0.08, qbb97: 0.1, ak47: 0.1, scar: 0.09,
+    an94: 0.24, groza: 0.078, grozas: 0.078, dp28: 0.115, bar: 0.12,
+    imbel: 0.092, pkp: 0.1, ash12: 0.1, m1a1: 0.095,
+    // DMRs / snipers
+    scout_elite: 1, scarssr: 0.3, model94: 0.7, mkg45: 0.17, blr: 0.8,
+    mosin: 1.75, sv98: 1.5, awc: 1.5, m39: 0.23, svd: 0.25, garand: 0.23,
+    barrett: 0.925,
+    // Shotguns
+    m870: 0.9, m1100: 0.3, mp220: 0.2, saiga: 0.4, spas12: 0.75,
+    spas16: 0.35, m1014: 0.4, usas: 0.5,
+    // Pistols
+    m9: 0.12, m9_dual: 0.08, m9_cursed: 0.12, m93r: 0.28, m93r_dual: 0.18,
+    glock: 0.06, glock_dual: 0.03, p30l: 0.14, p30l_dual: 0.09, ot38: 0.4,
+    ot38_dual: 0.2, ots38: 0.36, ots38_dual: 0.18, colt45: 0.12,
+    colt45_dual: 0.13, m1911: 0.13, m1911_dual: 0.085, deagle: 0.16,
+    deagle_dual: 0.12, sw500: 0.65,
+    // Special / event
+    flare_gun: 0.4, flare_gun_dual: 0.3, potato_cannon: 1.2,
+    potato_smg: 0.09, potato_lmg: 0.07, bugle: 1,
+  };
+
+  // Never auto-swap on these, no matter how low the threshold goes.
+  // Burst-fire guns would have their remaining shots truncated by a swap
+  // mid-burst; the flare gun and bugle are utility items where the user
+  // wants the gun they already had, not a quickswitch.
+  const AUTO_SWAP_NEVER = new Set([
+    'ump9', 'famas', 'm93r', 'm93r_dual', 'an94',
+    'flare_gun', 'flare_gun_dual', 'bugle',
   ]);
+
+  function isSlowFireGun(weapon) {
+    if (AUTO_SWAP_NEVER.has(weapon)) return false;
+    const delay = GUN_FIRE_DELAY[weapon];
+    return typeof delay === 'number' && delay >= AUTO_SWAP.slowFireThreshold;
+  }
 
   // Survev collects inputs once per tick (~16ms) and `flush()` advances
   // `keysOld := keys` at end-of-tick. A 30ms gap between the user's
@@ -1663,7 +1894,14 @@
     if (!me) { console.log('[autoswap] skip: no local player'); return; }
     const weapon = getCurrentWeapon(me);
     if (!weapon) { console.log('[autoswap] skip: no current weapon'); return; }
-    if (!SLOW_FIRE_GUNS.has(weapon)) { console.log(`[autoswap] skip: ${weapon} not in slow-fire set`); return; }
+    if (!isSlowFireGun(weapon)) {
+      const delay = GUN_FIRE_DELAY[weapon];
+      const why = delay === undefined ? 'unknown fireDelay'
+        : AUTO_SWAP_NEVER.has(weapon) ? 'never-swap list'
+        : `fireDelay ${delay}s < ${AUTO_SWAP.slowFireThreshold}s threshold`;
+      console.log(`[autoswap] skip: ${weapon} — ${why}`);
+      return;
+    }
     if (autoSwapOtherSlotHasGun(me)) {
       // Two-gun case: swap to the other gun. SwapWeapSlots/EquipOtherGun
       // resets gunSwitchCooldown so the other gun is ready as soon as
@@ -1718,8 +1956,24 @@
   // so the overlay can lerp smoothly between sample ticks.
   let interpPrev = {};   // { [id]: { x, y, xv, yv } }
   let interpCurr = {};   // { [id]: { x, y, xv, yv } }
-  let interpT0 = 0;      // timestamp when interpCurr was captured
-  const INTERP_WINDOW = SAMPLE_MS; // ms over which we lerp prev→curr
+  let interpT0 = 0;      // performance.now() when interpCurr was captured
+
+  // Interpolation window = a live estimate of how often positions actually
+  // update, rather than a fixed constant. survev streams positions at the
+  // server tick rate; packets arrive with network jitter and are only
+  // observed on our SAMPLE_MS sample boundaries, so the raw inter-arrival
+  // time bounces around. We smooth it with a per-update EWMA — weighting
+  // every update equally, i.e. *assuming* updates are evenly spaced — so a
+  // single late/early packet can't whip the window around and make the
+  // overlay jump. The lerp then advances at the typical cadence and reaches
+  // `curr` right about when the next packet is due, giving smooth predictions
+  // regardless of exactly when each packet lands.
+  const UPDATE_EWMA_ALPHA = 0.1;        // ~10-update (~1s) smoothing horizon
+  const MIN_INTERP_WINDOW = SAMPLE_MS;  // floor: never lerp faster than we sample
+  const MAX_INTERP_WINDOW = 500;        // ceiling: reject huge gaps (tab blur, game swap, join lag)
+  let ewmaUpdateMs = 0;                 // EWMA of the update interval (ms); 0 = not yet seeded
+  let lastUpdateAt = 0;                 // performance.now() of the previous position update
+  let interpWindowMs = SAMPLE_MS;       // window currently used by interpPos (clamped EWMA)
 
   function updateInterpState(sample) {
     if (!sample || !sample.enemies) return;
@@ -1744,6 +1998,19 @@
       if (!c || c.x !== n.x || c.y !== n.y) { changed = true; break; }
     }
     if (!changed && Object.keys(newMap).length === Object.keys(interpCurr).length) return;
+    // Fold the time since the previous position update into the cadence EWMA.
+    // The raw interval is clamped to [MIN, MAX] so quantization/jitter can't
+    // drive the window below our sample rate and a huge gap (tab blur, game
+    // swap, join lag) can't poison the average. The first interval seeds the
+    // EWMA directly so we don't ramp up slowly from a stale default.
+    if (lastUpdateAt) {
+      const interval = Math.min(Math.max(now - lastUpdateAt, MIN_INTERP_WINDOW), MAX_INTERP_WINDOW);
+      ewmaUpdateMs = ewmaUpdateMs
+        ? UPDATE_EWMA_ALPHA * interval + (1 - UPDATE_EWMA_ALPHA) * ewmaUpdateMs
+        : interval;
+      interpWindowMs = ewmaUpdateMs;
+    }
+    lastUpdateAt = now;
     interpPrev = interpCurr;
     interpCurr = newMap;
     interpT0 = now;
@@ -1757,8 +2024,9 @@
     const curr = interpCurr[id];
     const prev = interpPrev[id];
     if (!curr) return { x: fallbackX, y: fallbackY, xv: 0, yv: 0 };
+    const win = interpWindowMs > 0 ? interpWindowMs : SAMPLE_MS;
     const elapsed = performance.now() - interpT0;
-    const t = INTERP_WINDOW > 0 ? Math.min(elapsed / INTERP_WINDOW, 1) : 1;
+    const t = Math.min(elapsed / win, 1);
     if (!prev) {
       // No previous data — extrapolate from current using velocity.
       const dt = elapsed / 1000;
@@ -1773,7 +2041,7 @@
         yv: prev.yv + (curr.yv - prev.yv) * t,
       };
     }
-    const overshoot = (elapsed - INTERP_WINDOW) / 1000;
+    const overshoot = (elapsed - win) / 1000;
     return {
       x: curr.x + curr.xv * overshoot,
       y: curr.y + curr.yv * overshoot,
@@ -1965,11 +2233,74 @@
           ctx.stroke();
         }
       }
+
+      // Actual aimbot aim location: the world-space point the bot is currently
+      // steering the crosshair toward (aimState.aimX/aimY). This is the genuine
+      // post-humanization aim that dispatchAim derives theta from and sends to
+      // the game each frame — distinct from the white lead-X above, which is an
+      // idealized instantaneous lead point recomputed in the overlay. aimState
+      // is non-null only while Shift is held and a target is engaged, so this
+      // reticle appears exactly when the bot is actively aiming.
+      if (aimState.aimX != null && aimState.aimY != null) {
+        const axs = cx + (aimState.aimX - pi.x) * scale;
+        const ays = cy - (aimState.aimY - pi.y) * scale;
+        const reticle = 12;
+        const tick = 5;
+        const aimColor = 'rgba(0, 229, 255, 0.95)';
+
+        // Thin guide line from player (center) to the aim point.
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = 'rgba(0, 229, 255, 0.5)';
+        ctx.beginPath();
+        ctx.moveTo(cx, cy);
+        ctx.lineTo(axs, ays);
+        ctx.stroke();
+
+        // Reticle ring.
+        ctx.lineWidth = 2.5;
+        ctx.strokeStyle = aimColor;
+        ctx.beginPath();
+        ctx.arc(axs, ays, reticle, 0, Math.PI * 2);
+        ctx.stroke();
+
+        // Crosshair ticks straddling the ring.
+        ctx.beginPath();
+        ctx.moveTo(axs - reticle - tick, ays); ctx.lineTo(axs - reticle + tick, ays);
+        ctx.moveTo(axs + reticle - tick, ays); ctx.lineTo(axs + reticle + tick, ays);
+        ctx.moveTo(axs, ays - reticle - tick); ctx.lineTo(axs, ays - reticle + tick);
+        ctx.moveTo(axs, ays + reticle - tick); ctx.lineTo(axs, ays + reticle + tick);
+        ctx.stroke();
+
+        // Center dot.
+        ctx.fillStyle = aimColor;
+        ctx.beginPath();
+        ctx.arc(axs, ays, 2.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
     }
 
     requestAnimationFrame(overlayFrame);
   }
   requestAnimationFrame(overlayFrame);
+
+  // Capture-path diagnostics. `appCaptured: false` means the bind hook never
+  // saw the app singleton — that's the failure mode to investigate. Exposed
+  // as a devtools global (same idiom as `window.__aimHuman`) because this
+  // build has no frozen exports object to hang it off; call
+  // `window.__captureDiag()` from the console.
+  window.__captureDiag = () => ({
+    appCaptured: !!capturedApp,
+    appHasGame: !!(capturedApp && safeRead(capturedApp, 'game')),
+    gameCaptured: !!capturedGame,
+    rootName: lastFound?.rootName || null,
+    bindHook: { ...bindHookState },
+    trap: {
+      installedNames: Array.from(trapState.installed),
+      extraCandidatesAdded: trapState.candidatesAdded,
+      discoveryStatus: trapState.discoveryStatus,
+      pendingCandidatesRemaining: trapState.pendingCandidates.length
+    }
+  });
 
   post('status', { ok: true, message: 'Injector loaded.', url: location.href, isTop: window.top === window });
   // console.log(`[${SOURCE}] inject.js TAIL reached, starting sampleLoop @ ${SAMPLE_MS}ms`);
