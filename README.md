@@ -7,10 +7,19 @@ authorized deployment of survev.
 
 ## Features
 
+The aim helper, enemy overlay and auto-quickswap all ship **off** and are
+turned on from the MOD tab; until then the game plays as stock survev. The
+netcode smoothing and ping readout are on by default — neither touches input
+or gameplay state.
+
 - **Enemy overlay** — every visible enemy is drawn as a marker on a canvas
-  overlaid on the page, with position, velocity, weapon, and status.
-- **Aim helper** — held Shift suppresses real mouse events and dispatches
-  randomized aim points each frame; a committed-target aimbot tracks the
+  overlaid on the page, with position, velocity, weapon, and status. Toggled
+  by the "ESP overlay" button in the MOD tab; turning it off only stops the
+  drawing, sampling and aim keep running.
+- **Aim helper** — once enabled by the "Aimbot" button in the MOD tab, holding
+  the aimbot key (Shift by default, rebindable on the row below it) suppresses
+  real mouse events and dispatches
+  aim points each frame; a committed-target aimbot tracks the
   closest enemy under the user's real cursor. Target positions, velocities
   and the lead point are all computed on the recovered server clock and led
   by the measured round trip — see [Aiming on the clock](#aiming-on-the-clock).
@@ -18,7 +27,7 @@ authorized deployment of survev.
   shotgun, etc.) the extension synthesizes a `SwapWeapSlots` input on the
   next server tick so the other gun is ready immediately. "Slow" means a
   gun whose `fireDelay` is at or above a threshold that defaults to 0.5s;
-  the in-game settings tab has a slider to retune it live.
+  the MOD tab has an on/off button and a slider to retune the threshold live.
 - **Netcode smoothing** — survev renders entity motion by lerping over the
   *raw* previous packet gap, so any network jitter makes everything
   alternately sprint and freeze, and a late packet freezes the world until
@@ -28,7 +37,9 @@ authorized deployment of survev.
   see [Netcode smoothing](#netcode-smoothing) below.
 - **Settings tab** — all live-tunable knobs live in a third tab ("MOD") in
   survev's own Escape menu, alongside Settings and Keybinds, built from the
-  game's own markup and styles.
+  game's own markup and styles. Every value persists in `localStorage` under
+  `elg_settings` and is validated against its own spec on load, so a stale or
+  hand-edited entry can't drop a `NaN` into the aim or netcode paths.
 - **Ping readout** — live round-trip time above the top-left team panel,
   colour-coded green/amber/red. Read from the RTT samples survev already
   collects (`game.pings`), so it adds no traffic of its own.
@@ -304,8 +315,14 @@ placed.
   the page's own JS context (required to read non-extension-exposed objects).
 - The overlay canvas is appended to the page body; it doesn't interfere
   with the game's own canvas.
-- The aim helper is bound to **Shift** (hold to engage); the auto-quickswap
-  is keybind-agnostic and triggers off the user's real Fire bind.
+- The aim helper defaults to **Shift** (hold to engage) and is rebindable from
+  the Aimbot row in the MOD tab, which is survev's own keybind row — same
+  markup, same key names, same rules: click to arm, Escape cancels, Backspace
+  unbinds (leaving the aimbot off), and Ctrl/Alt/Win/Menu/F1–F12 are refused.
+  Binds are stored as legacy `keyCode`, so left and right modifiers are one
+  key. Mouse buttons aren't bindable — survev's rows accept them, ours don't.
+  The auto-quickswap is keybind-agnostic and triggers off the user's real
+  Fire bind.
 - Netcode smoothing swaps two fields for accessors — the camera's
   interpolation window, and each Player's interpolated position. Both are
   installed per *instance* rather than on a prototype, because survev declares

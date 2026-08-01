@@ -1348,15 +1348,70 @@
     }
   });
 
-  // Alt-to-randomize-aim. While Alt is held, real mousemove events are
-  // swallowed at the capture phase and a fresh random screen-space point
+  // Hold-to-aim. While the aimbot key is held, real mousemove events are
+  // swallowed at the capture phase and a solved screen-space aim point
   // is dispatched to the canvas every animation frame. Survev keeps the
   // local player viewport-centered and derives aim from
   // (mouseScreenPos − playerScreenPos), so a screen-space offset translates
   // directly into world-space aim direction.
-  let shiftHeld = false;
-  let shiftRafId = 0;
-  const SHIFT_AIM_RADIUS = 400; // pixels from viewport center; well outside the player
+  let aimHeld = false;
+  let aimRafId = 0;
+  const AIM_CURSOR_RADIUS = 400; // pixels from viewport center; well outside the player
+
+  // Aimbot master switch and activation key. The bind is stored the way survev
+  // stores its own — a legacy `KeyboardEvent.keyCode` — so the row can share
+  // its markup, its naming and its capture rules; `null` means unbound, which
+  // is what Backspace does on survev's rows and is equivalent to switching the
+  // aimbot off. Declared up here, rather than beside the settings panel,
+  // because SETTINGS_SPECS binds rows to it and would hit the temporal dead
+  // zone. Off by default: the cheats stay inert until they are turned on in
+  // the MOD tab, so a fresh profile plays as stock survev.
+  const AIMBOT = {
+    enabled: 0,
+    bind: 16, // Shift. keyCode doesn't distinguish left from right, so both work.
+  };
+
+  // Enemy overlay master switch. Same hoisting reason, same default, as AIMBOT.
+  const ESP = {
+    enabled: 0,
+  };
+
+  // True while the MOD tab is waiting for the user to press their new bind, so
+  // the handlers below don't treat that press as an activation. Both listeners
+  // are capture-phase on window and ours is registered first (at load), so the
+  // flag is the only thing that can keep them apart.
+  let bindCapture = false;
+
+  // keyCode → display name, transcribed from the bundle's own table so our row
+  // reads exactly like survev's ("ESC", "Space", "←", "Numpad 1"). Letters,
+  // digits, numpad digits and function keys are derived instead of listed —
+  // the table's entries across those ranges are just the obvious name — and
+  // anything unlisted falls back to `Key <code>`, which is its fallback too.
+  const KEY_NAMES = {
+    8: 'Backspace', 9: 'Tab', 12: 'Clear', 13: 'Enter', 16: 'Shift', 17: 'Control',
+    18: 'Alt', 19: 'Pause', 20: 'Capslock', 27: 'ESC', 32: 'Space', 33: 'Page Up',
+    34: 'Page Down', 35: 'End', 36: 'Home', 37: '←', 38: '↑', 39: '→', 40: '↓',
+    41: 'Select', 42: 'Print', 43: 'Execute', 44: 'Printscreen', 45: 'Insert',
+    46: 'Delete', 91: 'Windows Key', 93: 'Context Menu', 95: 'Sleep', 106: '*',
+    107: '+', 108: 'Separator', 109: '-', 110: '.', 111: '/', 144: 'Num Lock',
+    145: 'Scroll Lock', 186: ';', 187: '=', 188: ',', 189: '-', 190: '.',
+    191: '/', 192: 'Backquote', 219: '[', 220: '\\', 221: ']', 222: "'",
+    224: 'Meta',
+  };
+
+  function keyName(code) {
+    if (code == null) return '';
+    if (code >= 48 && code <= 57) return String(code - 48);
+    if (code >= 65 && code <= 90) return String.fromCharCode(code);
+    if (code >= 96 && code <= 105) return `Numpad ${code - 96}`;
+    if (code >= 112 && code <= 123) return `F${code - 111}`;
+    return KEY_NAMES[code] || `Key ${code}`;
+  }
+
+  // Keys survev refuses to bind: bare modifiers that never arrive alone in a
+  // usable way, the OS menu keys, and the function row. Pressing one leaves
+  // the row armed rather than binding it, exactly as in the Keybinds tab.
+  const UNBINDABLE = new Set([17, 18, 91, 93, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123]);
   function dist(a, b){
     return ((a["x"] - b["x"]) ** 2 + (a["y"] - b["y"]) ** 2) ** 0.5
   }
@@ -1783,8 +1838,8 @@
       aimState.targetId = null;
     }
 
-    const x = Math.round(window.innerWidth / 2 + Math.cos(aimState.theta) * SHIFT_AIM_RADIUS);
-    const y = Math.round(window.innerHeight / 2 - Math.sin(aimState.theta) * SHIFT_AIM_RADIUS);
+    const x = Math.round(window.innerWidth / 2 + Math.cos(aimState.theta) * AIM_CURSOR_RADIUS);
+    const y = Math.round(window.innerHeight / 2 - Math.sin(aimState.theta) * AIM_CURSOR_RADIUS);
     try {
       target.dispatchEvent(new MouseEvent('mousemove', {
         bubbles: true,
@@ -1798,39 +1853,48 @@
     } catch {}
   }
 
-  function shiftFrame() {
-    if (!shiftHeld) { shiftRafId = 0; return; }
+  function aimFrame() {
+    // Switching the aimbot off mid-hold drops the hold here rather than
+    // leaving the loop spinning until the key comes up.
+    if (!aimHeld || !AIMBOT.enabled) { releaseAim(); return; }
     dispatchAim();
-    shiftRafId = requestAnimationFrame(shiftFrame);
+    aimRafId = requestAnimationFrame(aimFrame);
+  }
+
+  // Drop the hold and every bit of state it accumulated. Also called when the
+  // bind changes out from under a held key, where no keyup for the old bind is
+  // ever going to arrive.
+  function releaseAim() {
+    aimHeld = false;
+    if (aimRafId) { cancelAnimationFrame(aimRafId); aimRafId = 0; }
+    aimState.targetId = null;
+    aimState.aimX = null;
+    aimState.aimY = null;
+    aimState.lastFrameAt = 0;
   }
 
   window.addEventListener('keydown', (e) => {
-    if (e.key !== 'Shift') return;
-    if (!shiftHeld) {
-      shiftHeld = true;
+    if (bindCapture || !AIMBOT.enabled || AIMBOT.bind == null || e.keyCode !== AIMBOT.bind) return;
+    if (!aimHeld) {
+      aimHeld = true;
       // Fresh hold: drop the prior aim point so dispatchAim re-seeds the glide
       // from wherever the user's real cursor currently points.
       aimState.aimX = null;
       aimState.aimY = null;
       aimState.lastFrameAt = 0;
-      if (!shiftRafId) shiftRafId = requestAnimationFrame(shiftFrame);
+      if (!aimRafId) aimRafId = requestAnimationFrame(aimFrame);
     }
-    // Suppress the browser's default Shift behavior so it doesn't steal
+    // Suppress the browser's default behavior for the bind so it doesn't steal
     // focus from the canvas.
     e.preventDefault();
   }, true);
 
   window.addEventListener('keyup', (e) => {
-    if (e.key !== 'Shift') return;
-    shiftHeld = false;
-    if (shiftRafId) { cancelAnimationFrame(shiftRafId); shiftRafId = 0; }
-    aimState.targetId = null;
-    aimState.aimX = null;
-    aimState.aimY = null;
-    aimState.lastFrameAt = 0;
+    if (AIMBOT.bind == null || e.keyCode !== AIMBOT.bind) return;
+    releaseAim();
   }, true);
 
-  // Capture-phase mousemove suppressor: while Shift is held, drop any real
+  // Capture-phase mousemove suppressor: while the aimbot key is held, drop any real
   // (trusted) mouse movement so only our per-frame synthetic events reach
   // the game. Synthetic events (isTrusted === false) pass through. We also
   // *record* the real mouse position on every trusted move (even when
@@ -1842,7 +1906,7 @@
       realMouse.y = e.clientY;
       realMouse.hasMoved = true;
     }
-    if (!shiftHeld || !e.isTrusted) return;
+    if (!aimHeld || !e.isTrusted) return;
     e.stopImmediatePropagation();
     e.preventDefault();
   }, true);
@@ -1851,6 +1915,7 @@
   // the auto-quickswap code below) because SETTINGS_SPECS binds a slider to it
   // and would hit the temporal dead zone otherwise.
   const AUTO_SWAP = {
+    enabled: 0,        // master switch; 0 = never synthesize a swap
     // Minimum fireDelay, in seconds, for a gun to be treated as
     // slow-firing. The default sits just under the 0.5s USAS-12 so the
     // set is snipers, pump/semi shotguns, the S&W 500 and the potato
@@ -1916,30 +1981,86 @@
   // pane is re-attached on demand because the menu markup can be rebuilt.
   // ---------------------------------------------------------------------
 
-  // One row per tunable. `kind: 'toggle'` renders a button, anything else a
-  // slider; `section` starts a new heading above the row.
+  // One row per tunable. `kind: 'toggle'` renders a button, `kind: 'keybind'` a
+  // survev-style keybind row, anything else a slider; `section` starts a new
+  // heading above the row. `id` is the settled name the value is persisted
+  // under, so renaming a store or a field doesn't silently orphan saved values.
   const SETTINGS_SPECS = [
-    { store: AIM_HUMAN, key: 'reactionMs',     label: 'Reaction',  unit: 'ms', min: 0,    max: 400,  step: 5,    decimals: 0,
+    { id: 'aimbot.enabled', store: AIMBOT, key: 'enabled', label: 'Aimbot', kind: 'toggle',
+      section: 'Aimbot' },
+    { id: 'aimbot.bind',  store: AIMBOT, key: 'bind', label: 'Aimbot key', kind: 'keybind' },
+    { id: 'esp.enabled',  store: ESP,    key: 'enabled', label: 'ESP overlay', kind: 'toggle',
+      section: 'ESP' },
+    { id: 'aim.reactionMs',     store: AIM_HUMAN, key: 'reactionMs',     label: 'Reaction',  unit: 'ms', min: 0,    max: 400,  step: 5,    decimals: 0,
       section: 'Aim humanization' },
-    { store: AIM_HUMAN, key: 'followFraction', label: 'Follow',                min: 0.01, max: 1,    step: 0.01, decimals: 2 },
-    { store: AIM_HUMAN, key: 'deadLingerMs',   label: 'Linger',    unit: 'ms', min: 0,    max: 2000, step: 50,   decimals: 0 },
-    { store: AIM_HUMAN, key: 'pingLeadK',      label: 'Ping lead',             min: 0,    max: 1.5,  step: 0.05, decimals: 2 },
-    { store: AUTO_SWAP, key: 'slowFireThreshold', label: 'Slow-fire', unit: 's', min: 0.1, max: 2,   step: 0.05, decimals: 2,
+    { id: 'aim.followFraction', store: AIM_HUMAN, key: 'followFraction', label: 'Follow',                min: 0.01, max: 1,    step: 0.01, decimals: 2 },
+    { id: 'aim.deadLingerMs',   store: AIM_HUMAN, key: 'deadLingerMs',   label: 'Linger',    unit: 'ms', min: 0,    max: 2000, step: 50,   decimals: 0 },
+    { id: 'aim.pingLeadK',      store: AIM_HUMAN, key: 'pingLeadK',      label: 'Ping lead',             min: 0,    max: 1.5,  step: 0.05, decimals: 2 },
+    { id: 'swap.enabled',       store: AUTO_SWAP, key: 'enabled',        label: 'Auto-quickswap', kind: 'toggle',
       section: 'Auto-quickswap' },
-    { store: NETCODE,   key: 'enabled',        label: 'Smoothing', kind: 'toggle',
+    { id: 'swap.slowFire',      store: AUTO_SWAP, key: 'slowFireThreshold', label: 'Slow-fire', unit: 's', min: 0.1, max: 2,   step: 0.05, decimals: 2 },
+    { id: 'net.enabled',        store: NETCODE,   key: 'enabled',        label: 'Smoothing', kind: 'toggle',
       section: 'Netcode smoothing' },
-    { store: NETCODE,   key: 'jitterK',        label: 'Jitter buf',            min: 0,    max: 5,    step: 0.1,  decimals: 1 },
-    { store: NETCODE,   key: 'clockHalfLife',  label: 'Clock',     unit: ' pkt', min: 5,  max: 400,  step: 5,    decimals: 0 },
-    { store: NETCODE,   key: 'renderLag',      label: 'Playout',   unit: ' tick', min: 0, max: 2,   step: 0.05, decimals: 2 },
-    { store: PING_UI,   key: 'enabled',        label: 'Ping readout', kind: 'toggle',
+    { id: 'net.jitterK',        store: NETCODE,   key: 'jitterK',        label: 'Jitter buf',            min: 0,    max: 5,    step: 0.1,  decimals: 1 },
+    { id: 'net.clockHalfLife',  store: NETCODE,   key: 'clockHalfLife',  label: 'Clock',     unit: ' pkt', min: 5,  max: 400,  step: 5,    decimals: 0 },
+    { id: 'net.renderLag',      store: NETCODE,   key: 'renderLag',      label: 'Playout',   unit: ' tick', min: 0, max: 2,   step: 0.05, decimals: 2 },
+    { id: 'hud.ping',           store: PING_UI,   key: 'enabled',        label: 'Ping readout', kind: 'toggle',
       section: 'HUD' },
   ];
+
+  // ---------------------------------------------------------------------
+  // Persistence. Everything in SETTINGS_SPECS is written to localStorage on
+  // change and restored at load, under our own key — survev keeps its config
+  // in `surviv_config` and we stay out of it.
+  //
+  // Values are validated on the way back in rather than trusted: the store
+  // objects are read every frame by the aim, netcode and overlay paths, and a
+  // hand-edited or stale entry that put a NaN in one of them would be a
+  // silent, permanent breakage with no obvious cause. Anything that fails its
+  // spec is dropped and the coded default stands.
+  // ---------------------------------------------------------------------
+  const SETTINGS_STORAGE_KEY = 'elg_settings';
+
+  function saveSettings() {
+    try {
+      const out = {};
+      for (const spec of SETTINGS_SPECS) out[spec.id] = spec.store[spec.key];
+      localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(out));
+    } catch {}
+  }
+
+  function loadSettings() {
+    let saved;
+    try {
+      saved = JSON.parse(localStorage.getItem(SETTINGS_STORAGE_KEY) || '{}');
+    } catch { return; }
+    if (!saved || typeof saved !== 'object') return;
+    for (const spec of SETTINGS_SPECS) {
+      if (!(spec.id in saved)) continue;
+      const v = saved[spec.id];
+      if (spec.kind === 'keybind') {
+        // null is a real value here — it is what an unbound row saves as.
+        if (v === null) { spec.store[spec.key] = null; continue; }
+        if (Number.isInteger(v) && v >= 0 && v <= 255 && !UNBINDABLE.has(v)) spec.store[spec.key] = v;
+      } else if (spec.kind === 'toggle') {
+        if (v === 0 || v === 1) spec.store[spec.key] = v;
+      } else if (Number.isFinite(v)) {
+        // Clamp instead of reject: a value outside the current range is what a
+        // retuned slider leaves behind, and the nearest legal value is what the
+        // user would get by dragging to the end anyway.
+        spec.store[spec.key] = Math.min(spec.max, Math.max(spec.min, v));
+      }
+    }
+  }
+
+  loadSettings();
 
   const ELG_TAB = 'elg';
   const ELG_TAB_BTN_ID = `btn-game-${ELG_TAB}`;
   const ELG_TAB_PANE_ID = `ui-game-tab-${ELG_TAB}`;
   const ELG_LIST_ID = `ui-${ELG_TAB}-list`;
   const ELG_STYLE_ID = `${ELG_TAB}-style`;
+  const ELG_LIST_MIN_H = 295; // survev's keybind-list height; see ELG_STYLE below
 
   // survev's stylesheet only targets its own two tabs by id, so ours gets an
   // equivalent rule rather than inheriting one. Values are copied from the
@@ -1951,6 +2072,9 @@
   // from `ui-game-tab-settings-desktop`, a class the bundle adds and removes as
   // the layout switches between desktop and mobile — copying that would mean
   // tracking the layout too. Keybinds sizes its inner list unconditionally.
+  //
+  // 295px is the floor, not the final height: fitElgPane measures the box on
+  // show and grows the list until "Return to Game" lands on the bottom edge.
   //
   // `pointer-events:all` is load-bearing: the whole `#ui-game` HUD is
   // click-through, so a pane that doesn't opt back in cannot be scrolled or
@@ -1966,7 +2090,7 @@
   const ELG_STYLE = `
     #${ELG_TAB_PANE_ID} > #${ELG_LIST_ID} {
       pointer-events: all;
-      height: 295px;
+      height: ${ELG_LIST_MIN_H}px;
       overflow-y: scroll;
       /* Belt-and-braces against the same promotion: nothing in the pane is
          wider than the track, so clipping here can only ever hide a stray
@@ -2009,7 +2133,45 @@
     document.querySelectorAll('.btn-game-tab-select').forEach((el) => {
       el.classList.toggle('btn-game-menu-selected', el.id === `btn-game-${tab}`);
     });
+    if (tab === ELG_TAB) fitElgPane();
   }
+
+  // Grow (or shrink) the row list so the pane fills the menu box and
+  // "Return to Game" ends up flush with its bottom edge, where it sits on
+  // survev's own tabs.
+  //
+  // The 295px copied from the keybinds tab is only a starting point. On
+  // desktop the menu is a fixed 495px box (`.ui-game-menu-desktop`) and the
+  // keybinds *pane* is 345px — 295px of list plus 50px for its
+  // restore-defaults button. Our pane has no height of its own, so it comes up
+  // 50px short and that shortfall is exactly the gap under the button.
+  // Measured rather than hardcoded, because the number depends on the row set
+  // and on which of survev's layouts is live; self-limiting, since after one
+  // pass the slack is zero and repeat calls return early. Under the mobile
+  // media query the menu is `height: initial` and hugs its content, so the
+  // slack is zero to begin with and this does nothing.
+  function fitElgPane() {
+    const menu = document.getElementById('ui-game-menu');
+    const list = document.getElementById(ELG_LIST_ID);
+    const resume = document.getElementById('btn-game-resume');
+    if (!menu || !list || !resume || !list.offsetParent) return;
+    const menuStyle = getComputedStyle(menu);
+    const contentBottom = menu.getBoundingClientRect().bottom
+      - parseFloat(menuStyle.paddingBottom || '0')
+      - parseFloat(menuStyle.borderBottomWidth || '0');
+    const slack = contentBottom
+      - resume.getBoundingClientRect().bottom
+      - parseFloat(getComputedStyle(resume).marginBottom || '0');
+    if (Math.abs(slack) < 1) return;
+    const h = Math.round(list.getBoundingClientRect().height + slack);
+    list.style.height = `${Math.max(ELG_LIST_MIN_H, h)}px`;
+  }
+
+  // Refit on resize: the menu panel is sized off the viewport, so the slack
+  // changes with it. Only does work while our tab is the visible one.
+  window.addEventListener('resize', () => {
+    try { fitElgPane(); } catch {}
+  });
 
   function buildElgPane() {
     const pane = document.createElement('div');
@@ -2032,6 +2194,65 @@
         list.appendChild(heading);
       }
 
+      // Keybind rows are survev's own markup, class for class: a
+      // `.ui-keybind-container` holding a `.btn-keybind-desc` anchor and a
+      // `.btn-keybind-display` box, with `.btn-keybind-desc-selected` applied
+      // while armed. That gets the shipped stylesheet to lay ours out exactly
+      // like the rows in the Keybinds tab, and the behaviour matches too:
+      // Escape cancels, Backspace unbinds, and the keys survev won't take
+      // leave the row armed instead of binding.
+      //
+      // Capture is a capture-phase window listener so the key never reaches the
+      // game, and `bindCapture` keeps the aimbot's own listener — registered
+      // first, at load, so it runs first — from engaging on the press.
+      if (spec.kind === 'keybind') {
+        const row = document.createElement('div');
+        row.className = 'ui-keybind-container';
+        const desc = document.createElement('a');
+        desc.className = 'btn-game-menu btn-darken btn-keybind-desc';
+        desc.textContent = spec.label;
+        const display = document.createElement('div');
+        display.className = 'btn-keybind-display';
+        let listening = false;
+        const paint = () => {
+          display.textContent = keyName(spec.store[spec.key]);
+          desc.classList.toggle('btn-keybind-desc-selected', listening);
+        };
+        const stop = () => {
+          listening = false;
+          bindCapture = false;
+          window.removeEventListener('keydown', onCapture, true);
+          paint();
+        };
+        function onCapture(ev) {
+          ev.preventDefault();
+          ev.stopImmediatePropagation();
+          // Rejected key: stay armed and wait for another, as survev does.
+          if (UNBINDABLE.has(ev.keyCode)) return;
+          if (ev.keyCode !== 27) {
+            // A held old bind will never get its keyup once this changes, so
+            // drop the hold rather than leaving the aim loop running forever.
+            releaseAim();
+            spec.store[spec.key] = ev.keyCode === 8 ? null : ev.keyCode;
+            saveSettings();
+          }
+          stop();
+        }
+        paint();
+        desc.addEventListener('click', (e) => {
+          e.stopPropagation();
+          if (listening) { stop(); return; }
+          listening = true;
+          bindCapture = true;
+          paint();
+          window.addEventListener('keydown', onCapture, true);
+        });
+        row.appendChild(desc);
+        row.appendChild(display);
+        list.appendChild(row);
+        continue;
+      }
+
       // Toggles reuse the menu-button look; sliders reuse the volume-slider
       // markup, so both inherit survev's styling rather than fighting it.
       if (spec.kind === 'toggle') {
@@ -2045,6 +2266,7 @@
           e.stopPropagation();
           spec.store[spec.key] = spec.store[spec.key] ? 0 : 1;
           paint();
+          saveSettings();
         });
         list.appendChild(btn);
         continue;
@@ -2072,6 +2294,9 @@
         spec.store[spec.key] = v;
         paintLabel(v);
       });
+      // Persist on `change`, not `input`: a drag fires `input` per pixel, and
+      // the value that matters is the one the user let go on.
+      slider.addEventListener('change', saveSettings);
       // The menu sits over the game canvas; keep drags from reaching it.
       slider.addEventListener('mousedown', (e) => e.stopPropagation());
       row.appendChild(label);
@@ -2135,6 +2360,9 @@
       // panes do. Falling back to append keeps this working if that button is
       // ever renamed or removed.
       const resume = document.getElementById('btn-game-resume');
+      // A rebuild throws away whatever row was mid-capture along with its
+      // listener, so clear the flag it owns or the bind would stay swallowed.
+      bindCapture = false;
       const pane = buildElgPane();
       if (resume && resume.parentElement === menu) menu.insertBefore(pane, resume);
       else menu.appendChild(pane);
@@ -2301,7 +2529,10 @@
       if (binds && typeof binds.isBindDown === 'function') {
         autoSwapEnsureHook(binds);
         const isDown = !!binds.isBindDown(AUTO_SWAP_INPUT_FIRE);
-        if (isDown && !autoSwapFireWasDown) autoSwapOnFirePressed(game);
+        // Gate the action, not the edge tracking: keeping `wasDown` current
+        // while disabled means re-enabling mid-hold doesn't fire a swap off a
+        // trigger pull that started before the toggle flipped.
+        if (isDown && !autoSwapFireWasDown && AUTO_SWAP.enabled) autoSwapOnFirePressed(game);
         autoSwapFireWasDown = isDown;
       } else {
         autoSwapFireWasDown = false;
@@ -2872,7 +3103,7 @@
   // ---------------------------------------------------------------------
   // Target overlay: a fixed-position canvas above the game canvas that
   // draws a circle around whichever enemy the cheat is currently aiming
-  // at (or *would* aim at if Shift were pressed). Used as a debugging /
+  // at (or *would* aim at if the aimbot key were held). Used as a debugging /
   // confidence aid for the red-team work — lets us visually confirm that
   // pickTarget is selecting the enemy we expect under various mouse
   // positions, stickiness windows, and humanization knobs.
@@ -3021,9 +3252,9 @@
     }
   });
 
-  // Find the enemy that the cheat is currently locked onto, OR — when Shift
-  // isn't held — the enemy that *would* be picked right now if Shift were
-  // pressed. This intentionally bypasses stickiness in the preview path so
+  // Find the enemy that the cheat is currently locked onto, OR — when the
+  // aimbot key isn't held — the enemy that *would* be picked right now if it
+  // were. This intentionally bypasses stickiness in the preview path so
   // the circle tracks the user's mouse in real time before they engage.
   function getCurrentAimTarget(sample) {
     if (!sample) return null;
@@ -3031,7 +3262,7 @@
     const enemies = sample.enemies;
     if (!player || !enemies || !enemies.length) return null;
 
-    if (shiftHeld && aimState.targetId != null) {
+    if (aimHeld && aimState.targetId != null) {
       const committed = enemies.find((e) => e.id === aimState.targetId);
       if (committed && !committed.dead && canInteract(player.layer, committed.layer)) return committed;
     }
@@ -3072,6 +3303,15 @@
     }
     const ctx = overlayCtx;
     ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+
+    // ESP off: keep the loop (and the canvas) alive but draw nothing, so
+    // flipping the toggle back on resumes on the very next frame. Sampling,
+    // aim and netcode are untouched — this is a display switch only.
+    overlayCanvas.style.display = ESP.enabled ? 'block' : 'none';
+    if (!ESP.enabled) {
+      requestAnimationFrame(overlayFrame);
+      return;
+    }
 
     const sample = pageSamples[pageSamples.length - 1];
     if (sample && sample.self && sample.enemies && sample.enemies.length) {
@@ -3175,7 +3415,7 @@
       // post-humanization aim that dispatchAim derives theta from and sends to
       // the game each frame — distinct from the white lead-X above, which is an
       // idealized instantaneous lead point recomputed in the overlay. aimState
-      // is non-null only while Shift is held and a target is engaged, so this
+      // is non-null only while the aimbot key is held and a target is engaged, so this
       // reticle appears exactly when the bot is actively aiming.
       if (aimState.aimX != null && aimState.aimY != null) {
         const axs = cx + (aimState.aimX - pi.x) * scale;

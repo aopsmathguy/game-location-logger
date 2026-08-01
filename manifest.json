@@ -1,12 +1,11 @@
 {
   "manifest_version": 3,
-  "name": "2D Shooter Position Logger",
-  "version": "0.2.0",
-  "description": "Injects into the game page, extracts your position and enemy positions, and logs samples.",
+  "minimum_chrome_version": "111",
+  "name": "survev.io game-state toolkit",
+  "version": "0.3.0",
+  "description": "Reads survev.io's live in-memory game state: enemy ESP overlay, aim helper, auto-quickswap, netcode smoothing, ping readout, and a JSON position log.",
   "permissions": [
-    "storage",
-    "downloads",
-    "activeTab"
+    "downloads"
   ],
   "host_permissions": [
     "*://survev.io/*",
