@@ -212,31 +212,44 @@ def derive_player_dir(text: str, player_start: int) -> str:
     return must_match("player.dir", text, pat, group="field", start=player_start)
 
 
-def derive_player_pos_alt(text: str, pos_field: str, player_start: int) -> str:
-    """Interpolated/rendered position used as a fallback for reads.
+def derive_player_visual_vec(text: str, src_field: str, label: str, player_start: int) -> str:
+    """Interpolated/rendered copy of a Player vector field (pos or dir), i.e.
+    what the renderer actually draws from.
 
     Anchor 1 (preferred): the lerp in the render-update path:
-        this.<posAlt> = <V>.lerp(<t>, this.<prev>, this.<pos>)
-    Anchor 2 (fallback): the snap-on-respawn branch:
-        this.<posAlt> = <V>.copy(this.<pos>)
+        this.<visual> = <V>.lerp(<t>, this.<prev>, this.<src>)
+    Anchor 2 (fallback): the interpolation-disabled branch:
+        this.<visual> = <V>.copy(this.<src>)
     Other classes (smokeBarn particles, playerStatus updaters) have
     `this.posTarget = w.copy(this.pos)` shapes with REAL readable names — we
     skip past them by searching from the Player class start.
     """
-    pos_re = re.escape(pos_field)
+    src_re = re.escape(src_field)
     scoped = text[player_start:]
-    lerp_pat = rf"this\.({IDENT})\s*=\s*\w+\.lerp\(\w+\s*,\s*this\.{IDENT}\s*,\s*this\.{pos_re}\)"
+    lerp_pat = rf"this\.({IDENT})\s*=\s*\w+\.lerp\(\w+\s*,\s*this\.{IDENT}\s*,\s*this\.{src_re}\)"
     m = re.search(lerp_pat, scoped)
     if m:
         return m.group(1)
-    copy_pat = rf"this\.({IDENT})\s*=\s*\w+\.copy\(this\.{pos_re}\)"
+    copy_pat = rf"this\.({IDENT})\s*=\s*\w+\.copy\(this\.{src_re}\)"
     m = re.search(copy_pat, scoped)
     if m:
         return m.group(1)
     raise DeriveError(
-        f"player.posAlt: neither lerp nor copy anchor matched.\n"
+        f"{label}: neither lerp nor copy anchor matched.\n"
         f"  lerp: {lerp_pat}\n  copy: {copy_pat}"
     )
+
+
+def derive_player_pos_alt(text: str, pos_field: str, player_start: int) -> str:
+    """Interpolated/rendered position used as a fallback for reads."""
+    return derive_player_visual_vec(text, pos_field, "player.posAlt", player_start)
+
+
+def derive_player_dir_alt(text: str, dir_field: str, player_start: int) -> str:
+    """Interpolated/rendered aim direction — the vector the body sprite's
+    rotation is taken from (`rotation = -atan2(<dirAlt>.y, <dirAlt>.x)`).
+    Same two anchors as posAlt, one field over."""
+    return derive_player_visual_vec(text, dir_field, "player.dirAlt", player_start)
 
 
 def derive_game_camera(text: str, game_start: int) -> str:
@@ -467,6 +480,7 @@ window.__SURVEV_MANGLED__ = {{
     pos:          {q("player.pos")},
     dir:          {q("player.dir")},
     posAlt:       {q("player.posAlt")},
+    dirAlt:       {q("player.dirAlt")},
   }},
 
   // ---- Player.netData (the sub-object named by player.netData above) ----
@@ -604,6 +618,7 @@ def main() -> None:
         ("player.pos",            lambda: derive_player_pos(text, p_start)),
         ("player.dir",            lambda: derive_player_dir(text, p_start)),
         ("player.posAlt",         lambda: derive_player_pos_alt(text, values["player.pos"], p_start)),
+        ("player.dirAlt",         lambda: derive_player_dir_alt(text, values["player.dir"], p_start)),
         ("netData.activeWeapon",  lambda: derive_field_on(text, values["player.netData"], "activeWeapon", "netData.activeWeapon", start=p_start)),
         ("netData.dead",          lambda: derive_field_on(text, values["player.netData"], "dead",         "netData.dead",         start=p_start)),
         ("netData.downed",        lambda: derive_field_on(text, values["player.netData"], "downed",       "netData.downed",       start=p_start)),

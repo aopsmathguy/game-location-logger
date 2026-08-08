@@ -20,6 +20,7 @@
   const PLAYER_POS   = M.player.pos;
   const PLAYER_DIR   = M.player.dir;
   const PLAYER_POS2  = M.player.posAlt;
+  const PLAYER_DIR2  = M.player?.dirAlt;
   const NET_WEAPON   = M.netData.activeWeapon;
   const NET_DEAD     = M.netData.dead;
   const NET_DOWNED   = M.netData.downed;
@@ -218,10 +219,17 @@
   // (different round / respawn — see swapCapturedGame).
   let cachedZoomKey = null;
   // Cached mangled own-prop name on the game (Rr) that holds the Camera
-  // instance, and the mangled name on the camera for m_zoom. Also reset on
-  // game swap. See findCameraOnGame / readCameraZoom below.
+  // instance, plus the camera's own identified members: the zero-arg
+  // `pixelsPerUnit()` method, the m_ppu field and the live m_zoom field.
+  // All reset on game swap. See findCameraOnGame / identifyCameraScale.
   let cachedCameraKey = null;
+  let cachedCameraScaleFn = null;
+  let cachedCameraPpuKey = null;
   let cachedCameraZoomKey = null;
+  // Date.now() of the last failed identifyCameraScale, so we retry on a
+  // slow cadence instead of probing the camera every single frame.
+  let cameraScaleProbedAt = 0;
+  const CAMERA_PROBE_RETRY_MS = 500;
 
   // Read the current scope radius (world units) from the active player's
   // localData. The bundle stores it via `this[localData][<mangled>] = e.zoom`.
@@ -301,67 +309,188 @@
     return null;
   }
 
-  // Return the camera's m_zoom — the CURRENT (interpolated) zoom factor,
-  // not m_targetZoom. The game lerps `m_zoom` toward `m_targetZoom` over
-  // several frames each time the scope changes (zoomFast ? 3 : 1.4-2), so
-  // sizing overlays by the target zoom makes them "jump" at scope change
-  // while the visible viewport is still mid-lerp. We disambiguate the two
-  // co-resident zoom scalars by computing the value m_targetZoom *should*
-  // have from the known formula
-  //     m_targetZoom = (maxScreenDim * 0.5) / (scopeRadius * ppu)
-  // — whichever small scalar matches that is targetZoom, the other is
-  // m_zoom. In steady state the two are equal and either returns the right
-  // value; during a transition, only m_zoom drifts away from expected.
-  function readCameraZoom(camera, expectedTargetZoom) {
-    if (!camera || typeof camera !== 'object') return null;
-    try {
-      const names = Object.getOwnPropertyNames(camera);
-      const candidates = [];
-      for (let i = 0; i < names.length; i++) {
-        const n = names[i];
-        const v = camera[n];
-        if (typeof v === 'number' && v > 0.05 && v < 20 && v !== 16) {
-          candidates.push([n, v]);
-        }
-      }
-      if (!candidates.length) return null;
-      if (candidates.length === 1) return candidates[0][1];
-      // targetZoom = closest to expected; m_zoom = the next-closest (of the
-      // remaining fields). When the two are equal — steady state — this
-      // correctly returns that shared value.
-      candidates.sort((a, b) =>
-        Math.abs(a[1] - expectedTargetZoom) - Math.abs(b[1] - expectedTargetZoom)
-      );
-      return candidates[1][1];
-    } catch {
-      return null;
+  // survev's camera pixels-per-unit is `m_ppu * m_zoom`, and m_ppu is a
+  // hardcoded 16 (client/src/camera.ts). Used both as an identification
+  // fingerprint and as the fallback multiplier.
+  const CAMERA_PPU = 16;
+
+  // Every scope change retargets the camera but does NOT snap it: the game
+  // does `m_zoom = lerp(dt * rate, m_zoom, m_targetZoom)` once per frame
+  // (client/src/game.ts, rate = zoomFast ? 3 : m_targetZoom > m_zoom ? 2 :
+  // 1.4), so the rendered scale slides toward the new scope across ~0.3-1s.
+  // Anything drawn off m_targetZoom is therefore wrong for the whole
+  // transition and only converges at the end.
+  //
+  // The two zoom scalars sit side by side on the camera under mangled names
+  // and are numerically identical in steady state, so they can't be told
+  // apart by inspection alone. Instead we identify them by EXPERIMENT, on a
+  // throwaway clone of the camera: the camera exposes a zero-arg
+  // `pixelsPerUnit()` returning m_ppu * m_zoom, so we call each zero-arg
+  // method on the clone, then double each candidate scalar and see whose
+  // change the method's result follows. The scalar the render transform
+  // actually reads is m_zoom, by definition — no name pinning, no guessing
+  // from the expected target, and correct mid-lerp.
+  //
+  // Probing the clone (same prototype, own fields copied) rather than the
+  // live camera means any method with side effects — the screen-shake apply
+  // is also zero-arg — mutates the copy and nothing the game can see.
+  function makeCameraProbe(camera) {
+    const probe = Object.create(Object.getPrototypeOf(camera));
+    const names = Object.getOwnPropertyNames(camera);
+    for (let i = 0; i < names.length; i++) {
+      const v = camera[names[i]];
+      probe[names[i]] = (v && typeof v === 'object' &&
+                         typeof v.x === 'number' && typeof v.y === 'number')
+        ? { x: v.x, y: v.y }
+        : v;
     }
+    return probe;
   }
 
-  // Compute the visible-world width in world units. Matches survev's camera
-  // math from client/src/game.ts:447ff — for screens at 16:9 or wider this
-  // collapses to 2*radius, and for narrower aspects (e.g. 4:3) it shrinks
-  // proportionally. Downstream callers use this to convert mouse pixel
-  // offsets into world coordinates, so getting the aspect right matters.
-  //
-  // We prefer the camera's live m_zoom over the target scope radius so the
-  // overlay tracks the smoothly-lerped viewport the user actually sees,
-  // instead of snapping to the new target the instant the scope changes.
-  function getViewportWorldUnits(scope, me, game) {
+  // Zero-arg function-valued members of the camera, instance first then up
+  // the prototype chain (class methods live on the prototype). Read through
+  // descriptors so we never trip an accessor just by looking.
+  function cameraZeroArgMethodNames(camera) {
+    const out = [];
+    const seen = new Set();
+    for (let o = camera; o && o !== Object.prototype; o = Object.getPrototypeOf(o)) {
+      const names = Object.getOwnPropertyNames(o);
+      for (let i = 0; i < names.length; i++) {
+        const n = names[i];
+        if (n === 'constructor' || seen.has(n)) continue;
+        seen.add(n);
+        const d = Object.getOwnPropertyDescriptor(o, n);
+        if (d && typeof d.value === 'function' && d.value.length === 0) out.push(n);
+      }
+    }
+    return out;
+  }
+
+  // Numeric own fields that could plausibly be a zoom factor. m_ppu (16) is
+  // excluded by value: it also scales pixelsPerUnit, so the doubling test
+  // alone can't separate it from m_zoom.
+  function cameraZoomCandidateKeys(camera) {
+    const out = [];
+    const names = Object.getOwnPropertyNames(camera);
+    for (let i = 0; i < names.length; i++) {
+      const v = camera[names[i]];
+      if (typeof v === 'number' && isFinite(v) &&
+          v > 0.05 && v < 20 && v !== CAMERA_PPU) out.push(names[i]);
+    }
+    return out;
+  }
+
+  // Fill cachedCameraScaleFn / PpuKey / ZoomKey. Returns true on success.
+  function identifyCameraScale(camera) {
+    try {
+      const probe = makeCameraProbe(camera);
+      const zoomKeys = cameraZoomCandidateKeys(probe);
+      if (!zoomKeys.length) return false;
+      let ppuKey = null;
+      const names = Object.getOwnPropertyNames(probe);
+      for (let i = 0; i < names.length; i++) {
+        if (probe[names[i]] === CAMERA_PPU) { ppuKey = names[i]; break; }
+      }
+      const methods = cameraZeroArgMethodNames(probe);
+      for (let i = 0; i < methods.length; i++) {
+        const fn = probe[methods[i]];
+        let base;
+        try { base = fn.call(probe); } catch { continue; }
+        if (typeof base !== 'number' || !isFinite(base) || base <= 0) continue;
+        // Exactly one candidate must drive the result, and proportionally —
+        // that rules out a method that merely happens to return a number.
+        let hit = null;
+        for (let j = 0; j < zoomKeys.length; j++) {
+          const k = zoomKeys[j];
+          const orig = probe[k];
+          let doubled;
+          try {
+            probe[k] = orig * 2;
+            doubled = fn.call(probe);
+          } catch {
+            doubled = null;
+          } finally {
+            probe[k] = orig;
+          }
+          if (typeof doubled !== 'number' || !isFinite(doubled)) continue;
+          if (Math.abs(doubled - base * 2) <= Math.abs(base) * 1e-9) {
+            if (hit) { hit = null; break; }  // ambiguous, don't trust it
+            hit = k;
+          }
+        }
+        if (!hit) continue;
+        cachedCameraScaleFn = methods[i];
+        cachedCameraZoomKey = hit;
+        cachedCameraPpuKey = ppuKey;
+        return true;
+      }
+    } catch {}
+    return false;
+  }
+
+  // Pixels per world unit as the game is rendering it RIGHT NOW. Prefers the
+  // camera's own pixelsPerUnit(), falls back to m_ppu * m_zoom by the
+  // identified field names, and returns null if the camera is unusable —
+  // callers then fall back to scope-radius math.
+  function readCameraPxPerUnit(camera) {
+    if (!camera || typeof camera !== 'object') return null;
+    if (!cachedCameraScaleFn && !cachedCameraZoomKey) {
+      const now = Date.now();
+      // In steady state the doubling test is still decisive, so a failure
+      // here means the camera's shape changed; retry on a slow cadence.
+      if (now - cameraScaleProbedAt >= CAMERA_PROBE_RETRY_MS) {
+        cameraScaleProbedAt = now;
+        identifyCameraScale(camera);
+      }
+    }
+    if (cachedCameraScaleFn) {
+      try {
+        const fn = camera[cachedCameraScaleFn];
+        if (typeof fn === 'function') {
+          const px = fn.call(camera);
+          if (typeof px === 'number' && isFinite(px) && px > 0) return px;
+        }
+      } catch {}
+      cachedCameraScaleFn = null;
+    }
+    if (cachedCameraZoomKey) {
+      const zoom = camera[cachedCameraZoomKey];
+      const ppu = cachedCameraPpuKey ? camera[cachedCameraPpuKey] : CAMERA_PPU;
+      if (typeof zoom === 'number' && isFinite(zoom) && zoom > 0 &&
+          typeof ppu === 'number' && isFinite(ppu) && ppu > 0) return ppu * zoom;
+      cachedCameraZoomKey = null;
+      cachedCameraPpuKey = null;
+    }
+    return null;
+  }
+
+  // Pixels per world unit, by whatever source is available. The camera is
+  // authoritative — it is literally the scale the renderer draws with, so
+  // overlays stay glued to the game through a scope-zoom lerp. Without a
+  // camera we fall back to the scope radius, which matches survev's own
+  // camera math (client/src/game.ts): for screens at 16:9 or wider the
+  // viewport collapses to 2*radius world units, and for narrower aspects
+  // (e.g. 4:3) it shrinks proportionally. That fallback is only correct in
+  // steady state — it is the target zoom, not the lerped one.
+  function getPxPerWorldUnit(scope, me, game) {
+    const camera = game ? findCameraOnGame(game) : null;
+    if (camera) {
+      const px = readCameraPxPerUnit(camera);
+      if (px) return px;
+    }
     const fromPlayer = me ? readZoomRadiusFromPlayer(me, scope) : null;
-    const fromTable = SCOPE_RADIUS_TABLE[scope] ?? SCOPE_RADIUS_TABLE['1xscope'];
-    const radius = fromPlayer ?? fromTable;
+    const radius = fromPlayer ?? SCOPE_RADIUS_TABLE[scope] ?? SCOPE_RADIUS_TABLE['1xscope'];
     const W = window.innerWidth;
     const H = window.innerHeight;
     const maxScreenDim = Math.max(Math.min(W, H) * (16 / 9), Math.max(W, H));
-    const camera = game ? findCameraOnGame(game) : null;
-    if (camera) {
-      const expectedTargetZoom = (maxScreenDim * 0.5) / (radius * 16);
-      const mZoom = readCameraZoom(camera, expectedTargetZoom);
-      // pixels-per-world-unit = ppu * m_zoom; viewport width = W / that.
-      if (mZoom && mZoom > 0) return W / (16 * mZoom);
-    }
-    return (W * 2 * radius) / maxScreenDim;
+    return maxScreenDim / (2 * radius);
+  }
+
+  // Visible-world width in world units. Downstream callers use this to
+  // convert mouse pixel offsets into world coordinates, so getting the
+  // aspect right matters.
+  function getViewportWorldUnits(scope, me, game) {
+    return window.innerWidth / getPxPerWorldUnit(scope, me, game);
   }
 
   // Standalone zoom logger — fires from sampleLoop unconditionally so we see
@@ -594,7 +723,10 @@
     lastDeepSearchAt = 0;
     cachedZoomKey = null;
     cachedCameraKey = null;
+    cachedCameraScaleFn = null;
+    cachedCameraPpuKey = null;
     cachedCameraZoomKey = null;
+    cameraScaleProbedAt = 0;
   }
 
   function tryCaptureFromCandidate(obj) {
@@ -1050,6 +1182,21 @@
     return null;
   }
 
+  // Same-side test, from two `roster.getPlayerInfo()` records. Asked in one
+  // place so the sampler and the name tags can't disagree about who is an
+  // enemy: squadmates share a `groupId`, faction teammates share a non-zero
+  // `teamId` (0 means "no faction", so it never makes two players allies).
+  // With no info for either side the answer is "enemy" — that is the shape
+  // the sampler has always had, and an unknown player is one we want to see.
+  function isHostileTo(selfInfo, info) {
+    const sameGroup =
+      selfInfo && info && selfInfo.groupId != null && info.groupId != null && selfInfo.groupId === info.groupId;
+    const sameTeam =
+      selfInfo && info && selfInfo.teamId != null && info.teamId != null &&
+      selfInfo.teamId !== 0 && info.teamId !== 0 && selfInfo.teamId === info.teamId;
+    return !(sameGroup || sameTeam);
+  }
+
   // Build a sample, or return { reason } if the game isn't ready yet.
   // Reasons:
   //   'no-roster'  -> couldn't find the roster on the game (shouldn't happen
@@ -1114,13 +1261,7 @@
       if (selfId != null && id === selfId) continue;
 
       const info = getInfo(id) ?? {};
-      const sameGroup =
-        selfInfo && info && selfInfo.groupId != null && info.groupId != null && selfInfo.groupId === info.groupId;
-      const sameTeam =
-        selfInfo && info && selfInfo.teamId != null && info.teamId != null &&
-        selfInfo.teamId !== 0 && info.teamId !== 0 && selfInfo.teamId === info.teamId;
-
-      if (sameGroup || sameTeam) continue;
+      if (!isHostileTo(selfInfo, info)) continue;
 
       const pos = getXY(player[PLAYER_POS] ?? player[PLAYER_POS2]);
       if (!pos) continue;
@@ -1241,7 +1382,7 @@
     logZoomTick();
     // Cheap no-op once attached; survev's menu markup is static, so this only
     // does work on the first tick and after any rebuild.
-    try { ensureElgTab(); } catch {}
+    try { ensureElgTab(); refitElgPaneIfVisible(); } catch {}
     const found = findRoot();
     const now = Date.now();
 
@@ -1290,6 +1431,7 @@
     // buildSample so a match that is still missing a roster/local player (the
     // lobby, the first moments of a round) still gets its camera hooked.
     netcodeTick(found.game);
+    nameTagTick(found.game);
     try { updatePingUI(found.game, now); } catch {}
 
     const sample = buildSample(found);
@@ -1371,8 +1513,40 @@
     bind: 16, // Shift. keyCode doesn't distinguish left from right, so both work.
   };
 
+  // What the overlay fades an enemy to when it can't be shot because it is on
+  // a layer we can't reach — a bunker while we're aboveground.
+  const UNREACHABLE_ALPHA = 0.5;
+
   // Enemy overlay master switch. Same hoisting reason, same default, as AIMBOT.
   const ESP = {
+    enabled: 0,
+    // Dim an enemy whose shot line is blocked by map geometry — see the
+    // line-of-sight block in the overlay. On by default, but it only shows
+    // once the overlay itself is on.
+    losDim: 1,
+    // Alpha the ring and its connecting line drop to when blocked. Defaults to
+    // the wrong-layer fade: both mean "no shot on this one", so they read as
+    // the same state rather than as a hierarchy of two different problems.
+    blockedAlpha: UNREACHABLE_ALPHA,
+  };
+
+  // Bank shots: when the direct line is walled off, look for a one-bounce path
+  // off a reflecting surface and aim at that instead. Same hoisting reason, and
+  // same off-by-default, as AIMBOT and ESP: with it off a blocked target is
+  // simply shot at through the wall, which is worse aim but is also stock
+  // behaviour, and the search is the most expensive thing in the aim path.
+  const BANK = {
+    enabled: 0,
+    // Take a bounce even when the direct line is open. Trick-shot mode: worse
+    // in every measurable way and much better to watch.
+    prefer: 0,
+  };
+
+  // Autoshoot: hold the trigger exactly while the shot is on. Rides on the aim
+  // helper and only acts while its key is held — see the autoshoot block for
+  // what "the shot is on" means. Same hoisting reason, same off-by-default, as
+  // AIMBOT and ESP.
+  const AUTOSHOOT = {
     enabled: 0,
   };
 
@@ -1462,6 +1636,756 @@
     return true;
   }
 
+  // ---------------------------------------------------------------------
+  // Bullet-blocking geometry
+  // ---------------------------------------------------------------------
+  //
+  // survev has no separate "wall" entity: every solid thing in the world —
+  // walls, trees, crates, rocks, barrels, bunker stairwells — is an Obstacle,
+  // and buildings/structures carry only ceilings, floors and stair volumes,
+  // none of which stop a bullet. So the obstacle pool *is* the bullet
+  // collision set (plus players, which we don't treat as cover).
+  //
+  // The Obstacle class keeps every collision field under a real readable name
+  // across re-mangles — `collider`, `collidable`, `dead`, `height`, `layer`,
+  // `isWindow`, `isWall`, `isDoor`, `type` — so none of this needs a new
+  // mangled.js entry; the only mangled thing on the path is the pool's getAll,
+  // which we already have as POOL_GETALL.
+  //
+  // `collider` is already in world space. The Obstacle rebuilds it on every
+  // update as `collider.transform(def.collision, pos, oriToRad(ori), scale)`,
+  // and since `ori` is a quarter-turn count, a rotated AABB stays axis
+  // aligned — so the only two shapes that ever come back are
+  //     { type: 0, pos: {x,y}, rad }          circle
+  //     { type: 1, min: {x,y}, max: {x,y} }   aabb
+  // A door's `pos`/`ori` are resent when it swings, so its collider tracks the
+  // open state for free.
+  //
+  // Scope: the server only streams objects inside the local player's view
+  // radius, so the pool holds what is on screen plus a margin — which is
+  // exactly the set a shot at a *visible* enemy can pass through. There is no
+  // client-side source for the collision geometry of off-screen map objects
+  // (the join-time map message carries type/pos/ori/scale but the per-type
+  // `collision` shapes live in bundle-private defs).
+
+  const COLLIDER_CIRCLE = 0;
+  const COLLIDER_AABB = 1;
+  // GameConfig.bullet.height — an obstacle shorter than this is shot over
+  // (`obstacle.height < bullet.height` is the game's own reject test).
+  const BULLET_HEIGHT = 0.25;
+
+  // GameConfig.player.radius. A player's centre is always at least this far
+  // from any collidable surface — that's what the collision resolution
+  // guarantees — so a blocker reported closer than this to our shot origin is
+  // one we are *inside*, which no real position can be. That only happens when
+  // the origin has been extrapolated into geometry (sprinting at a wall pushes
+  // it up to ~2.4 units forward over a 200ms reaction + ping), and without the
+  // guard it would read as "blocked" against every enemy on screen.
+  const PLAYER_RADIUS = 1;
+
+  // Obstacle types that bounce a bullet instead of just eating it —
+  // `reflectBullets` on the obstacle def. Metal walls, barrels, lockers,
+  // vault doors, shipping-container walls, appliances.
+  //
+  // This has to be a static table because the client Obstacle *doesn't keep
+  // the flag*: `thAfw` copies `collidable`, `destructible`, `height`,
+  // `isWall`, `isWindow`, `isBush` and the door/button blocks off the def and
+  // drops the rest, and the def module itself is bundle-private. What the
+  // instance does keep is `type`, and type names are content, not identifiers,
+  // so they survive re-mangling — unlike everything in mangled.js, this list
+  // only goes stale when survev ships new map objects.
+  //
+  // Derived offline from the definitions chunk in js_dump/ (MapObjectDefs) by
+  // evaluating the def factories and reading `reflectBullets` off each merged
+  // obstacle def: 724 obstacle defs, all carrying the flag explicitly, 166
+  // true. Every one of them is also collidable, non-window and at least
+  // bullet-height, i.e. every reflector is a blocker.
+  //
+  // Reflection is a server decision — the client is only told after the fact,
+  // via `reflectCount`/`reflectObjId` on the bullet — and it is capped at
+  // GameConfig.bullet.maxReflect (3) with damage decaying by reflectDistDecay
+  // (1.5). A player carrying a pan is a reflector too (equipped or stowed, it
+  // presents a reflecting segment), but that's a player, not map geometry.
+  const REFLECTS_BULLETS = new Set([
+    'airdrop_crate_01', 'airdrop_crate_01sv', 'airdrop_crate_01x',
+    'airdrop_crate_02', 'airdrop_crate_02de', 'airdrop_crate_02h',
+    'airdrop_crate_02sv', 'airdrop_crate_02tr', 'airdrop_crate_02x',
+    'airdrop_crate_03', 'airdrop_crate_03dev', 'airdrop_crate_03po',
+    'airdrop_crate_04', 'airdrop_crate_04po', 'airdrop_crate_05', 'barrel_01',
+    'barrel_01b', 'barrel_01bd', 'barrel_01bh', 'barrel_01f', 'barrel_01w',
+    'bathhouse_rocks_01', 'bollard_01', 'cell_door_01', 'class_shell_01',
+    'class_shell_02', 'class_shell_03', 'cobalt_wall_int_4',
+    'container_05_collider', 'container_wall_side',
+    'container_wall_side_open', 'container_wall_top', 'control_panel_01',
+    'control_panel_02', 'control_panel_02b', 'control_panel_03',
+    'control_panel_04', 'control_panel_06', 'control_panel_07',
+    'crossing_door_01', 'deposit_box_01', 'deposit_box_02', 'deposit_box_03',
+    'eye_door_01', 'fire_ext_01', 'grill_01', 'hedgehog_wall',
+    'house_door_02', 'locker_01', 'locker_02', 'locker_03',
+    'metal_wall_column_4x8', 'metal_wall_column_5x12', 'metal_wall_ext_10',
+    'metal_wall_ext_12', 'metal_wall_ext_12_5', 'metal_wall_ext_13',
+    'metal_wall_ext_16', 'metal_wall_ext_18', 'metal_wall_ext_2',
+    'metal_wall_ext_23', 'metal_wall_ext_2x2', 'metal_wall_ext_3',
+    'metal_wall_ext_4', 'metal_wall_ext_43', 'metal_wall_ext_5',
+    'metal_wall_ext_6', 'metal_wall_ext_7', 'metal_wall_ext_8',
+    'metal_wall_ext_9', 'metal_wall_ext_short_6', 'metal_wall_ext_short_7',
+    'metal_wall_ext_thick_12', 'metal_wall_ext_thick_16',
+    'metal_wall_ext_thick_20', 'metal_wall_ext_thick_23',
+    'metal_wall_ext_thick_28', 'metal_wall_ext_thick_5',
+    'metal_wall_ext_thick_6', 'metal_wall_ext_thick_8',
+    'metal_wall_ext_thicker_10', 'metal_wall_ext_thicker_11',
+    'metal_wall_ext_thicker_12', 'metal_wall_ext_thicker_13',
+    'metal_wall_ext_thicker_14', 'metal_wall_ext_thicker_15',
+    'metal_wall_ext_thicker_16', 'metal_wall_ext_thicker_17',
+    'metal_wall_ext_thicker_18', 'metal_wall_ext_thicker_19',
+    'metal_wall_ext_thicker_1_5', 'metal_wall_ext_thicker_20',
+    'metal_wall_ext_thicker_21', 'metal_wall_ext_thicker_22',
+    'metal_wall_ext_thicker_23', 'metal_wall_ext_thicker_24',
+    'metal_wall_ext_thicker_25', 'metal_wall_ext_thicker_26',
+    'metal_wall_ext_thicker_27', 'metal_wall_ext_thicker_28',
+    'metal_wall_ext_thicker_29', 'metal_wall_ext_thicker_30',
+    'metal_wall_ext_thicker_32', 'metal_wall_ext_thicker_34',
+    'metal_wall_ext_thicker_35', 'metal_wall_ext_thicker_4',
+    'metal_wall_ext_thicker_42', 'metal_wall_ext_thicker_48',
+    'metal_wall_ext_thicker_49', 'metal_wall_ext_thicker_5',
+    'metal_wall_ext_thicker_6', 'metal_wall_ext_thicker_7',
+    'metal_wall_ext_thicker_8', 'metal_wall_ext_thicker_9', 'oven_01',
+    'power_box_01', 'propane_01', 'recorder_01', 'recorder_02', 'recorder_03',
+    'recorder_04', 'recorder_05', 'recorder_06', 'recorder_07', 'recorder_08',
+    'recorder_09', 'recorder_10', 'recorder_11', 'recorder_12', 'recorder_13',
+    'recorder_14', 'refrigerator_01', 'refrigerator_01b', 'silo_01',
+    'silo_01po', 'stove_01', 'stove_02', 'switch_01', 'switch_01o',
+    'switch_01p', 'switch_01y', 'switch_02', 'switch_03', 'toilet_03',
+    'toilet_04', 'toilet_05', 'vault_door_bathhouse', 'vault_door_chrys_01',
+    'vault_door_chrys_02', 'vault_door_eye', 'vault_door_main',
+    'vault_door_reserve', 'vending_01', 'warehouse_column',
+    'warehouse_wall_edge', 'warehouse_wall_edge_2', 'warehouse_wall_int',
+    'warehouse_wall_side', 'wheel_01', 'wheel_02', 'wheel_03',
+    'workshop_wall_edge', 'workshop_wall_mid_1', 'workshop_wall_mid_2',
+    'workshop_wall_mid_3', 'workshop_wall_right',
+  ]);
+
+  // Does a bullet bounce off this obstacle? Note this says nothing about
+  // whether the bullet gets *through*: a reflector is still solid, so it
+  // blocks the original line either way. What it changes is what happens
+  // after — a shot into one comes back out at the mirror angle rather than
+  // dying there, so a reflector between us and a target is cover that shoots
+  // back, and the near face of one is a place to bank a shot from.
+  function reflectsBullets(o) {
+    return !!o && REFLECTS_BULLETS.has(o.type);
+  }
+
+  // survev's util.sameLayer, which is what the bullet path actually tests
+  // against — deliberately *not* canInteract above. They disagree for a
+  // shooter on a stairs layer: canInteract says a player on 2/3 can engage
+  // anything, but sameLayer(2, 1) is false, so ground-floor obstacles are the
+  // ones that block them.
+  function sameLayerAs(a, b) {
+    const x = Number.isFinite(a) ? a : 0;
+    const y = Number.isFinite(b) ? b : 0;
+    return (x & 1) === (y & 1) || Boolean(x & 2 && y & 2);
+  }
+
+  function looksLikeGameMap(v) {
+    try {
+      return !!v && typeof v === 'object' &&
+        'deadObstacleIds' in v && 'mapLoaded' in v && 'terrain' in v && 'mapDef' in v;
+    } catch {
+      return false;
+    }
+  }
+
+  // An Obstacle, by the readable fields its class declares. `collider` alone
+  // isn't enough — Loot and DeadBody carry one too — but the door/window/bush
+  // trio is unique to Obstacle.
+  function looksLikeObstacle(v) {
+    try {
+      return !!v && typeof v === 'object' &&
+        'collider' in v && 'collidable' in v && 'isWindow' in v && 'isBush' in v;
+    } catch {
+      return false;
+    }
+  }
+
+  let cachedMapKey = null;
+  let cachedObstaclePoolKey = null;
+
+  // `map` is a real readable field on the Game class (`this.map = new gn(...)`),
+  // so the fast path is a direct read; the own-prop scan is there for the build
+  // where that stops being true.
+  function findMapOnGame(game) {
+    if (!game || typeof game !== 'object') return null;
+    try {
+      if (looksLikeGameMap(game.map)) return game.map;
+      if (cachedMapKey) {
+        const m = game[cachedMapKey];
+        if (looksLikeGameMap(m)) return m;
+        cachedMapKey = null;
+      }
+      const names = Object.getOwnPropertyNames(game);
+      for (let i = 0; i < names.length; i++) {
+        const v = game[names[i]];
+        if (looksLikeGameMap(v)) {
+          cachedMapKey = names[i];
+          return v;
+        }
+      }
+    } catch {}
+    return null;
+  }
+
+  // The map holds three entity pools under mangled names — obstacles,
+  // buildings, structures — so we identify the obstacle one by what its
+  // entries are rather than by what it's called. That needs the pool to hold
+  // at least one live obstacle, which in a running match it always does; until
+  // then this returns null and the caller reports no geometry rather than
+  // wrong geometry.
+  function findObstaclePool(map) {
+    if (!map || typeof map !== 'object') return null;
+    const isObstaclePool = (v) => {
+      if (!v || typeof v !== 'object' || typeof v[POOL_GETALL] !== 'function') return false;
+      const all = v[POOL_GETALL]();
+      if (!Array.isArray(all) || !all.length) return false;
+      return looksLikeObstacle(all[0]);
+    };
+    try {
+      if (cachedObstaclePoolKey) {
+        const p = map[cachedObstaclePoolKey];
+        if (isObstaclePool(p)) return p;
+        cachedObstaclePoolKey = null;
+      }
+      const names = Object.getOwnPropertyNames(map);
+      for (let i = 0; i < names.length; i++) {
+        if (isObstaclePool(map[names[i]])) {
+          cachedObstaclePoolKey = names[i];
+          return map[names[i]];
+        }
+      }
+    } catch {}
+    return null;
+  }
+
+  // The pool's getAll returns its raw backing array, recycled-but-inactive
+  // entries included — hence the `active` filter the game itself applies at
+  // every call site.
+  function getObstacles() {
+    const map = findMapOnGame(capturedGame);
+    if (!map) return [];
+    const pool = findObstaclePool(map);
+    if (!pool) return [];
+    const all = pool[POOL_GETALL]();
+    return Array.isArray(all) ? all : [];
+  }
+
+  // The game's own reject test for "can a bullet fired on `layer` stop against
+  // this obstacle", lifted from the bullet/tracer collision path.
+  function blocksBullets(o, layer) {
+    return !!o && o.active && !o.dead && o.collidable && !o.isWindow &&
+      o.height >= BULLET_HEIGHT && !!o.collider && sameLayerAs(layer, o.layer);
+  }
+
+  // Ports of collider.intersectSegment's two branches, returning the distance
+  // from p0 to the entry point (the direction is normalized, so the parameter
+  // *is* the distance) or null. Kept faithful to the game's arithmetic,
+  // epsilons included, so a hit here is a hit there.
+  function segHitCircle(x0, y0, x1, y1, cx, cy, rad) {
+    let dx = x1 - x0;
+    let dy = y1 - y0;
+    const len = Math.max(Math.hypot(dx, dy), 1e-6);
+    dx /= len; dy /= len;
+    const ox = x0 - cx;
+    const oy = y0 - cy;
+    const s = ox * dx + oy * dy;
+    const c = ox * ox + oy * oy - rad * rad;
+    if (c > 0 && s > 0) return null;
+    const disc = s * s - c;
+    if (disc < 0) return null;
+    const sq = Math.sqrt(disc);
+    let t = -s - sq;
+    if (t < 0) t = -s + sq;
+    return t <= len ? t : null;
+  }
+
+  function segHitAabb(x0, y0, x1, y1, minX, minY, maxX, maxY) {
+    const EPS = 1e-5;
+    let tMin = 0;
+    let tMax = Number.MAX_VALUE;
+    let dx = x1 - x0;
+    let dy = y1 - y0;
+    const len = Math.hypot(dx, dy);
+    if (len > EPS) { dx /= len; dy /= len; } else { dx = 1; dy = 0; }
+    let ax = Math.abs(dx);
+    let ay = Math.abs(dy);
+    // A segment exactly parallel to an axis would divide by zero on that axis;
+    // the game nudges the component instead of special-casing the slab.
+    if (ax < EPS) { dx = EPS * 2; ax = dx; }
+    if (ay < EPS) { dy = EPS * 2; ay = dy; }
+    const t1x = (minX - x0) / dx;
+    const t2x = (maxX - x0) / dx;
+    tMin = Math.max(tMin, Math.min(t1x, t2x));
+    tMax = Math.min(tMax, Math.max(t1x, t2x));
+    if (tMin > tMax) return null;
+    const t1y = (minY - y0) / dy;
+    const t2y = (maxY - y0) / dy;
+    tMin = Math.max(tMin, Math.min(t1y, t2y));
+    tMax = Math.min(tMax, Math.max(t1y, t2y));
+    if (tMin > tMax) return null;
+    if (tMin > len) return null;
+    return tMin;
+  }
+
+  function segHitCollider(x0, y0, x1, y1, col) {
+    if (!col) return null;
+    if (col.type === COLLIDER_AABB) {
+      const { min, max } = col;
+      if (!min || !max) return null;
+      return segHitAabb(x0, y0, x1, y1, min.x, min.y, max.x, max.y);
+    }
+    if (col.type === COLLIDER_CIRCLE) {
+      const p = col.pos;
+      if (!p) return null;
+      return segHitCircle(x0, y0, x1, y1, p.x, p.y, col.rad);
+    }
+    return null;
+  }
+
+  // Nearest bullet-blocking obstacle along the segment, or null for a clear
+  // line. Reads the pool directly and allocates nothing per obstacle, so it's
+  // safe to call per target per frame.
+  //
+  // `minDist` drops hits closer than that to the origin: a shot origin sitting
+  // inside a collider (hugging a wall, or the barrel offset pushing the muzzle
+  // into one) otherwise reports distance 0 and reads as blocked forever.
+  // Broad phase: does the collider's bounding box overlap the segment's? Four
+  // comparisons that reject the great majority of a streamed-in pool before
+  // the exact test runs, which is what makes a per-enemy-per-frame call cheap.
+  function colliderNearSegment(col, loX, loY, hiX, hiY) {
+    if (col.type === COLLIDER_AABB) {
+      return col.max.x >= loX && col.min.x <= hiX && col.max.y >= loY && col.min.y <= hiY;
+    }
+    const r = col.rad;
+    return col.pos.x + r >= loX && col.pos.x - r <= hiX &&
+           col.pos.y + r >= loY && col.pos.y - r <= hiY;
+  }
+
+  function firstBulletHit(x0, y0, x1, y1, layer, minDist = 0) {
+    const obstacles = getObstacles();
+    const loX = Math.min(x0, x1), hiX = Math.max(x0, x1);
+    const loY = Math.min(y0, y1), hiY = Math.max(y0, y1);
+    let best = null;
+    let bestDist = Infinity;
+    for (let i = 0; i < obstacles.length; i++) {
+      const o = obstacles[i];
+      if (!blocksBullets(o, layer)) continue;
+      if (!colliderNearSegment(o.collider, loX, loY, hiX, hiY)) continue;
+      const d = segHitCollider(x0, y0, x1, y1, o.collider);
+      if (d === null || d < minDist || d >= bestDist) continue;
+      bestDist = d;
+      best = o;
+    }
+    if (!best) return null;
+    const len = Math.hypot(x1 - x0, y1 - y0) || 1;
+    return {
+      id: Number(best.__id ?? 0),
+      type: best.type,
+      reflects: reflectsBullets(best),
+      dist: bestDist,
+      x: x0 + ((x1 - x0) / len) * bestDist,
+      y: y0 + ((y1 - y0) / len) * bestDist,
+    };
+  }
+
+  // Same sweep, but it only has to answer yes/no, so it stops at the first
+  // blocker instead of sorting for the nearest.
+  //
+  // `exclude` drops one obstacle from consideration. That's for the legs of a
+  // bank shot, which start or end *on* a reflector's surface and would
+  // otherwise always report it as blocking them.
+  function hasLineOfSight(x0, y0, x1, y1, layer, minDist = 0, exclude = null) {
+    const obstacles = getObstacles();
+    const loX = Math.min(x0, x1), hiX = Math.max(x0, x1);
+    const loY = Math.min(y0, y1), hiY = Math.max(y0, y1);
+    for (let i = 0; i < obstacles.length; i++) {
+      const o = obstacles[i];
+      if (o === exclude) continue;
+      if (!blocksBullets(o, layer)) continue;
+      if (!colliderNearSegment(o.collider, loX, loY, hiX, hiY)) continue;
+      const d = segHitCollider(x0, y0, x1, y1, o.collider);
+      if (d !== null && d >= minDist) return false;
+    }
+    return true;
+  }
+
+  // ---------------------------------------------------------------------
+  // One-bounce (bank) shots
+  // ---------------------------------------------------------------------
+  //
+  // When the direct line is walled off, a reflector can still carry the shot:
+  // survev bounces bullets off `reflectBullets` surfaces (see the table
+  // above), so a metal wall you can see is a shot at someone you can't.
+  //
+  // The mirror trick makes the geometry a straight line. Reflecting the
+  // *target* across the plane of a face turns the two-leg path into one
+  // segment: where P->E' crosses the plane is exactly the point a bullet
+  // aimed at E' bounces from to arrive at E, and |P - E'| is the whole path
+  // length. So aiming at the mirrored target *is* aiming at the bounce, and
+  // the number the lead solver wants for flight time falls out of the same
+  // construction.
+  //
+  // Only axis-aligned faces are candidates. A collider is either an AABB or a
+  // circle, and a circle has no mirror plane — the reflection point is the
+  // root of a quartic (Alhazen's problem), so those are skipped for now and a
+  // barrel or a tree never offers a bank.
+  // Scratch for the candidate list, reused so a per-frame search doesn't churn.
+  const bankCandidates = [];
+  // How many faces get the expensive treatment. Candidates are tried
+  // shortest-path-first, so this bounds the cost of a scene where nothing
+  // works — a room full of metal walls with every bounce blocked would
+  // otherwise run two line-of-sight sweeps per face before giving up — while
+  // only ever discarding long-way-round shots nobody wants to take anyway.
+  const BANK_MAX_CANDIDATES = 12;
+  // And how far around the houses the shot is allowed to go, as a multiple of
+  // the direct distance. A bounce is always longer than the shot it replaces,
+  // and survev decays a reflected bullet's damage over that extra distance
+  // (`reflectDistDecay`), so a path several times the direct one arrives late,
+  // weak, and on a lead that has long stopped being a prediction. Rejecting
+  // those early is most of what keeps a crowded room cheap.
+  const BANK_MAX_PATH_MULT = 3;
+
+  // barrel_01's collision radius, and the smallest circle worth banking off:
+  // two of them.
+  //
+  // A curved mirror's sensitivity goes as 1/r. Move the bounce point along a
+  // circle by a hair and the surface normal turns by that distance over the
+  // radius, and the outgoing leg turns by twice that — so on a barrel every
+  // centimetre of error in where the bullet actually meets the surface swings
+  // the far leg by about two thirds of a degree, and neither the lead nor the
+  // extrapolated origin is anywhere near that accurate. A flat face has no
+  // such term at all, which is why only circles need a size floor. The check
+  // is against the *live* collider, so a damaged silo that has shrunk below
+  // the floor stops qualifying, which is correct — it really has got harder.
+  const BARREL_RADIUS = 1.75;
+  const BANK_MIN_CIRCLE_RAD = 2 * BARREL_RADIUS;
+
+  const BANK_FACE = 0;
+  const BANK_CIRCLE = 1;
+
+  // Signed shortest-arc difference between two bearings, in radians. Used by
+  // the circle bounce below and by autoshoot's "has the crosshair arrived yet"
+  // test.
+  function angleDelta(a, b) {
+    let d = (a - b) % (Math.PI * 2);
+    if (d > Math.PI) d -= Math.PI * 2;
+    if (d < -Math.PI) d += Math.PI * 2;
+    return d;
+  }
+
+  // The shortest one-bounce path from (fromX, fromY) to a moving target.
+  //
+  // `at(travelMs)` returns the target's lead point for a given flight time, so
+  // path length and lead are solved together: a different surface means a
+  // different path length means a different lead, which is why each candidate
+  // runs its own fixed point before it is validated rather than the search
+  // running once against a single guessed lead.
+  //
+  // Candidates are tried shortest-path-first and the first one that survives
+  // validation wins, so the expensive part — two line-of-sight sweeps — runs
+  // once or twice in the normal case rather than over every surface.
+  //
+  // Returns { x, y, rx, ry, dist, obstacle } where (x, y) is the point to aim
+  // at, (rx, ry) is where the bullet meets the surface, and `dist` is the
+  // total path length. Null when nothing works.
+  function bankSolve(fromX, fromY, layer, at, bulletSpeed, minDist) {
+    const t0 = at(0);
+    const obstacles = getObstacles();
+    const maxPath = Math.hypot(t0.x - fromX, t0.y - fromY) * BANK_MAX_PATH_MULT;
+    bankCandidates.length = 0;
+
+    // Cheap pass: geometry only, against the un-refined lead point. Anything
+    // that fails here cannot be rescued by a better flight time.
+    for (let i = 0; i < obstacles.length; i++) {
+      const o = obstacles[i];
+      if (!blocksBullets(o, layer) || !reflectsBullets(o)) continue;
+      const col = o.collider;
+
+      if (col.type === COLLIDER_CIRCLE) {
+        if (col.rad < BANK_MIN_CIRCLE_RAD) continue;
+        // Cheapest possible reject first: no path touching this circle can be
+        // shorter than reaching its near side and leaving from it.
+        const pl = Math.hypot(fromX - col.pos.x, fromY - col.pos.y);
+        const el = Math.hypot(t0.x - col.pos.x, t0.y - col.pos.y);
+        if (pl - col.rad + el - col.rad > maxPath) continue;
+        const hit = circleBounce(fromX, fromY, t0.x, t0.y, col.pos.x, col.pos.y, col.rad);
+        if (!hit || hit.dist > maxPath) continue;
+        bankCandidates.push({
+          kind: BANK_CIRCLE, o, cx: col.pos.x, cy: col.pos.y, rad: col.rad, dist: hit.dist,
+        });
+        continue;
+      }
+
+      const { min, max } = col;
+      for (let f = 0; f < 4; f++) {
+        // f 0,1: the planes x = min.x / x = max.x, spanning y.
+        // f 2,3: the planes y = min.y / y = max.y, spanning x.
+        const axis = f >> 1;
+        const nrm = (f & 1) ? 1 : -1;
+        const c = axis === 0 ? (nrm > 0 ? max.x : min.x) : (nrm > 0 ? max.y : min.y);
+        const lo = axis === 0 ? min.y : min.x;
+        const hi = axis === 0 ? max.y : max.x;
+        // Both ends have to sit on the outside of the plane. A specular
+        // bounce cannot reach a target behind the surface it bounces off,
+        // and this is also what rules out the box's three other faces.
+        const pOut = axis === 0 ? fromX - c : fromY - c;
+        const tOut = axis === 0 ? t0.x - c : t0.y - c;
+        if (pOut * nrm <= 0 || tOut * nrm <= 0) continue;
+        const hit = mirrorCross(fromX, fromY, t0.x, t0.y, axis, c, lo, hi);
+        if (!hit || hit.dist > maxPath) continue;
+        bankCandidates.push({ kind: BANK_FACE, o, axis, c, lo, hi, nrm, dist: hit.dist });
+      }
+    }
+    if (!bankCandidates.length) return null;
+    bankCandidates.sort((a, b) => a.dist - b.dist);
+
+    const tried = Math.min(bankCandidates.length, BANK_MAX_CANDIDATES);
+    for (let i = 0; i < tried; i++) {
+      const cand = bankCandidates[i];
+      // Same fixed point the direct solve uses, over this candidate's path
+      // length: each pass shrinks the residual by the target-to-bullet speed
+      // ratio. It ends with `hit` and `tp` consistent, so what gets validated
+      // below is the settled geometry — the target may well have moved off a
+      // face's extent, or around behind the surface, while the lead converged.
+      let tp = t0;
+      let hit = bankSolveOne(cand, fromX, fromY, tp.x, tp.y);
+      for (let pass = 0; pass < 3 && hit; pass++) {
+        tp = at(hit.dist / bulletSpeed * 1000);
+        hit = bankSolveOne(cand, fromX, fromY, tp.x, tp.y);
+      }
+      if (!hit) continue;
+
+      // Both legs have to be clear of everything else. The reflector itself is
+      // excluded from both, since both touch it by construction.
+      //
+      // Nothing here needs to re-check that the bullet meets *this* face of
+      // the reflector rather than another one of the same box: the side test
+      // put P strictly outside the face's plane and mirrorCross put R inside
+      // the face's extent, so the whole incoming leg lies in that plane's
+      // outside half-space and can only touch the box at R. (Probed over 54k
+      // random candidates: an explicit entry-point check never once caught a
+      // real case, and rejected 5% of valid ones on the floating-point tie of
+      // a segment ending exactly on a boundary.) A circle is convex and the
+      // bounce point is on the arc both ends can see, so the same holds there.
+      if (!hasLineOfSight(fromX, fromY, hit.rx, hit.ry, layer, minDist, cand.o)) continue;
+      if (!hasLineOfSight(hit.rx, hit.ry, tp.x, tp.y, layer, 0, cand.o)) continue;
+
+      return {
+        x: hit.ax, y: hit.ay,
+        rx: hit.rx, ry: hit.ry,
+        dist: hit.dist,
+        obstacle: cand.o,
+      };
+    }
+    return null;
+  }
+
+  // One candidate against one target point. Returns the bounce point, the
+  // total path length, and the point to aim at — for a face that's the
+  // mirrored target, for a circle it's the bounce point itself. Both give the
+  // same bearing, which is all the game is ever told: a circle has no mirror
+  // plane, but the bullet still leaves along P->R either way.
+  function bankSolveOne(cand, fromX, fromY, tx, ty) {
+    if (cand.kind === BANK_CIRCLE) {
+      const hit = circleBounce(fromX, fromY, tx, ty, cand.cx, cand.cy, cand.rad);
+      if (!hit) return null;
+      return { rx: hit.rx, ry: hit.ry, dist: hit.dist, ax: hit.rx, ay: hit.ry };
+    }
+    const hit = mirrorCross(fromX, fromY, tx, ty, cand.axis, cand.c, cand.lo, cand.hi);
+    if (!hit) return null;
+    const tOut = cand.axis === 0 ? tx - cand.c : ty - cand.c;
+    if (tOut * cand.nrm <= 0) return null;
+    return { rx: hit.rx, ry: hit.ry, dist: hit.dist, ax: hit.mx, ay: hit.my };
+  }
+
+  // Mirror (tx, ty) across the plane (axis, c), then intersect the straight
+  // line from (x0, y0) to that mirror with the plane. Returns the mirrored
+  // point, the crossing, and the total path length |P - E'| — or null if the
+  // line runs parallel to the plane, crosses outside the segment, or crosses
+  // beyond the face's finite extent [lo, hi].
+  function mirrorCross(x0, y0, tx, ty, axis, c, lo, hi) {
+    const mx = axis === 0 ? 2 * c - tx : tx;
+    const my = axis === 0 ? ty : 2 * c - ty;
+    const dx = mx - x0;
+    const dy = my - y0;
+    const denom = axis === 0 ? dx : dy;
+    if (Math.abs(denom) < 1e-9) return null;
+    const t = ((axis === 0 ? c - x0 : c - y0)) / denom;
+    if (!(t > 0 && t < 1)) return null;
+    const rx = x0 + dx * t;
+    const ry = y0 + dy * t;
+    const along = axis === 0 ? ry : rx;
+    if (along < lo || along > hi) return null;
+    return { mx, my, rx, ry, dist: Math.hypot(dx, dy) };
+  }
+
+  // Bisection steps for the circle bounce. The search arc is at most half the
+  // circle, so 28 halvings put it under 1e-8 rad — a nanometre of arc on a
+  // barrel, and far below what the lead itself is accurate to.
+  const CIRCLE_BOUNCE_ITERS = 28;
+
+  // Where a bullet bounces off a reflecting circle: the point R on it whose
+  // radius bisects the angle P-R-E. That is the reflection law written for a
+  // curved mirror — the normal anywhere on a circle *is* its radius, and a
+  // specular bounce puts the normal exactly between the incoming and outgoing
+  // rays, so the bisector condition and "angle in equals angle out" are the
+  // same statement.
+  //
+  // This is Alhazen's problem, which has no closed form worth having (it
+  // reduces to a quartic), so it is solved numerically. In circle-centred
+  // coordinates with R(θ) = C + r(cosθ, sinθ) and
+  //     u = normalize(P - R),  v = normalize(E - R),  n = (cosθ, sinθ)
+  // "the radius bisects" says u + v points along n, so the root to find is
+  //     f(θ) = cross(u + v, n) = 0
+  //
+  // The visibility condition is what makes that tractable rather than a
+  // quartic root-finding exercise. R can only be a bounce point if both ends
+  // can see it, and R is visible from P exactly when
+  // |θ - bearing(P)| < acos(r / |P - C|). Each constraint is therefore an arc
+  // centred on that point's bearing and less than half the circle wide, so
+  // their intersection is a single arc, and f changes sign exactly once across
+  // it. Bisecting that arc converges on the one bounce that physically exists
+  // and never meets the quartic's other roots, which live on the arcs facing
+  // away from one end or the other.
+  function circleBounce(px, py, ex, ey, cx, cy, rad) {
+    const pdx = px - cx, pdy = py - cy;
+    const edx = ex - cx, edy = ey - cy;
+    const pl = Math.hypot(pdx, pdy);
+    const el = Math.hypot(edx, edy);
+    // A point inside the circle has no exterior bounce. (Neither end should
+    // ever be inside — a player can't stand in a barrel — but the extrapolated
+    // origin can be, and acos of a ratio over 1 is NaN.)
+    if (!(pl > rad) || !(el > rad)) return null;
+
+    const bearP = Math.atan2(pdy, pdx);
+    // The two visibility arcs, measured relative to P's bearing so the wrap is
+    // handled once. Both are narrower than half the circle, so this intersects
+    // as a plain interval — the wrapped part of E's arc can never reach back
+    // around into P's.
+    const half = angleDelta(Math.atan2(edy, edx), bearP);
+    let lo = Math.max(-Math.acos(rad / pl), half - Math.acos(rad / el));
+    let hi = Math.min(Math.acos(rad / pl), half + Math.acos(rad / el));
+    if (!(hi > lo)) return null;
+
+    const f = (s) => {
+      const th = bearP + s;
+      const nx = Math.cos(th), ny = Math.sin(th);
+      const rx = cx + rad * nx, ry = cy + rad * ny;
+      let ux = px - rx, uy = py - ry;
+      let vx = ex - rx, vy = ey - ry;
+      const ul = Math.hypot(ux, uy) || 1e-9;
+      const vl = Math.hypot(vx, vy) || 1e-9;
+      ux /= ul; uy /= ul; vx /= vl; vy /= vl;
+      return (ux + vx) * ny - (uy + vy) * nx;
+    };
+
+    // Step just inside the tangent points: exactly on one the incoming ray
+    // grazes the surface, which is a degenerate bounce, not a shot.
+    const inset = (hi - lo) * 1e-6;
+    lo += inset;
+    hi -= inset;
+    let flo = f(lo);
+    let fhi = f(hi);
+    if (!(flo === 0 || fhi === 0 || (flo < 0) !== (fhi < 0))) return null;
+
+    let mid = lo;
+    for (let i = 0; i < CIRCLE_BOUNCE_ITERS; i++) {
+      mid = (lo + hi) * 0.5;
+      const fm = f(mid);
+      if ((fm < 0) === (flo < 0)) { lo = mid; flo = fm; } else { hi = mid; fhi = fm; }
+    }
+
+    const th = bearP + mid;
+    const rx = cx + rad * Math.cos(th);
+    const ry = cy + rad * Math.sin(th);
+    return {
+      rx, ry,
+      dist: Math.hypot(rx - px, ry - py) + Math.hypot(ex - rx, ey - ry),
+    };
+  }
+
+  // Plain-object snapshot of the collision set, for inspection and for drawing.
+  // Copies the numbers out because the Obstacle replaces its `collider` object
+  // wholesale on every update, so a held reference silently goes stale.
+  // Pass a layer to get only what would block a shot fired on it; omit it for
+  // everything the pool currently holds, with `blocksBullets` then answered
+  // against the local player's own layer.
+  function bulletColliders(layer) {
+    const wantAll = !Number.isFinite(layer);
+    const me = wantAll && capturedGame ? findLocalPlayerOnGame(capturedGame) : null;
+    const refLayer = wantAll ? (Number.isFinite(me?.layer) ? me.layer : 0) : layer;
+    const out = [];
+    for (const o of getObstacles()) {
+      if (!o || !o.active) continue;
+      if (!wantAll && !blocksBullets(o, refLayer)) continue;
+      const c = o.collider;
+      if (!c) continue;
+      const shape = c.type === COLLIDER_AABB
+        ? { kind: 'aabb', minX: c.min.x, minY: c.min.y, maxX: c.max.x, maxY: c.max.y }
+        : { kind: 'circle', x: c.pos.x, y: c.pos.y, rad: c.rad };
+      out.push({
+        id: Number(o.__id ?? 0),
+        type: o.type,
+        layer: Number.isFinite(o.layer) ? o.layer : 0,
+        height: o.height,
+        dead: !!o.dead,
+        collidable: !!o.collidable,
+        isWall: !!o.isWall,
+        isWindow: !!o.isWindow,
+        isDoor: !!o.isDoor,
+        isBush: !!o.isBush,
+        blocksBullets: blocksBullets(o, refLayer),
+        reflectsBullets: reflectsBullets(o),
+        shape,
+      });
+    }
+    return out;
+  }
+
+  // Console handle: `__wallDiag()` for a one-line state read, and the raw
+  // helpers for poking at the geometry from devtools.
+  window.__bulletGeom = {
+    list: bulletColliders,
+    firstHit: firstBulletHit,
+    los: hasLineOfSight,
+    obstacles: getObstacles,
+    reflects: reflectsBullets,
+    reflectorTypes: REFLECTS_BULLETS,
+    // Bank solve against a stationary point, for poking at the geometry from
+    // devtools. The aim path calls bankSolve directly with a lead function.
+    bank: (x0, y0, tx, ty, layer = 0, minDist = PLAYER_RADIUS) =>
+      bankSolve(x0, y0, layer, () => ({ x: tx, y: ty }), 1e8, minDist),
+  };
+  window.__wallDiag = () => {
+    const map = findMapOnGame(capturedGame);
+    const pool = map ? findObstaclePool(map) : null;
+    const all = pool ? (pool[POOL_GETALL]() || []) : [];
+    const me = capturedGame ? findLocalPlayerOnGame(capturedGame) : null;
+    const layer = Number.isFinite(me?.layer) ? me.layer : 0;
+    return {
+      gameCaptured: !!capturedGame,
+      mapFound: !!map,
+      mapKey: cachedMapKey,
+      poolFound: !!pool,
+      poolKey: cachedObstaclePoolKey,
+      pooled: all.length,
+      active: all.filter((o) => o && o.active).length,
+      blockingOnMyLayer: all.filter((o) => blocksBullets(o, layer)).length,
+      reflectingOnMyLayer: all.filter((o) => blocksBullets(o, layer) && reflectsBullets(o)).length,
+      reflectingTypes: [...new Set(all
+        .filter((o) => blocksBullets(o, layer) && reflectsBullets(o))
+        .map((o) => o.type))],
+      myLayer: layer,
+    };
+  };
+
   // Auto-aim humanization. Tunable live from devtools via `window.__aimHuman`.
   const AIM_HUMAN = {
     // Human reaction delay, in ms. We aim using the enemy's state as it was
@@ -1477,8 +2401,10 @@
     // dt-corrected each frame so the closing rate is frame-rate independent.
     // 1.0 ⇒ instant snap; smaller ⇒ a slower glide onto the target.
     followFraction: 0.3,
-    // After an enemy dies it stays lockable (acts alive) for this many ms,
-    // so its corpse/last position can still be aimed at briefly.
+    // How long a just-killed enemy stays in play after dying, in ms. Inside
+    // that window it counts as a live player in every respect — it competes
+    // for "nearest the cursor" on equal terms and gets shot at like anything
+    // else — and once the timer is up it drops out entirely.
     deadLingerMs: 600,
     // How much of the measured round trip to lead by, as a fraction. The state
     // we can see is one one-way delay old and a shot fired now arrives one
@@ -1488,9 +2414,76 @@
     // judged against the world we actually saw and any ping lead is overshoot.
     pingLeadK: 1,
   };
-  // id -> Date.now() when the enemy was first observed dead; lets pickTarget
-  // keep a just-killed target lockable for AIM_HUMAN.deadLingerMs.
+  // id -> Date.now() when the enemy was first seen dead, so the linger window
+  // is measured from the death rather than restarted every frame.
   const deadSince = new Map();
+
+  // Players the aim path must never engage, as the raw text of the MOD tab's
+  // box: one name per line, kept verbatim so what the user typed is what comes
+  // back. Hoisted with the other stores because SETTINGS_SPECS binds a row to
+  // it. Empty by default — nobody is spared until a name is put here.
+  const AIM_WHITELIST = {
+    names: '',
+  };
+
+  // Longest whitelist accepted from localStorage, and the cap the box enforces
+  // as it is typed. Nothing about the feature needs a limit; the stored entry
+  // does, since it is hand-editable and is parsed back into a set on load.
+  const WHITELIST_MAX_CHARS = 4000;
+
+  // Derived lookup set, rebuilt only when the text actually changes: this is
+  // asked once per enemy per frame, and the text changes at typing speed.
+  let whitelistCache = { text: null, set: new Set() };
+
+  function whitelistSet() {
+    const text = typeof AIM_WHITELIST.names === 'string' ? AIM_WHITELIST.names : '';
+    if (whitelistCache.text === text) return whitelistCache.set;
+    const set = new Set();
+    for (const line of text.split('\n')) {
+      const name = line.trim().toLowerCase();
+      if (name) set.add(name);
+    }
+    whitelistCache = { text, set };
+    return set;
+  }
+
+  // Is this someone we've promised not to shoot? Matched on the trimmed line,
+  // case-insensitively: the name is being retyped from memory rather than
+  // copied out of the game, and survev won't hand out two names that differ
+  // only in case anyway.
+  function isWhitelistedName(name) {
+    if (typeof name !== 'string' || !name) return false;
+    const set = whitelistSet();
+    if (!set.size) return false;
+    return set.has(name.trim().toLowerCase());
+  }
+
+  // Is this enemy someone the aim path should be dealing with at all?
+  //
+  // Not on the whitelist, and alive — or dead and still inside
+  // AIM_HUMAN.deadLingerMs. Inside that window
+  // a corpse is treated exactly as a live player — same candidacy for "nearest
+  // the cursor", same shot solve, same trigger — which is the point: the kill
+  // often lands before the last of the burst does, and dropping the target the
+  // instant the server says "dead" throws away shots that were already on
+  // their way to being useful.
+  //
+  // Every part of the aim path asks this one question rather than testing
+  // `e.dead` itself, so target selection, the overlay's marker and autoshoot
+  // cannot disagree about whether a body is still in play.
+  function isEngageable(e, now) {
+    if (!e) return false;
+    // A whitelisted name is never engaged, alive or dead: the aim path behaves
+    // as though they were not on the field at all. Asked here rather than at
+    // each call site so target selection, the overlay's green marker and
+    // autoshoot all honour it from one test — the same reason the linger
+    // window lives here.
+    if (isWhitelistedName(e.name)) return false;
+    if (!e.dead) { deadSince.delete(e.id); return true; }
+    if (!deadSince.has(e.id)) deadSince.set(e.id, now);
+    return now - deadSince.get(e.id) < AIM_HUMAN.deadLingerMs;
+  }
+
   window.__aimHuman = AIM_HUMAN;
   // Frame time the followFraction is calibrated against (60fps).
   const AIM_REF_DT = 1 / 60;
@@ -1513,9 +2506,9 @@
 
   // World→pixel scale (pixels per world unit) for the current frame. The
   // sample's stored viewportWorldUnits is at most SAMPLE_MS old, and during
-  // a scope-zoom lerp the game's rendered zoom slides across ~1s of frames;
-  // we re-read the camera's live m_zoom per frame so overlays stay glued
-  // to whatever the user sees instead of jumping at each new sample.
+  // a scope-zoom lerp the game's rendered scale slides across ~0.3-1s of
+  // frames; we re-read the camera's live scale per frame so overlays stay
+  // glued to whatever the user sees instead of jumping at each new sample.
   // Falls back to the sample's cached viewportWorldUnits before the camera
   // is located, and to an arbitrary default before a sample exists.
   function getLivePxPerWorldUnit(sample) {
@@ -1523,14 +2516,8 @@
     if (game) {
       const cam = findCameraOnGame(game);
       if (cam) {
-        const W = window.innerWidth;
-        const H = window.innerHeight;
-        const maxScreenDim = Math.max(Math.min(W, H) * (16 / 9), Math.max(W, H));
-        const scope = sample?.self?.scope || '1xscope';
-        const radius = SCOPE_RADIUS_TABLE[scope] ?? SCOPE_RADIUS_TABLE['1xscope'];
-        const expectedTargetZoom = (maxScreenDim * 0.5) / (radius * 16);
-        const mZoom = readCameraZoom(cam, expectedTargetZoom);
-        if (mZoom && mZoom > 0) return 16 * mZoom;
+        const px = readCameraPxPerUnit(cam);
+        if (px) return px;
       }
     }
     return window.innerWidth / (sample?.self?.viewportWorldUnits || 56);
@@ -1546,14 +2533,7 @@
   function pickTarget(player, enemies, now) {
     const candidates = [];
     for (const e of enemies) {
-      if (e.dead) {
-        // Keep a just-killed enemy lockable for a short linger window. Record
-        // when we first saw it dead, then drop it once the window elapses.
-        if (!deadSince.has(e.id)) deadSince.set(e.id, now);
-        if (now - deadSince.get(e.id) >= AIM_HUMAN.deadLingerMs) continue;
-      } else {
-        deadSince.delete(e.id);
-      }
+      if (!isEngageable(e, now)) continue;
       if (isSpoofedEnemy(e.id, pageSamples)) continue;
       if (!canInteract(player.layer, e.layer)) continue;
       candidates.push(e);
@@ -1790,7 +2770,37 @@
       const travelMs = Math.hypot(hit.x - from.x, hit.y - from.y) / bulletSpeed * 1000;
       hit = at(travelMs);
     }
-    return { x: hit.x, y: hit.y, fromX: from.x, fromY: from.y };
+
+    // Is that shot actually available? The layer to test on is our own, since
+    // that is the layer the bullet is fired on.
+    const layer = player.layer;
+    const directClear = hasLineOfSight(
+      from.x, from.y, hit.x, hit.y, layer, PLAYER_RADIUS,
+    );
+    // Walled off: go looking for a bounce. The mirrored point comes back as
+    // the thing to aim at, so everything downstream — the glide, the bearing,
+    // the overlay — needs no idea that this shot is going the long way round.
+    //
+    // `prefer` looks for one even when the direct line is wide open, which
+    // turns the fallback into a trick-shot mode: the bounce is taken whenever
+    // the geometry offers one inside BANK_MAX_PATH_MULT, and only a target
+    // with no usable surface anywhere near it gets shot at straight. It is
+    // strictly worse aim — a longer flight, a bigger lead, and the damage
+    // decay survev applies to a reflected bullet — so it is worth turning on
+    // because it is funny, not because it is good.
+    const bank = (BANK.enabled && (BANK.prefer || !directClear))
+      ? bankSolve(from.x, from.y, layer, at, bulletSpeed, PLAYER_RADIUS)
+      : null;
+    if (bank) {
+      return {
+        x: bank.x, y: bank.y, fromX: from.x, fromY: from.y,
+        blocked: false, bank,
+      };
+    }
+    return {
+      x: hit.x, y: hit.y, fromX: from.x, fromY: from.y,
+      blocked: !directClear, bank: null,
+    };
   }
 
   function dispatchAim() {
@@ -1807,10 +2817,17 @@
     const dt = aimState.lastFrameAt ? Math.max(0.001, (now - aimState.lastFrameAt) / 1000) : AIM_REF_DT;
     aimState.lastFrameAt = now;
 
+    // Whoever is nearest the cursor, every frame — no commitment, no carrying
+    // a target through a kill. If they can't actually be shot, the aim helper
+    // does nothing at all rather than dragging the crosshair onto someone
+    // unreachable: `blocked` is the solver's own verdict, meaning no clear
+    // line and no bounce either.
     const [enemy] = pickTarget(player, enemies, now);
-    if (enemy) {
+    const tgt = enemy ? reactionTarget(player, enemy, now) : null;
+    const engage = !!tgt && !tgt.blocked;
+
+    if (engage) {
       aimState.targetId = enemy.id;
-      const tgt = reactionTarget(player, enemy, now);
       // First frame of an engagement: start the glide from where the user's
       // real cursor is pointing in the world, not from a stale/zero point.
       if (aimState.aimX == null) {
@@ -1835,11 +2852,30 @@
       // world unit apart, which is a couple of degrees at duel range.
       aimState.theta = Math.atan2(aimState.aimY - tgt.fromY, aimState.aimX - tgt.fromX);
     } else {
+      // Hand the cursor back. Dropping the glide anchor matters: without it,
+      // re-engaging would sweep the crosshair across from wherever the last
+      // target stood instead of starting from where the mouse is now.
       aimState.targetId = null;
+      aimState.aimX = null;
+      aimState.aimY = null;
     }
 
-    const x = Math.round(window.innerWidth / 2 + Math.cos(aimState.theta) * AIM_CURSOR_RADIUS);
-    const y = Math.round(window.innerHeight / 2 - Math.sin(aimState.theta) * AIM_CURSOR_RADIUS);
+    let x;
+    let y;
+    if (engage) {
+      x = Math.round(window.innerWidth / 2 + Math.cos(aimState.theta) * AIM_CURSOR_RADIUS);
+      y = Math.round(window.innerHeight / 2 - Math.sin(aimState.theta) * AIM_CURSOR_RADIUS);
+    } else {
+      // The user's own cursor, replayed. Their real mousemoves are being
+      // swallowed for as long as the key is held, so the game sees only what
+      // we send it — sending their position straight back is what "no aimbot"
+      // has to mean here. Before they have ever moved the mouse there is no
+      // position to replay, so nothing is sent and the game keeps the aim it
+      // already had.
+      if (!realMouse.hasMoved) return;
+      x = Math.round(realMouse.x);
+      y = Math.round(realMouse.y);
+    }
     try {
       target.dispatchEvent(new MouseEvent('mousemove', {
         bubbles: true,
@@ -1873,8 +2909,19 @@
     aimState.lastFrameAt = 0;
   }
 
+  // True while the caret is in one of our own multi-line boxes. This listener
+  // is capture-phase on window, so it runs *before* the event reaches the box
+  // and cannot be stopped from there — it has to ask. Without it, a bind on a
+  // printable key (or Shift, the default) would engage the aimbot mid-word and
+  // swallow the character with its preventDefault.
+  function typingInElgField() {
+    const el = document.activeElement;
+    return !!el && el.tagName === 'TEXTAREA' && el.classList.contains(ELG_TEXTAREA_CLASS);
+  }
+
   window.addEventListener('keydown', (e) => {
-    if (bindCapture || !AIMBOT.enabled || AIMBOT.bind == null || e.keyCode !== AIMBOT.bind) return;
+    if (bindCapture || typingInElgField()) return;
+    if (!AIMBOT.enabled || AIMBOT.bind == null || e.keyCode !== AIMBOT.bind) return;
     if (!aimHeld) {
       aimHeld = true;
       // Fresh hold: drop the prior aim point so dispatchAim re-seeds the glide
@@ -1958,6 +3005,17 @@
     enabled: 1,
   };
 
+  // Enemy name tags: show every enemy's name under their sprite, the way the
+  // game already shows a teammate's, in red instead of the teammate cyan. Same
+  // hoisting reason again, and independent of the ESP overlay — see the
+  // name-tag block further down. On by default: it reads the label the game
+  // has already built and touches no input or gameplay state, so it sits with
+  // the netcode smoothing and the ping readout rather than with the cheats
+  // that ship off.
+  const NAME_TAGS = {
+    enabled: 1,
+  };
+
   // ---------------------------------------------------------------------
   // Settings UI, injected as a third tab in survev's own Escape menu next to
   // Settings and Keybinds.
@@ -1989,8 +3047,20 @@
     { id: 'aimbot.enabled', store: AIMBOT, key: 'enabled', label: 'Aimbot', kind: 'toggle',
       section: 'Aimbot' },
     { id: 'aimbot.bind',  store: AIMBOT, key: 'bind', label: 'Aimbot key', kind: 'keybind' },
+    { id: 'aimbot.whitelist', store: AIM_WHITELIST, key: 'names', label: 'Never aim at',
+      kind: 'textarea', rows: 4, maxLength: WHITELIST_MAX_CHARS,
+      placeholder: 'One player name per line' },
     { id: 'esp.enabled',  store: ESP,    key: 'enabled', label: 'ESP overlay', kind: 'toggle',
       section: 'ESP' },
+    { id: 'esp.losDim',   store: ESP,    key: 'losDim',  label: 'Dim blocked', kind: 'toggle' },
+    { id: 'esp.blockedAlpha', store: ESP, key: 'blockedAlpha', label: 'Blocked fade',      min: 0,    max: 1,    step: 0.05, decimals: 2 },
+    { id: 'names.enemy',  store: NAME_TAGS, key: 'enabled', label: 'Enemy names', kind: 'toggle',
+      section: 'Name tags' },
+    { id: 'bank.enabled', store: BANK,  key: 'enabled', label: 'Bank shots', kind: 'toggle',
+      section: 'Bank shots' },
+    { id: 'bank.prefer',  store: BANK,  key: 'prefer',  label: 'Prefer banks', kind: 'toggle' },
+    { id: 'autoshoot.enabled', store: AUTOSHOOT, key: 'enabled', label: 'Autoshoot', kind: 'toggle',
+      section: 'Autoshoot' },
     { id: 'aim.reactionMs',     store: AIM_HUMAN, key: 'reactionMs',     label: 'Reaction',  unit: 'ms', min: 0,    max: 400,  step: 5,    decimals: 0,
       section: 'Aim humanization' },
     { id: 'aim.followFraction', store: AIM_HUMAN, key: 'followFraction', label: 'Follow',                min: 0.01, max: 1,    step: 0.01, decimals: 2 },
@@ -2044,6 +3114,10 @@
         if (Number.isInteger(v) && v >= 0 && v <= 255 && !UNBINDABLE.has(v)) spec.store[spec.key] = v;
       } else if (spec.kind === 'toggle') {
         if (v === 0 || v === 1) spec.store[spec.key] = v;
+      } else if (spec.kind === 'textarea') {
+        // Truncated rather than rejected, for the same reason a slider clamps:
+        // an over-long entry is still mostly the user's list.
+        if (typeof v === 'string') spec.store[spec.key] = v.slice(0, spec.maxLength || 4000);
       } else if (Number.isFinite(v)) {
         // Clamp instead of reject: a value outside the current range is what a
         // retuned slider leaves behind, and the nearest legal value is what the
@@ -2060,7 +3134,9 @@
   const ELG_TAB_PANE_ID = `ui-game-tab-${ELG_TAB}`;
   const ELG_LIST_ID = `ui-${ELG_TAB}-list`;
   const ELG_STYLE_ID = `${ELG_TAB}-style`;
-  const ELG_LIST_MIN_H = 295; // survev's keybind-list height; see ELG_STYLE below
+  const ELG_TEXTAREA_CLASS = `${ELG_TAB}-textarea`;
+  const ELG_LIST_H = 295;    // survev's keybind-list height; see ELG_STYLE below
+  const ELG_LIST_MIN_H = 90; // floor for fitElgPane, ~three rows
 
   // survev's stylesheet only targets its own two tabs by id, so ours gets an
   // equivalent rule rather than inheriting one. Values are copied from the
@@ -2073,8 +3149,10 @@
   // the layout switches between desktop and mobile — copying that would mean
   // tracking the layout too. Keybinds sizes its inner list unconditionally.
   //
-  // 295px is the floor, not the final height: fitElgPane measures the box on
-  // show and grows the list until "Return to Game" lands on the bottom edge.
+  // 295px is only the starting height: fitElgPane measures the box on show and
+  // grows (or shrinks) the list until "Return to Game" lands on the bottom
+  // edge, so every pixel between the tab buttons and that button is scrollable
+  // row space.
   //
   // `pointer-events:all` is load-bearing: the whole `#ui-game` HUD is
   // click-through, so a pane that doesn't opt back in cannot be scrolled or
@@ -2090,7 +3168,7 @@
   const ELG_STYLE = `
     #${ELG_TAB_PANE_ID} > #${ELG_LIST_ID} {
       pointer-events: all;
-      height: ${ELG_LIST_MIN_H}px;
+      height: ${ELG_LIST_H}px;
       overflow-y: scroll;
       /* Belt-and-braces against the same promotion: nothing in the pane is
          wider than the track, so clipping here can only ever hide a stray
@@ -2109,6 +3187,41 @@
       bottom: 0;
     }
     #${ELG_LIST_ID} .elg-heading:first-child { margin-top: 0; }
+    /* survev has no textarea anywhere in its UI, so this one has no shipped
+       markup to borrow and gets rules of its own. They are deliberately plain:
+       the menu's own dark panel is the background, so a translucent fill and a
+       hairline border is all it takes to read as part of it. */
+    #${ELG_LIST_ID} .elg-textarea-row { margin: 4px 0 8px; }
+    #${ELG_LIST_ID} .elg-textarea-label {
+      display: block;
+      width: auto;
+      margin: 0 0 4px;
+      /* Same reason as .elg-heading: no slider on the row to line up with. */
+      bottom: 0;
+    }
+    #${ELG_LIST_ID} .${ELG_TEXTAREA_CLASS} {
+      /* Load-bearing for the same reason the list needs it — the HUD around
+         it is click-through, so the box cannot be focused without this. */
+      pointer-events: all;
+      display: block;
+      /* border-box + 100% is what keeps the box inside the track no matter how
+         the menu is scaled; a fixed width is what put a horizontal scrollbar on
+         the slider rows. */
+      box-sizing: border-box;
+      width: 100%;
+      resize: vertical;
+      font-family: inherit;
+      font-size: 12px;
+      line-height: 1.4;
+      color: #fff;
+      background: rgba(0, 0, 0, 0.4);
+      border: 1px solid rgba(255, 255, 255, 0.25);
+      border-radius: 3px;
+      padding: 4px 6px;
+      outline: none;
+    }
+    #${ELG_LIST_ID} .${ELG_TEXTAREA_CLASS}:focus { border-color: rgba(255, 255, 255, 0.6); }
+    #${ELG_LIST_ID} .${ELG_TEXTAREA_CLASS}::placeholder { color: rgba(255, 255, 255, 0.35); }
     /* Tab buttons are 30px tall but #btn-game-tabs sets line-height:36px,
        which is invisible on survev's icon-only tabs and off-centre on ours. */
     #${ELG_TAB_BTN_ID} { line-height: 30px; }
@@ -2138,7 +3251,9 @@
 
   // Grow (or shrink) the row list so the pane fills the menu box and
   // "Return to Game" ends up flush with its bottom edge, where it sits on
-  // survev's own tabs.
+  // survev's own tabs. Everything above that button is then the scroll
+  // container, so the rows get every spare pixel and the button never floats
+  // in the middle of the box.
   //
   // The 295px copied from the keybinds tab is only a starting point. On
   // desktop the menu is a fixed 495px box (`.ui-game-menu-desktop`) and the
@@ -2146,25 +3261,47 @@
   // restore-defaults button. Our pane has no height of its own, so it comes up
   // 50px short and that shortfall is exactly the gap under the button.
   // Measured rather than hardcoded, because the number depends on the row set
-  // and on which of survev's layouts is live; self-limiting, since after one
-  // pass the slack is zero and repeat calls return early. Under the mobile
-  // media query the menu is `height: initial` and hugs its content, so the
-  // slack is zero to begin with and this does nothing.
+  // and on which of survev's layouts is live; self-limiting, since the list
+  // height moves the button one-for-one, so after one pass the slack is zero
+  // and repeat calls return early. Under the mobile media query the menu is
+  // `height: initial` and hugs its content, so the slack is zero to begin with
+  // and this does nothing.
+  //
+  // Everything is measured in *layout* pixels (offsetTop/offsetHeight), not
+  // through getBoundingClientRect: `#ui-center` carries a `scale(.85)` under
+  // two of survev's media queries — including plain `max-width:1200px`, so on
+  // most windows — and rects come back scaled while `style.height` is set
+  // unscaled. Mixing the two made the computed height come out *smaller* than
+  // the 295px it started at, so the fit clamped to the floor and silently did
+  // nothing: the button sat 50px above the bottom edge with dead space beneath
+  // it and the list stayed at its minimum.
   function fitElgPane() {
     const menu = document.getElementById('ui-game-menu');
     const list = document.getElementById(ELG_LIST_ID);
     const resume = document.getElementById('btn-game-resume');
     if (!menu || !list || !resume || !list.offsetParent) return;
     const menuStyle = getComputedStyle(menu);
-    const contentBottom = menu.getBoundingClientRect().bottom
-      - parseFloat(menuStyle.paddingBottom || '0')
-      - parseFloat(menuStyle.borderBottomWidth || '0');
+    // offsetTop is relative to the offsetParent, so the two measurements have
+    // to share one. The menu is statically positioned, which puts both it and
+    // the button in `#ui-center`'s frame; the other branch covers the menu
+    // ever gaining a `position`, which would reparent the button onto it.
+    let contentBottom;
+    if (resume.offsetParent === menu) {
+      contentBottom = menu.clientHeight - parseFloat(menuStyle.paddingBottom || '0');
+    } else if (resume.offsetParent === menu.offsetParent) {
+      contentBottom = menu.offsetTop + menu.offsetHeight
+        - parseFloat(menuStyle.paddingBottom || '0')
+        - parseFloat(menuStyle.borderBottomWidth || '0');
+    } else return;
     const slack = contentBottom
-      - resume.getBoundingClientRect().bottom
+      - (resume.offsetTop + resume.offsetHeight)
       - parseFloat(getComputedStyle(resume).marginBottom || '0');
     if (Math.abs(slack) < 1) return;
-    const h = Math.round(list.getBoundingClientRect().height + slack);
-    list.style.height = `${Math.max(ELG_LIST_MIN_H, h)}px`;
+    const h = `${Math.max(ELG_LIST_MIN_H, Math.round(list.offsetHeight + slack))}px`;
+    // Skip the redundant write when the fit wants a height the floor won't
+    // give it: the slack never reaches zero there, so without this the loop
+    // would restyle the list on every tick.
+    if (list.style.height !== h) list.style.height = h;
   }
 
   // Refit on resize: the menu panel is sized off the viewport, so the slack
@@ -2172,6 +3309,25 @@
   window.addEventListener('resize', () => {
     try { fitElgPane(); } catch {}
   });
+
+  // A resize that lands while the menu is shut can't be measured — the pane
+  // has no box — so the height it leaves behind is stale the next time the tab
+  // is opened. Called once per sample tick from the loop that attaches the tab,
+  // this catches that case on show, and covers the paths that reach our pane
+  // without going through elgSelectTab (survev drives it natively once its own
+  // collections have picked it up).
+  //
+  // Both checks read an inline `display`, which every one of those paths sets:
+  // ours and survev's tab switches on the pane, and survev's Escape handler on
+  // the menu. So a tick with the menu closed costs two property reads and
+  // forces no layout.
+  function refitElgPaneIfVisible() {
+    const pane = document.getElementById(ELG_TAB_PANE_ID);
+    if (!pane || pane.style.display === 'none') return;
+    const menu = document.getElementById('ui-game-menu');
+    if (!menu || menu.style.display === 'none') return;
+    fitElgPane();
+  }
 
   function buildElgPane() {
     const pane = document.createElement('div');
@@ -2269,6 +3425,46 @@
           saveSettings();
         });
         list.appendChild(btn);
+        continue;
+      }
+
+      // A multi-line box, for a setting that is a list rather than a number.
+      // Every key event is stopped at the box so the game never sees the
+      // typing: survev's own key handler is a bubble-phase listener on window,
+      // so stopping here is enough to keep "wasd" from walking the player and
+      // a digit from swapping weapons. Our aimbot listener is capture-phase and
+      // runs before this, so it asks `typingInElgField()` instead. Escape is
+      // deliberately let through, after blurring, so it still closes the menu.
+      if (spec.kind === 'textarea') {
+        const row = document.createElement('div');
+        row.className = 'elg-textarea-row';
+        const label = document.createElement('p');
+        label.className = 'slider-text elg-textarea-label';
+        label.textContent = spec.label;
+        const box = document.createElement('textarea');
+        box.className = ELG_TEXTAREA_CLASS;
+        box.rows = spec.rows || 4;
+        box.spellcheck = false;
+        box.maxLength = spec.maxLength || 4000;
+        if (spec.placeholder) box.placeholder = spec.placeholder;
+        box.value = String(spec.store[spec.key] ?? '');
+        // Saved per keystroke, unlike the sliders: typing fires `input` at
+        // human speed rather than per pixel of a drag, and `change` alone would
+        // lose the edit when the menu is closed with the box still focused.
+        box.addEventListener('input', () => {
+          spec.store[spec.key] = box.value;
+          saveSettings();
+        });
+        for (const type of ['keydown', 'keyup', 'keypress']) {
+          box.addEventListener(type, (e) => {
+            if (e.key === 'Escape') { box.blur(); return; }
+            e.stopPropagation();
+          });
+        }
+        box.addEventListener('mousedown', (e) => e.stopPropagation());
+        row.appendChild(label);
+        row.appendChild(box);
+        list.appendChild(row);
         continue;
       }
 
@@ -2453,34 +3649,103 @@
   const AUTO_SWAP_INPUT_EQUIP_LAST = 19;
   const AUTO_SWAP_INPUT_EQUIP_OTHER = 20;
 
-  // These inputs have no default keybind in the bundle and no UI-flag
+  // ---- Synthetic inputs -------------------------------------------------
+  //
+  // Most of these inputs have no default keybind in the bundle and no UI-flag
   // analog like SwapWeapSlots does — the bundle only emits them when
-  // `game[inputBinds].isBindPressed(N.<Input>)` returns true in
-  // the input loop. To trigger one without a bind, we wrap
-  // `isBindPressed` and return true for the queued input the next time
-  // the input loop polls it — once, then we drop it from the set so we
-  // don't keep emitting it on every subsequent tick. Using a Set makes
-  // this independent of which keybinds (if any) the user has assigned.
-  let autoSwapHookedDmk = null;
-  const autoSwapPendingInputs = new Set();
+  // `game[inputBinds].isBindPressed(N.<Input>)` returns true in the input
+  // loop. And the fire flags on the outgoing packet are built straight off
+  // that object too:
+  //     shootStart = inputBinds.isBindPressed(Input.Fire)
+  //     shootHold  = inputBinds.isBindDown(Input.Fire)
+  // so wrapping the same two methods is enough to press or hold anything
+  // without owning a keybind for it, independent of what the user has bound.
+  //
+  //   pendingInputs    — one-shot. Consumed by the next isBindPressed poll,
+  //                      then dropped, so it doesn't re-emit on every later
+  //                      tick. Right for the equip inputs, which have exactly
+  //                      one reader: the loop that copies pressed inputs onto
+  //                      the outgoing message.
+  //   framePressInputs — pressed for a whole frame, read without consuming.
+  //                      Necessary for Fire, which has *two* readers per
+  //                      frame, and they run in the wrong order: the player
+  //                      update polls isBindPressed(Fire) for the dry-fire
+  //                      sound, and it runs earlier in Game.update than the
+  //                      input-message build that turns the same poll into
+  //                      `shootStart`. A one-shot token gets eaten by the
+  //                      first and never reaches the packet, so a press-fired
+  //                      gun silently never shoots. Whoever arms one of these
+  //                      disarms it on their next tick, which is what keeps it
+  //                      to a single frame — exactly what survev's own
+  //                      keysOld/keys edge gives a real key press.
+  //   heldInputs       — level. isBindDown reports true for as long as it's in
+  //                      the set; whoever adds it owns taking it back out.
+  //
+  // Anything that wants to observe the *user* has to read through
+  // realBindDown, or it will see our own synthetic input and feed back on
+  // itself — auto-quickswap's fire-edge detector being the live example.
+  let bindHookTarget = null;
+  let origIsBindDown = null;
+  let origIsBindPressed = null;
+  const pendingInputs = new Set();
+  const framePressInputs = new Set();
+  const heldInputs = new Set();
 
-  function autoSwapEnsureHook(binds) {
-    if (!binds || binds === autoSwapHookedDmk) return;
-    if (typeof binds.isBindPressed !== 'function') return;
-    const orig = binds.isBindPressed;
+  function ensureBindHook(binds) {
+    if (!binds || binds === bindHookTarget) return;
+    if (typeof binds.isBindPressed !== 'function' || typeof binds.isBindDown !== 'function') return;
+    const origPressed = binds.isBindPressed;
+    const origDown = binds.isBindDown;
     binds.isBindPressed = function(input) {
-      if (autoSwapPendingInputs.has(input)) {
-        autoSwapPendingInputs.delete(input);
+      if (framePressInputs.has(input)) return true;
+      if (pendingInputs.has(input)) {
+        pendingInputs.delete(input);
         return true;
       }
-      return orig.call(this, input);
+      return origPressed.call(this, input);
     };
-    autoSwapHookedDmk = binds;
+    binds.isBindDown = function(input) {
+      if (heldInputs.has(input)) return true;
+      return origDown.call(this, input);
+    };
+    origIsBindPressed = origPressed;
+    origIsBindDown = origDown;
+    bindHookTarget = binds;
+  }
+
+  // The user's own state of an input, with our synthetic layer bypassed.
+  function realBindDown(binds, input) {
+    if (!binds) return false;
+    try {
+      const fn = (binds === bindHookTarget && origIsBindDown) ? origIsBindDown : binds.isBindDown;
+      return typeof fn === 'function' && !!fn.call(binds, input);
+    } catch {
+      return false;
+    }
   }
 
   function autoSwapEmitInput(game, input) {
-    autoSwapEnsureHook(game?.[GAME_BINDS]);
-    autoSwapPendingInputs.add(input);
+    ensureBindHook(game?.[GAME_BINDS]);
+    pendingInputs.add(input);
+  }
+
+  // Press an input for the whole of the coming frame. The caller disarms it on
+  // its next tick — see framePressInputs above for why one-shot isn't enough
+  // for Fire.
+  function pressInputThisFrame(game, input) {
+    ensureBindHook(game?.[GAME_BINDS]);
+    framePressInputs.add(input);
+  }
+
+  // Hold or release an input at the level `on` asks for. The rising edge also
+  // presses it, so `shootStart` goes true on the first frame of a hold rather
+  // than only `shootHold` — a server that arms the trigger on the start flag
+  // then still sees the shot begin.
+  function setInputHeld(binds, input, on) {
+    ensureBindHook(binds);
+    if (!on) { heldInputs.delete(input); return; }
+    if (!heldInputs.has(input)) framePressInputs.add(input);
+    heldInputs.add(input);
   }
 
   // Edge-trigger on the user's Fire bind, whatever key/button that is.
@@ -2501,12 +3766,20 @@
       console.log(`[autoswap] skip: ${weapon} — ${why}`);
       return;
     }
+    autoSwapQueueAfterShot(game, me, weapon);
+  }
+
+  // Queue the post-shot swap for a slow gun. Shared by auto-quickswap, which
+  // triggers off the user's own trigger pull, and autoshoot, which triggers
+  // off its own — `log` is off for the latter, which would otherwise print a
+  // line per shot forever.
+  function autoSwapQueueAfterShot(game, me, weapon, log = true) {
     if (autoSwapOtherSlotHasGun(me)) {
       // Two-gun case: swap to the other gun. SwapWeapSlots/EquipOtherGun
       // resets gunSwitchCooldown so the other gun is ready as soon as
       // its own switchDelay elapses — beats waiting out the slow gun's
       // fireDelay.
-      console.log(`[autoswap] queued swap after ${weapon} shot`);
+      if (log) console.log(`[autoswap] queued swap after ${weapon} shot`);
       setTimeout(() => autoSwapEmitInput(game, AUTO_SWAP_INPUT_EQUIP_OTHER), AUTO_SWAP_FIRE_TO_SWAP_MS);
     } else {
       // Single-gun case: tap melee then return to the gun via
@@ -2516,7 +3789,7 @@
       // index the gun lives in. Stagger the two inputs by one tick
       // each so Fire/EquipMelee/EquipLastWeap each land on their own
       // server tick in order.
-      console.log(`[autoswap] queued melee-tap after ${weapon} shot`);
+      if (log) console.log(`[autoswap] queued melee-tap after ${weapon} shot`);
       setTimeout(() => autoSwapEmitInput(game, AUTO_SWAP_INPUT_EQUIP_MELEE), AUTO_SWAP_FIRE_TO_SWAP_MS);
       setTimeout(() => autoSwapEmitInput(game, AUTO_SWAP_INPUT_EQUIP_LAST), AUTO_SWAP_FIRE_TO_SWAP_MS * 2);
     }
@@ -2527,8 +3800,11 @@
       const game = capturedGame;
       const binds = game?.[GAME_BINDS];
       if (binds && typeof binds.isBindDown === 'function') {
-        autoSwapEnsureHook(binds);
-        const isDown = !!binds.isBindDown(AUTO_SWAP_INPUT_FIRE);
+        ensureBindHook(binds);
+        // The user's trigger, not ours — autoshoot holds the same input, and
+        // reading the wrapped method would make every burst it fires look
+        // like a fresh trigger pull.
+        const isDown = realBindDown(binds, AUTO_SWAP_INPUT_FIRE);
         // Gate the action, not the edge tracking: keeping `wasDown` current
         // while disabled means re-enabling mid-hold doesn't fire a swap off a
         // trigger pull that started before the toggle flipped.
@@ -2541,6 +3817,281 @@
     requestAnimationFrame(autoSwapFrameTick);
   }
   requestAnimationFrame(autoSwapFrameTick);
+
+  // ---------------------------------------------------------------------
+  // Autoshoot
+  // ---------------------------------------------------------------------
+  //
+  // Shoot exactly while the shot is on, and stop the moment it isn't. It rides
+  // on the aim helper: the aimbot decides where the crosshair points and
+  // whether that shot exists at all (direct or banked), and this only decides
+  // whether to pull. So it does nothing unless the aimbot is enabled and its
+  // key is held — without that the crosshair isn't on anyone and "can the
+  // enemy be hit" has no meaning.
+  //
+  // How it pulls depends on the gun, in three cases:
+  //
+  //   slow   — one shot, then the quickswap. A gun whose fireDelay is at or
+  //            over AUTO_SWAP.slowFireThreshold spends most of its time in
+  //            recovery, and swapping resets gunSwitchCooldown, so shot →
+  //            swap → shoot the other one beats waiting out the delay. Exactly
+  //            the trick auto-quickswap does off the user's trigger, driven
+  //            off ours instead. With two guns it alternates between them;
+  //            with one it taps melee and comes back.
+  //   auto    — hold the trigger. `fireMode: 'auto'` is the only case survev
+  //            reads `isBindDown(Fire)` for, and it keeps firing on its own.
+  //   press   — everything else: a press per shot, paced at the gun's
+  //            fireDelay, which is as fast as a semi-auto can go.
+  //
+  // Slow wins over auto where they overlap (the USAS at the default threshold,
+  // and more of them if it is dialled down), because the swap beats the wait
+  // either way. The press path covers auto guns too, incidentally: `shootStart`
+  // is built off `isBindPressed` regardless of fire mode.
+  //
+  // The AUTOSHOOT store itself lives up beside AIMBOT, for the same
+  // temporal-dead-zone reason: SETTINGS_SPECS binds a row to it.
+
+  // Guns with `fireMode: 'auto'`, transcribed from the gun defs in the
+  // definitions chunk (74 guns: 28 auto, 5 burst, 41 single — every one
+  // carries the field explicitly). Static for the same reason as
+  // GUN_BULLET_SPEED and the reflector table: the field lives on a
+  // bundle-private def, but the type string is on the entity, and type names
+  // are content rather than identifiers, so this survives re-mangling and only
+  // goes stale when survev ships new guns.
+  //
+  // Burst guns (an94, famas, m93r, m93r_dual, ump9) are deliberately absent —
+  // holding their trigger does nothing.
+  const GUN_AUTO = new Set([
+    'ak47', 'ash12', 'bar', 'colt45', 'colt45_dual', 'dp28', 'glock',
+    'glock_dual', 'groza', 'grozas', 'hk416', 'imbel', 'm1a1', 'm249',
+    'm4a1', 'mac10', 'mp5', 'pkp', 'potato_lmg', 'potato_smg', 'qbb97',
+    'saiga', 'scar', 'scorpion', 'spas16', 'usas', 'vector', 'vector45',
+  ]);
+
+  // Burst guns, from the same fireMode extraction as GUN_AUTO. They hold, the
+  // same as an automatic: a held trigger keeps a burst gun firing burst after
+  // burst, and the server paces the gap between them. (The client's dry-fire
+  // sound only consults `isBindDown` for `fireMode == 'auto'`, which is what
+  // the *sound* does, not what the gun does — firing is resolved server-side
+  // off shootStart/shootHold.) Holding also sidesteps the thing that makes
+  // pressing them awkward, which is that a press mid-burst restarts it.
+  //
+  // They are never slow, so they never reach the swap path: every one of them
+  // is in AUTO_SWAP_NEVER, which isSlowFireGun rejects outright.
+  const GUN_BURST = new Set(['an94', 'famas', 'm93r', 'm93r_dual', 'ump9']);
+  // How often to re-press a slow gun while waiting for it to actually go off.
+  // The press that fires it can't be the one that also queues the swap: after
+  // a swap the new gun still owes its switchDelay, and a press inside that
+  // window is silently dropped. Queueing the swap off it anyway would swap
+  // straight back off a gun that never fired, and the two guns would trade
+  // places forever without a shot between them. So we keep tapping until the
+  // magazine confirms a shot went out, and swap off *that*.
+  const AUTOSHOOT_SLOW_RETRY_MS = 50;
+  // Backstop for when the magazine can't be read at all: press, swap, and give
+  // the swap this long to land before trying again.
+  const AUTOSHOOT_SWAP_TIMEOUT_MS = 400;
+
+  const autoShootState = {
+    nextPressAt: 0,      // Date.now() before which we won't press again
+    weapon: '',          // the gun being tracked; a change retires all of this
+    ammoAtPress: null,   // magazine as of our press. Lower now means it fired
+    swapQueued: false,   // shot confirmed, swap on its way, stop pressing
+    swapDeadline: 0,     // ...but resume if the swap never lands
+  };
+
+  // What autoshoot should be doing this frame: null for nothing, otherwise
+  // 'hold' | 'press' | 'swap' plus the context the tick needs to act on it.
+  // The local player's gun and magazine, read every frame regardless of
+  // whether we intend to shoot.
+  //
+  // Tracking has to outlive the shoot decision. The plan below drops to null
+  // on any of eight conditions, and several of them flicker constantly
+  // mid-engagement — the aim wobbling a hair past tolerance, the target
+  // blinking out of a sample, a bank momentarily failing to validate. Folding
+  // the magazine reading into that meant a single such frame wiped it, and
+  // since the shot -> ammo-update round trip is three to six frames, one
+  // flicker anywhere in the window destroyed the very edge the swap triggers
+  // on. The gun would fire and then just sit there, which is precisely the
+  // "shoots and waits" failure.
+  function autoShootObserve() {
+    const game = capturedGame;
+    const me = game ? findLocalPlayerOnGame(game) : null;
+    if (!me) return null;
+    const weapon = getCurrentWeapon(me);
+    if (!weapon) return null;
+    const slots = me[PLAYER_LOC]?.[LOC_SLOTS];
+    const idx = me[PLAYER_LOC]?.[LOC_CURIDX];
+    const cur = (Array.isArray(slots) && Number.isFinite(idx)) ? slots[idx] : null;
+    const ammo = (cur && Number.isFinite(cur.ammo)) ? cur.ammo : null;
+    return { game, me, weapon, ammo };
+  }
+
+  function autoShootPlan(obs) {
+    if (!AUTOSHOOT.enabled || !AIMBOT.enabled || !aimHeld || !obs) return null;
+    const { game, me, weapon, ammo } = obs;
+
+    // Has to be a gun at all. This is also what keeps the single-gun swap from
+    // eating itself: that path taps melee on the way round, and a Fire press
+    // with a melee equipped is a swing, not a shot.
+    if (GUN_FIRE_DELAY[weapon] === undefined) return null;
+
+    // A reload in progress is not a reason to hold off: firing cancels it, and
+    // rounds already in the magazine are worth more right now than the ones
+    // being loaded. That covers the shell-by-shell shotgun reload, where every
+    // shell that lands is immediately shootable, and the tactical reload of a
+    // part-full magazine, where all of it is.
+    //
+    // If the server treats the first press as cancel-only and fires on the
+    // next, nothing here needs to care: 'hold' keeps shootHold up, and both
+    // press paths come back within a frame or AUTOSHOOT_SLOW_RETRY_MS.
+    //
+    // The magazine being *empty* is the one case that still holds off, and it
+    // has to. Interrupting an empty gun's reload cancels it, leaves us with
+    // nothing to fire, and the auto-reload starts over — press again and the
+    // gun never reloads at all. So this single check is what keeps
+    // "interrupt reloads" from meaning "never finish one".
+    if (ammo != null && ammo <= 0) return null;
+
+    const sample = pageSamples[pageSamples.length - 1];
+    if (!sample || aimState.targetId == null) return null;
+    const enemy = sample.enemies.find((e) => e.id === aimState.targetId);
+    // Same linger rule the aim uses, so the trigger doesn't quit on a body the
+    // aim is still tracking.
+    if (!isEngageable(enemy, Date.now())) return null;
+    const self = liveSelf(sample);
+    if (!self || !canInteract(self.layer, enemy.layer)) return null;
+
+    // "Can be hit" is the aim solver's own answer: a clear direct line, or a
+    // bounce it found. Blocked with no bounce means hold fire.
+    const shot = reactionTarget(self, enemy, Date.now());
+    if (shot.blocked) return null;
+
+    // And the crosshair has to have actually arrived. The aim glides toward
+    // the solution at `followFraction` a frame, so early in an engagement the
+    // shot exists but we are not yet pointing at it. The tolerance is the
+    // target's own angular radius at the range the bullet travels — for a
+    // bank that is the whole path length, which is the right denominator,
+    // since the far leg is what has to land.
+    const dx = shot.x - shot.fromX;
+    const dy = shot.y - shot.fromY;
+    const dist = Math.hypot(dx, dy);
+    const tol = Math.atan2(PLAYER_RADIUS, Math.max(dist, PLAYER_RADIUS));
+    if (Math.abs(angleDelta(aimState.theta, Math.atan2(dy, dx))) > tol) return null;
+
+    const mode = isSlowFireGun(weapon) ? 'swap'
+      : (GUN_AUTO.has(weapon) || GUN_BURST.has(weapon)) ? 'hold'
+      : 'press';
+    return { mode, weapon, ammo, game, me };
+  }
+
+  function autoShootStep() {
+    // Retire last frame's press before deciding on this one. Ours is the tick
+    // that arms it, so ours is the tick that has to take it back down — that
+    // is what makes a synthetic press exactly one frame wide, the same width
+    // survev's own keysOld/keys edge gives a real one.
+    framePressInputs.delete(AUTO_SWAP_INPUT_FIRE);
+
+    const obs = autoShootObserve();
+    const now = Date.now();
+
+    // A different weapon retires everything the last one had going: its
+    // pacing, its pending swap, and its magazine reading. This is the *only*
+    // thing that resets tracking — deliberately, since anything that resets on
+    // a bad frame loses the shot we are waiting to see.
+    if (!obs || obs.weapon !== autoShootState.weapon) {
+      autoShootState.weapon = obs ? obs.weapon : '';
+      autoShootState.ammoAtPress = null;
+      autoShootState.swapQueued = false;
+      autoShootState.nextPressAt = 0;
+    }
+
+    let plan = null;
+    try {
+      plan = autoShootPlan(obs);
+    } catch {}
+
+    const binds = capturedGame?.[GAME_BINDS];
+    // Only the hold path leaves the trigger down. The other two work in
+    // presses and must not also be holding it, or an auto gun that counts as
+    // slow would keep firing straight through its own swap.
+    if (binds) setInputHeld(binds, AUTO_SWAP_INPUT_FIRE, plan?.mode === 'hold');
+    else heldInputs.delete(AUTO_SWAP_INPUT_FIRE);
+
+    // Did the shot we pressed for actually go out? The magazine says so, and
+    // it is checked against the reading taken at the press rather than against
+    // the previous frame, so a gap in the readings can't swallow the drop.
+    // This runs off `obs`, not off the plan: once we have pulled the trigger
+    // we are committed, and whether the crosshair is still exactly on target
+    // three frames later has no bearing on whether to leave the gun we just
+    // emptied a round out of.
+    if (obs && autoShootState.ammoAtPress != null && obs.ammo != null
+        && obs.ammo < autoShootState.ammoAtPress) {
+      autoShootState.ammoAtPress = null;
+      if (isSlowFireGun(obs.weapon) && !autoShootState.swapQueued) {
+        // Swapping resets gunSwitchCooldown, so the other gun beats this one's
+        // recovery. With one gun this taps melee and comes straight back.
+        autoSwapQueueAfterShot(obs.game, obs.me, obs.weapon, false);
+        autoShootState.swapQueued = true;
+        autoShootState.swapDeadline = now + AUTOSHOOT_SWAP_TIMEOUT_MS;
+      }
+    }
+
+    // ...and don't wait on a swap forever. If it never lands — the input got
+    // dropped, the other slot turned out to be empty — go back to shooting the
+    // gun we have rather than standing there holding it.
+    if (autoShootState.swapQueued && now > autoShootState.swapDeadline) {
+      autoShootState.swapQueued = false;
+    }
+
+    // Nothing to press: an auto gun paces itself, and no plan means no shot.
+    // Clearing the gate means the first shot of the next engagement goes out
+    // on the frame it becomes available rather than waiting out a stale timer.
+    if (!plan || plan.mode === 'hold') {
+      autoShootState.nextPressAt = 0;
+      return;
+    }
+    if (autoShootState.swapQueued) return;
+    if (now < autoShootState.nextPressAt) return;
+
+    pressInputThisFrame(plan.game, AUTO_SWAP_INPUT_FIRE);
+    // Remember the magazine as it was *before* this shot, and don't overwrite
+    // it on the retries that follow — the drop is measured from the first
+    // press of the volley, not the most recent one.
+    if (autoShootState.ammoAtPress == null) autoShootState.ammoAtPress = plan.ammo;
+
+    if (plan.mode === 'swap') {
+      // Keep tapping until the shot registers. Without a readable magazine
+      // there is nothing to wait for, so fall back to firing once, swapping,
+      // and giving that a while to land.
+      if (plan.ammo == null) {
+        autoSwapQueueAfterShot(plan.game, plan.me, plan.weapon, false);
+        autoShootState.swapQueued = true;
+        autoShootState.swapDeadline = now + AUTOSHOOT_SWAP_TIMEOUT_MS;
+        autoShootState.nextPressAt = now + AUTOSHOOT_SWAP_TIMEOUT_MS;
+      } else {
+        autoShootState.nextPressAt = now + AUTOSHOOT_SLOW_RETRY_MS;
+      }
+    } else {
+      // A press per frame. Pacing it at the fireDelay instead looks tidier and
+      // is measurably slower: a press the gun isn't ready for is dropped, and
+      // if that press has already moved the gate forward a whole cycle, the
+      // *next* one lands a cycle late — a 130ms gun ends up firing every
+      // 224ms. Pressing freely costs nothing, since the server ignores what it
+      // can't honour, and adds no packets either: the aim is rewriting the
+      // input message every frame during an engagement anyway.
+      autoShootState.nextPressAt = 0;
+    }
+  }
+
+  function autoShootFrameTick() {
+    try {
+      autoShootStep();
+    } catch {
+      heldInputs.delete(AUTO_SWAP_INPUT_FIRE);
+    }
+    requestAnimationFrame(autoShootFrameTick);
+  }
+  requestAnimationFrame(autoShootFrameTick);
 
   // ---------------------------------------------------------------------
   // Netcode smoothing: kill the stutter survev shows on a jittery link.
@@ -2581,6 +4132,12 @@
   //      Numbering by arrival is exact here: survev runs over a WebSocket, so
   //      TCP guarantees no loss and no reordering, and the arrival count *is*
   //      the tick index. That would not hold over UDP.
+  //
+  //      Aim direction arrives in the same packet, so it is snapshotted with
+  //      the position and played back off the same pair on the same clock —
+  //      as an angle along the shortest arc rather than as a vector, and
+  //      stopping at the newest snapshot rather than turning past it. See
+  //      renderDirOnClock for why it differs from the position path.
   //
   //   B. A jitter-buffered window for everything that is not a player — loot,
   //      obstacles, projectiles, the gas circle. Those still go through
@@ -2710,6 +4267,32 @@
     ready: false,
   };
 
+  // The last few arrivals, kept verbatim so the HUD can report how far the fit
+  // actually sits from the packets it is fit to. A ring of raw (n, t) rather
+  // than a running sum of squares because the residual worth showing is against
+  // the *current* slope, not against whatever the slope happened to be at the
+  // moment each packet landed — the latter conflates fit error with the fit's
+  // own convergence.
+  const CLOCK_RESID_CAP = 60;     // ~3s of arrivals at 20Hz
+  const clockResid = {
+    n: new Float64Array(CLOCK_RESID_CAP),
+    t: new Float64Array(CLOCK_RESID_CAP),
+    len: 0,
+    head: 0,                      // next slot to overwrite
+  };
+
+  // RMS of (arrival time - pseudotime) over the retained arrivals: the spread
+  // the clock is smoothing out, in ms. Null until the fit is usable.
+  function clockJitterMs() {
+    if (!netClock.ready || !clockResid.len) return null;
+    let sum = 0;
+    for (let i = 0; i < clockResid.len; i++) {
+      const d = clockResid.t[i] - pseudotimeOf(clockResid.n[i]);
+      sum += d * d;
+    }
+    return Math.sqrt(sum / clockResid.len);
+  }
+
   function resetNetClock() {
     netClock.n = 0;
     netClock.count = 0;
@@ -2720,6 +4303,8 @@
     netClock.cnt = 0;
     netClock.slope = 0;
     netClock.ready = false;
+    clockResid.len = 0;
+    clockResid.head = 0;
     // Packet indices restart, so every retained snapshot's index now points at
     // the wrong pseudotime. (Declared below, beside the ring it indexes.)
     netSnapsById.clear();
@@ -2728,6 +4313,10 @@
   // Fold one arrival into the clock. Called once per update packet.
   function clockOnPacket(nowMs) {
     const n = netClock.n++;
+    clockResid.n[clockResid.head] = n;
+    clockResid.t[clockResid.head] = nowMs;
+    clockResid.head = (clockResid.head + 1) % CLOCK_RESID_CAP;
+    if (clockResid.len < CLOCK_RESID_CAP) clockResid.len++;
     // `clockHalfLife` is live-tunable. Moments already banked stay weighted as
     // the old horizon banked them, so a slider move re-converges over a few
     // half-lives rather than landing instantly. The slope is a ratio of two
@@ -2800,6 +4389,14 @@
       if (!st) continue;
       const pos = player[PLAYER_NET]?.[PLAYER_POS];
       if (!pos || typeof pos.x !== 'number' || typeof pos.y !== 'number') continue;
+      // Aim direction rides along in the same snapshot: it arrives in the same
+      // packet as the position, so it belongs on the same tick index and gets
+      // played back on the same clock. Recorded as null when the packet had no
+      // usable dir, which makes the pair unusable and drops that player's dir
+      // back to the game's own lerp for as long as it lasts.
+      const dir = player[PLAYER_NET]?.[PLAYER_DIR];
+      const haveDir = dir && typeof dir.x === 'number' && typeof dir.y === 'number'
+        && (dir.x !== 0 || dir.y !== 0);
       // The pool hands the same Player object to a new entity when the old one
       // is released, so a ring is only this id's history from the tick the id
       // last changed. Without the reset the first snapshot pair after a recycle
@@ -2818,7 +4415,13 @@
       // out of the pool for a while, so the pair straddling the gap would
       // report the whole absence as one tick of movement.
       if (last && (last.n > idx || idx - last.n > NET_SNAP_CAP)) st.snaps.length = 0;
-      st.snaps.push({ n: idx, x: pos.x, y: pos.y });
+      st.snaps.push({
+        n: idx,
+        x: pos.x,
+        y: pos.y,
+        dx: haveDir ? dir.x : null,
+        dy: haveDir ? dir.y : null,
+      });
       if (st.snaps.length > NET_SNAP_CAP) st.snaps.shift();
     }
   }
@@ -2845,6 +4448,51 @@
     const w1 = (nowMs - t2) / d;
     const w2 = (t1 - nowMs) / d;
     return { x: p1.x * w1 + p2.x * w2, y: p1.y * w1 + p2.y * w2 };
+  }
+
+  // Aim direction on the recovered clock — the same two-snapshot playback as
+  // renderOnClock, with two departures.
+  //
+  // It stops at the newest snapshot: `t` is capped at 1, so the rotation never
+  // turns past a direction the server has actually sent. A stall holds the
+  // last real direction rather than continuing the turn through it. Nothing is
+  // lost in the steady state — the renderer already sits half a tick behind
+  // the newest snapshot, so the cap only engages once the data has run out —
+  // and it costs nothing on the way back in, because holding an angle and then
+  // resuming from it is a rate change, not the position path's positional
+  // snap. The lower end is left open: `t` below 0 runs the same segment
+  // backwards, which is continuous with the rest of the arc.
+  //
+  // And it interpolates the *angle*, not the vector. Lerping the two direction
+  // vectors componentwise and taking the atan2 of the result sweeps at a
+  // non-constant rate (fast at the ends, slow in the middle) and collapses
+  // entirely when a player spins ~180° in one tick: the interpolant passes
+  // through the origin and the angle it reports there is arbitrary. Walking
+  // the arc from a1 to a2 turns at a constant rate and has no degenerate pair.
+  //
+  // Returns null under the same conditions as renderOnClock, plus a pair with
+  // no usable direction on either end — the caller falls back to the game's
+  // own dir lerp.
+  function renderDirOnClock(st, nowMs) {
+    if (!netClock.ready) return null;
+    const s = st.snaps;
+    if (s.length < 2) return null;
+    const p1 = s[s.length - 2];
+    const p2 = s[s.length - 1];
+    if (p1.dx == null || p2.dx == null) return null;
+    const t1 = pseudotimeOf(p1.n);
+    const t2 = pseudotimeOf(p2.n);
+    const d = t2 - t1;
+    if (!d) return null;
+    const t = Math.min((nowMs - t1) / d, 1);
+    const a1 = Math.atan2(p1.dy, p1.dx);
+    const a2 = Math.atan2(p2.dy, p2.dx);
+    // Shortest arc: wrap the tick's turn into (-pi, pi] so a turn across the
+    // ±pi seam goes the short way round rather than the long way back.
+    let delta = a2 - a1;
+    delta -= Math.PI * 2 * Math.floor((delta + Math.PI) / (Math.PI * 2));
+    const a = a1 + delta * t;
+    return { x: Math.cos(a), y: Math.sin(a) };
   }
 
   // Swap the camera's interpolation-window field for an accessor: the game
@@ -2905,11 +4553,22 @@
     st.haveOut = true;
   }
 
-  // Replace a Player's interpolated-position field with an accessor. It has to
-  // be per-instance: survev declares it as a class field, so every Player gets
-  // its own data property that would shadow anything installed on the
-  // prototype (the same reason the constructor setter traps stopped firing —
-  // see the capture notes at the top of this file).
+  // Same, for the rendered aim direction — the field the body sprite's
+  // rotation is taken from. The game assigns it in the same per-frame block as
+  // the position (and skips the assignment for the local player when it is
+  // aiming straight off the mouse), so driving it from the setter keeps our
+  // playback exactly where the game's own lerp sat.
+  function updatePlayerDirSmoothing(st, base) {
+    st.dirOut = renderDirOnClock(st, renderNowMs()) || base;
+    st.haveDirOut = true;
+  }
+
+  // Replace a Player's interpolated position and direction fields with
+  // accessors. It has to be per-instance: survev declares them as class
+  // fields, so every Player gets its own data property that would shadow
+  // anything installed on the prototype (the same reason the constructor
+  // setter traps stopped firing — see the capture notes at the top of this
+  // file).
   function installPlayerSmoothing(player) {
     if (!player || netSmoothState.has(player)) return;
     let desc;
@@ -2923,7 +4582,10 @@
       base: player[PLAYER_POS2] || { x: 0, y: 0 },
       out: null,
       haveOut: false,
-      snaps: [],            // [{ n, x, y }] positions tagged by packet index
+      dirBase: (PLAYER_DIR2 && player[PLAYER_DIR2]) || { x: 1, y: 0 },
+      dirOut: null,
+      haveDirOut: false,
+      snaps: [],            // [{ n, x, y, dx, dy }] pos+dir tagged by packet index
       id: 0,                // entity id the ring belongs to; see snapshotPlayers
     };
     try {
@@ -2950,6 +4612,35 @@
     } catch {
       return;
     }
+    // The direction hook is optional: an older mangled.js has no `dirAlt`
+    // entry, and the position smoothing above is still worth having on its
+    // own. A failure here leaves dir on stock behaviour, nothing else.
+    if (PLAYER_DIR2) {
+      try {
+        const dirDesc = Object.getOwnPropertyDescriptor(player, PLAYER_DIR2);
+        if (!dirDesc || dirDesc.configurable) {
+          Object.defineProperty(player, PLAYER_DIR2, {
+            configurable: true,
+            enumerable: true,
+            get() {
+              return (NETCODE.enabled && st.haveDirOut) ? st.dirOut : st.dirBase;
+            },
+            set(v) {
+              st.dirBase = v;
+              if (!NETCODE.enabled || !v) {
+                st.haveDirOut = false;
+                return;
+              }
+              try {
+                updatePlayerDirSmoothing(st, v);
+              } catch {
+                st.haveDirOut = false;
+              }
+            },
+          });
+        }
+      } catch {}
+    }
     netSmoothState.set(player, st);
     netStats.playersHooked++;
   }
@@ -2974,6 +4665,229 @@
       for (const player of players) installPlayerSmoothing(player);
     } catch {}
   }
+
+  // ---------------------------------------------------------------------
+  // Enemy name tags.
+  //
+  // survev already builds the label. Every Player owns a `nameText` — a
+  // PIXI.Text child of its own container, anchored under the sprite — and the
+  // per-frame player update fills it in for *everyone*:
+  //
+  //     this.nameText.text = info.name;
+  //     this.nameText.visible = !isActivePlayer && sameGroup;
+  //
+  // then shows it only for teammates. So an enemy's tag is already built,
+  // already carrying the right name, and already following the sprite through
+  // zoom, layer and death; the single thing between it and the screen is that
+  // `visible` assignment. Taking that over rather than drawing labels of our
+  // own is what makes the enemy tag pixel-identical to the teammate one, and
+  // it costs one property read per player per frame.
+  //
+  // `nameText` is one of the names survev leaves readable (like `playerPool`
+  // and `pings`), so none of this needs a mangled.js entry.
+  //
+  // The hook is an accessor on the Text instance, not a write from our own
+  // tick, for ordering: the game assigns `visible` once per frame per player,
+  // in the same update that assigns the interpolated position, and our sample
+  // loop is not ordered against that — anything we wrote would be overwritten
+  // before the next render about half the time. The accessor ORs our decision
+  // onto the game's, so the local player's own name stays hidden, a teammate
+  // stays visible for the game's own reason, and turning the toggle off
+  // restores stock behaviour on the very next assignment.
+  // ---------------------------------------------------------------------
+
+  // Enemies get the ESP overlay's enemy red, so the two features read as one
+  // thing rather than as two different opinions about who is dangerous. The
+  // ally fill is read off the label itself and this is only the fallback for
+  // when that read fails — it is the cyan the bundle's own text style ships.
+  const NAME_TAG_ENEMY_FILL = 0xff3c3c;
+  const NAME_TAG_ALLY_FILL = 0x00ffff;
+
+  // nameText (PIXI.Text) -> { base, enemy, fill, allyFill }
+  const nameTagState = new WeakMap();
+  // How many labels we have taken over. A WeakMap has no size, and the tick
+  // needs to know whether there is anything to hand back once the feature is
+  // switched off — see nameTagTick.
+  let nameTagsHooked = 0;
+
+  // Replace a name label's `visible` with an accessor. Per-instance, like the
+  // netcode hooks above — `visible` is an own data property on every PIXI v7
+  // DisplayObject, so a prototype install would be shadowed. If a future PIXI
+  // makes it a prototype accessor (v8 does), the underlying setter is called
+  // with the effective value instead of being replaced, so the renderer keeps
+  // whatever bookkeeping it hangs off the write.
+  function installNameTag(text) {
+    if (!text || nameTagState.has(text)) return nameTagState.get(text) || null;
+
+    let proto = null;
+    try {
+      for (let o = Object.getPrototypeOf(text); o && !proto; o = Object.getPrototypeOf(o)) {
+        const d = Object.getOwnPropertyDescriptor(o, 'visible');
+        if (d && (d.get || d.set)) proto = d;
+      }
+      const own = Object.getOwnPropertyDescriptor(text, 'visible');
+      if (own && !own.configurable) return null;
+    } catch {
+      return null;
+    }
+
+    const st = {
+      base: !!text.visible,   // what the game last asked for
+      eff: !!text.visible,    // what we let the renderer see
+      enemy: false,
+      // Whatever fill the label was built with, so switching a recycled entity
+      // back to a teammate restores the game's colour rather than our idea of it.
+      allyFill: safeRead(text.style, 'fill') ?? NAME_TAG_ALLY_FILL,
+      fill: safeRead(text.style, 'fill') ?? NAME_TAG_ALLY_FILL,
+    };
+    const apply = function (self) {
+      st.eff = st.base || (NAME_TAGS.enabled === 1 && st.enemy);
+      if (proto?.set) proto.set.call(self, st.eff);
+    };
+    try {
+      Object.defineProperty(text, 'visible', {
+        configurable: true,
+        enumerable: true,
+        get() {
+          return proto?.get ? proto.get.call(this) : st.eff;
+        },
+        set(v) {
+          st.base = !!v;
+          apply(this);
+        },
+      });
+    } catch {
+      return null;
+    }
+    st.apply = apply;
+    nameTagState.set(text, st);
+    nameTagsHooked++;
+    return st;
+  }
+
+  // Recolour a label, but only when the colour actually changes: assigning to
+  // a TextStyle field bumps its styleID and makes PIXI re-render the text
+  // texture, which is not something to do every frame per player.
+  function paintNameTag(text, st) {
+    // Gated on the toggle as well as on the side, so switching the feature off
+    // hands the label back exactly as it was found rather than leaving a red
+    // one hidden behind a `visible` we no longer force.
+    const want = (NAME_TAGS.enabled === 1 && st.enemy) ? NAME_TAG_ENEMY_FILL : st.allyFill;
+    if (st.fill === want) return;
+    st.fill = want;
+    try { text.style.fill = want; } catch {}
+  }
+
+  // Called from the sample loop: hook every live label and refresh which of
+  // them belong to enemies. Side-agnostic work only — whether the tag is
+  // *shown* is decided in the accessor above, on the game's own clock.
+  function nameTagTick(game) {
+    if (!game) return;
+    // Nothing is hooked while the feature is switched off, so a session that
+    // turns it off gets no accessor on any label built afterwards. Once hooked
+    // they stay, and the tick keeps running while disabled so a live
+    // toggle-off hands every label back instead of leaving it forced on.
+    if (NAME_TAGS.enabled !== 1 && nameTagsHooked === 0) return;
+    try {
+      const roster = findRosterOnGame(game) || game?.[GAME_ROSTER];
+      const pool = roster?.playerPool;
+      if (!pool || typeof pool[POOL_GETALL] !== 'function') return;
+      // Who we are. Without a local player at all there is no side to be on,
+      // and "everyone is an enemy" — the sampler's reading of that state —
+      // would put a red tag under our own sprite, so that case waits; it is
+      // one tick. A *missing id* on a local player we do have is not a reason
+      // to stop: the pool holds us too, and object identity excludes us from
+      // our own tags without needing `__id` to have arrived.
+      const me = findLocalPlayerOnGame(game) || game?.[GAME_LOCAL];
+      if (!me) return;
+      const selfId = Number(me.__id ?? me.playerId ?? 0) || null;
+      let selfInfo = null;
+      try { selfInfo = selfId != null ? roster.getPlayerInfo?.(selfId) ?? null : null; } catch {}
+
+      for (const player of pool[POOL_GETALL]() || []) {
+        const text = player?.nameText;
+        if (!text) continue;
+        const st = nameTagState.get(text) || (NAME_TAGS.enabled === 1 ? installNameTag(text) : null);
+        if (!st) continue;
+        // Pool entries are recycled, so this is re-derived every tick rather
+        // than latched at install: the object that held an enemy last round
+        // can hold a squadmate in the next one.
+        let info = null;
+        const id = Number(player.__id ?? 0) || null;
+        if (id != null) { try { info = roster.getPlayerInfo?.(id) ?? null; } catch {} }
+        // Identity first, id second: `player !== me` is the half that cannot
+        // be defeated by a missing or late `__id`, and the id comparison only
+        // has to catch a local player the walk found under a different object.
+        //
+        // With no info for ourselves there is no way to tell a squadmate from
+        // an enemy, and isHostileTo's "assume hostile" — right for the sampler,
+        // which would rather log a teammate than miss a foe — would paint the
+        // squad red. So nothing is an enemy until that resolves. The hooks are
+        // still installed, which is what keeps this distinguishable in
+        // __nameTagDiag from the tick never having run.
+        st.enemy = Boolean(player.active) && player !== me
+          && (selfId == null || id !== selfId)
+          && selfInfo != null && isHostileTo(selfInfo, info);
+        paintNameTag(text, st);
+        // The toggle can flip between two of the game's assignments; re-run the
+        // decision now so it takes effect on this frame rather than the next one.
+        st.apply?.(text);
+      }
+    } catch {}
+  }
+
+  // Why isn't a name showing? Every step of the path in one object: whether
+  // the tick can reach the pool at all, who it thinks we are, and — per live
+  // player — what the label holds and what the renderer is being told about
+  // it. The last four fields are the ones that separate "we never forced it
+  // visible" from "we did and something above it is hidden anyway".
+  window.__nameTagDiag = () => {
+    const game = capturedGame;
+    const roster = game ? (findRosterOnGame(game) || game[GAME_ROSTER]) : null;
+    const pool = roster?.playerPool;
+    const players = (pool && typeof pool[POOL_GETALL] === 'function' ? pool[POOL_GETALL]() : []) || [];
+    const me = game ? (findLocalPlayerOnGame(game) || game[GAME_LOCAL]) : null;
+    const selfId = Number(me?.__id ?? me?.playerId ?? 0) || null;
+    const live = players.filter((p) => p && p.active);
+    const infoOf = (id) => { try { return roster?.getPlayerInfo?.(id) ?? null; } catch { return null; } };
+    return {
+      enabled: NAME_TAGS.enabled === 1,
+      gameCaptured: !!game,
+      rosterFound: !!roster,
+      poolFound: !!pool,
+      pooled: players.length,
+      live: live.length,
+      selfFound: !!me,
+      selfId,
+      selfGroupId: infoOf(selfId)?.groupId ?? null,
+      hooked: nameTagsHooked,
+      // A live player with no `nameText` is the one failure that needs a code
+      // change rather than a setting: it means the bundle stopped calling the
+      // label that, and the hook has nothing to attach to.
+      missingLabel: live.filter((p) => !p.nameText).length,
+      players: live.map((p) => {
+        const text = p.nameText;
+        const st = text ? nameTagState.get(text) : null;
+        return {
+          id: p.__id,
+          name: infoOf(p.__id)?.name ?? null,
+          self: p === me,
+          hooked: !!st,
+          enemy: st ? st.enemy : null,
+          gameWants: st ? st.base : null,   // what the game last assigned
+          visible: text ? text.visible : null,  // what the renderer reads
+          text: text ? text.text : null,
+          fill: text ? safeRead(text.style, 'fill') : null,
+          // A label can be visible and still not draw: PIXI walks up the
+          // parents, so an unparented label or a hidden player container
+          // hides it regardless.
+          parented: text ? !!text.parent : null,
+          containerVisible: safeRead(p.container, 'visible') ?? null,
+          worldVisible: text ? text.worldVisible : null,
+        };
+      }),
+    };
+  };
 
   // ---------------------------------------------------------------------
   // Ping readout, pinned above the team panel in the top-left HUD.
@@ -3086,18 +5000,28 @@
     if (!el) return;
     const ms = medianPingMs();
     pingState.currentMs = ms;
+
+    // Clock readout beside the ping: the fitted tick period (slope of the
+    // pseudotime model, ms per packet) and the RMS arrival-vs-pseudotime
+    // residual, i.e. how much jitter the fit is absorbing. Both blank until
+    // the clock has converged.
+    const jitter = clockJitterMs();
+    const clockTxt = netClock.ready
+      ? ` · ${netClock.slope.toFixed(2)} ms/tick${jitter == null ? '' : ` · ±${jitter.toFixed(1)} ms`}`
+      : '';
+
     if (ms == null) {
       // In a match but no acked input yet — say so rather than showing a stale
       // or invented number.
       el.style.display = 'flex';
       pingState.dot.style.background = '#7f8c8d';
-      pingState.text.textContent = '– ms';
+      pingState.text.textContent = `– ms${clockTxt}`;
       return;
     }
     el.style.display = 'flex';
     pingState.dot.style.background =
       ms < PING_GOOD_MS ? '#2ecc71' : ms < PING_OK_MS ? '#f1c40f' : '#e74c3c';
-    pingState.text.textContent = `${Math.round(ms)} ms`;
+    pingState.text.textContent = `${Math.round(ms)} ms${clockTxt}`;
   }
 
   // ---------------------------------------------------------------------
@@ -3262,12 +5186,10 @@
     const enemies = sample.enemies;
     if (!player || !enemies || !enemies.length) return null;
 
-    if (aimHeld && aimState.targetId != null) {
-      const committed = enemies.find((e) => e.id === aimState.targetId);
-      if (committed && !committed.dead && canInteract(player.layer, committed.layer)) return committed;
-    }
-
-    // Otherwise compute fresh best-by-mouse-distance with no commitment.
+    // Nearest the cursor, recomputed every frame — the same rule pickTarget
+    // uses, so the green ring marks whoever the aim helper would engage. It
+    // says nothing about whether there is a shot on them; that is what the
+    // ring's fade is for.
     const scale = getLivePxPerWorldUnit(sample);
     let mwx, mwy;
     if (realMouse.hasMoved) {
@@ -3277,11 +5199,11 @@
       mwx = player.x;
       mwy = player.y;
     }
+    const now = Date.now();
     let best = null;
     let bestScore = Infinity;
     for (const e of enemies) {
-      if (e.dead) continue;
-      if (e.name === "VERY BAD AT GAME") continue;
+      if (!isEngageable(e, now)) continue;
       if (isSpoofedEnemy(e.id, pageSamples)) continue;
       if (!canInteract(player.layer, e.layer)) continue;
       const p = livePos(e.id, e);
@@ -3294,6 +5216,31 @@
       }
     }
     return best;
+  }
+
+  // Whether there is a shot on this enemy at all, and the bounce it took to
+  // get one. All of it comes from `reactionTarget`, so the ring is showing the
+  // state of the shot the aimbot would actually take — and a bankable enemy
+  // counts as having one, because it does.
+  //
+  // Returns { blocked, fade, bank }: `fade` is ESP.blockedAlpha when blocked
+  // and 1 otherwise; `bank` is the solution to draw, or null. `blocked` false
+  // is the default whenever the answer can't be worked out (dimming is a
+  // display aid, and guessing "no shot" would hide enemies).
+  const CLEAR_SHOT_STATE = { blocked: false, fade: 1, bank: null };
+  function shotState(self, enemy, now) {
+    if (!ESP.losDim || !self || !enemy) return CLEAR_SHOT_STATE;
+    try {
+      const shot = reactionTarget(self, enemy, now);
+      if (!Number.isFinite(shot.x) || !Number.isFinite(shot.fromX)) return CLEAR_SHOT_STATE;
+      return {
+        blocked: shot.blocked,
+        fade: shot.blocked ? ESP.blockedAlpha : 1,
+        bank: shot.bank,
+      };
+    } catch {
+      return CLEAR_SHOT_STATE;
+    }
   }
 
   function overlayFrame() {
@@ -3327,12 +5274,19 @@
       const targetId = target ? target.id : null;
       const cx = window.innerWidth / 2;
       const cy = window.innerHeight / 2;
+      const losSelf = liveSelf(sample);
+      const losNow = Date.now();
 
       // Draw a ring around every live enemy so the user can see threats at a
       // glance. The current aim target is drawn last in green so it stays on top.
       // Downed players get a yellow ring. Enemies on a layer we can't reach
       // (e.g. they're in a bunker while we're aboveground) are dimmed to
-      // alpha=0.5 to signal that they're not lockable.
+      // UNREACHABLE_ALPHA, and enemies whose shot line is walled off with no
+      // bounce available are dimmed to the same level by default (a bank
+      // counts as a shot, so those stay bright — see shotState). Either way a
+      // ring with no shot behind it gets no connecting line: the line means
+      // "this one is takeable", so drawing a faded one would say the opposite
+      // twice over.
       for (const e of sample.enemies) {
         if (e.dead) continue;
         if (isSpoofedEnemy(e.id, pageSamples)) continue;
@@ -3341,46 +5295,59 @@
         const sx = cx + (ei.x - pi.x) * scale;
         const sy = cy - (ei.y - pi.y) * scale;
         const reachable = canInteract(player.layer, e.layer);
+        const st = reachable ? shotState(losSelf, e, losNow) : CLEAR_SHOT_STATE;
+        const shootable = reachable && !st.blocked;
         const colorRgb = e.downed ? '255, 220, 40' : '255, 60, 60';
-        const ringAlpha = reachable ? 1 : 0.5;
-        const lineAlpha = reachable ? 0.6 : 0.3;
-        const ringColor = `rgba(${colorRgb}, ${ringAlpha})`;
-        const lineColor = `rgba(${colorRgb}, ${lineAlpha})`;
+        const ringAlpha = (reachable ? 1 : UNREACHABLE_ALPHA) * st.fade;
         ctx.lineWidth = 4;
-        ctx.strokeStyle = ringColor;
+        ctx.strokeStyle = `rgba(${colorRgb}, ${ringAlpha})`;
         ctx.beginPath();
         ctx.arc(sx, sy, radius, 0, Math.PI * 2);
         ctx.stroke();
 
-        // Line from player (center) to enemy
-        ctx.lineWidth = 3;
-        ctx.strokeStyle = lineColor;
-        ctx.beginPath();
-        ctx.moveTo(cx, cy);
-        ctx.lineTo(sx, sy);
-        ctx.stroke();
+        if (shootable) {
+          ctx.lineWidth = 3;
+          ctx.strokeStyle = `rgba(${colorRgb}, 0.6)`;
+          ctx.beginPath();
+          ctx.moveTo(cx, cy);
+          ctx.lineTo(sx, sy);
+          ctx.stroke();
+        }
       }
 
       if (target) {
         const ti = overlayPos(target.id, target.x, target.y);
         const sx = cx + (ti.x - pi.x) * scale;
         const sy = cy - (ti.y - pi.y) * scale;
+        const st = shotState(losSelf, target, losNow);
+        const blockFade = st.fade;
 
         ctx.lineWidth = 4;
-        ctx.strokeStyle = 'rgba(64, 255, 89, 0.95)';
+        ctx.strokeStyle = `rgba(64, 255, 89, ${0.95 * blockFade})`;
         ctx.beginPath();
         ctx.arc(sx, sy, radius, 0, Math.PI * 2);
         ctx.stroke();
 
-        // Line from player (center) to aim target
+        // The path the shot actually takes — and only when there is one, same
+        // rule as the enemy rings above. A bank shot is drawn as its two legs,
+        // bent at the surface it bounces off, so the reason the aim has swung
+        // away from the target is visible rather than mysterious; a direct
+        // shot is the usual straight line to it. Only the committed target
+        // gets this — one bounce per frame, not one per enemy.
         ctx.lineWidth = 3;
-        ctx.strokeStyle = 'rgba(64, 255, 89, 0.55)';
-        ctx.beginPath();
-        ctx.moveTo(cx, cy);
-        ctx.lineTo(sx, sy);
-        ctx.stroke();
+        ctx.strokeStyle = `rgba(64, 255, 89, ${0.55 * blockFade})`;
+        if (!st.blocked) {
+          ctx.beginPath();
+          ctx.moveTo(cx, cy);
+          if (st.bank) {
+            ctx.lineTo(cx + (st.bank.rx - pi.x) * scale, cy - (st.bank.ry - pi.y) * scale);
+          }
+          ctx.lineTo(sx, sy);
+          ctx.stroke();
+        }
 
-        // Small crosshair tick at center for unambiguous "this enemy" indication.
+        // Small crosshair tick at center for unambiguous "this enemy"
+        // indication — drawn either way, since the target is still the target.
         ctx.beginPath();
         ctx.moveTo(sx - 4, sy);
         ctx.lineTo(sx + 4, sy);
@@ -3514,7 +5481,12 @@
   window.__aimDiag = () => {
     const sample = pageSamples[pageSamples.length - 1];
     const target = sample ? getCurrentAimTarget(sample) : null;
-    if (!target) return { target: null, clockReady: netClock.ready };
+    // Enemies on screen right now that the whitelist is holding fire on. The
+    // first thing to check when the aim "does nothing" against someone.
+    const spared = (sample?.enemies || [])
+      .filter((e) => isWhitelistedName(e.name))
+      .map((e) => e.name);
+    if (!target) return { target: null, clockReady: netClock.ready, whitelisted: spared };
     const self = sample.self;
     const now = Date.now();
     const tNow = performance.now();
@@ -3525,6 +5497,7 @@
     const pingMs = medianPingMs();
     return {
       target: { id: target.id, name: target.name },
+      whitelisted: spared,
       source: pair ? 'clock' : 'sample',
       tickMs: pair ? Number((pair.t2 - pair.t1).toFixed(2)) : null,
       speed: Number(Math.hypot(seen.xv, seen.yv).toFixed(2)),
@@ -3540,6 +5513,16 @@
       // how far the firing origin sits ahead of where we are drawn.
       leadUnits: Number(Math.hypot(aimAt.x - drawn.x, aimAt.y - drawn.y).toFixed(2)),
       originAheadUnits: Number(Math.hypot(aimAt.fromX - self.x, aimAt.fromY - self.y).toFixed(2)),
+      // 'direct' when the line is clear, 'bank' when the aim point above is a
+      // mirrored one and the shot is going round, 'blocked' when neither is
+      // available and the aim is being thrown at a wall.
+      shot: aimAt.bank ? 'bank' : (aimAt.blocked ? 'blocked' : 'direct'),
+      bank: aimAt.bank ? {
+        off: aimAt.bank.obstacle.type,
+        at: [Number(aimAt.bank.rx.toFixed(2)), Number(aimAt.bank.ry.toFixed(2))],
+        pathUnits: Number(aimAt.bank.dist.toFixed(2)),
+        vsDirectUnits: Number(Math.hypot(drawn.x - aimAt.fromX, drawn.y - aimAt.fromY).toFixed(2)),
+      } : null,
     };
   };
 
