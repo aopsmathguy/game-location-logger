@@ -4146,9 +4146,10 @@
   //      measured deviation. One accessor on one camera field reaches all of
   //      them at once.
   //
-  //   The render is deliberately unclamped — a render time past the newest
-  //   snapshot extrapolates along the same line rather than freezing — but it
-  //   is taken half a tick behind the clock rather than at `t_now`, so most
+  //   The render extrapolates rather than freezing — a render time past the
+  //   newest snapshot continues along the same line, for up to
+  //   NET_MAX_EXTRAP_MS past it — but it is taken half a tick behind the clock
+  //   rather than at `t_now`, so most
   //   frames interpolate between two snapshots we hold instead of extending
   //   past the newest one. That halves the overshoot on direction changes and
   //   on stops, for a playout delay that still leaves the render ahead of
@@ -4171,6 +4172,11 @@
   // Snapshots retained per player. Only the newest two are rendered from; the
   // rest are headroom so a TCP burst can be recorded without dropping ticks.
   const NET_SNAP_CAP = 8;
+  // How far past the newest snapshot the position lerp may be extended. Inside
+  // this the render keeps coasting along the last segment, which is what covers
+  // an ordinary stall; past it the position freezes rather than sliding off on
+  // a velocity the server stopped confirming a fifth of a second ago.
+  const NET_MAX_EXTRAP_MS = 200;
 
   const netStats = {
     hookedCamera: null,
@@ -4231,8 +4237,10 @@
   // render time advances smoothly and is never yanked by one late arrival, so
   // the discontinuities stop existing rather than being hidden.
   //
-  // The render is unclamped, so a stall is extrapolated through rather than
-  // frozen, and it is taken at `t_now - renderLag * tick` rather than at
+  // The render extrapolates, so a stall is coasted through rather than frozen
+  // — bounded at NET_MAX_EXTRAP_MS past the newest snapshot, so a stall that
+  // is really a disconnect stops rather than sliding away — and it is taken at
+  // `t_now - renderLag * tick` rather than at
   // t_now. Rendering at t_now exactly means the newest snapshot's pseudotime
   // is always a little in the past, so every frame leans past the end of the
   // data; half a tick of playout centres the render on the data instead. The
@@ -4430,8 +4438,13 @@
   // p2@t2 in pseudotime, render at
   //     p1 * (t_now - t2)/(t1 - t2) + p2 * (t1 - t_now)/(t1 - t2)
   // which is the standard two-point lerp written over (t1 - t2); the weights
-  // sum to 1 for any t_now. It is deliberately unclamped, so t_now past t2
-  // extrapolates along the same line rather than freezing.
+  // sum to 1 for any t_now. The upper end is left open by NET_MAX_EXTRAP_MS
+  // rather than at the newest snapshot, so t_now past t2 keeps extrapolating
+  // along the same line — that is what carries an ordinary stall — but the
+  // render time is clipped to max(t1, t2) + NET_MAX_EXTRAP_MS, so a stall long
+  // enough to be a disconnect or a tab-blur parks the player at the end of
+  // that coast instead of running off the map. The lower end stays open: t_now
+  // before t1 runs the same segment backwards, which is continuous.
   //
   // Returns null before the clock has converged or while a player has fewer
   // than two snapshots, in which case the caller falls back to survev's lerp.
@@ -4445,8 +4458,13 @@
     const t2 = pseudotimeOf(p2.n);
     const d = t1 - t2;
     if (!d) return null;
-    const w1 = (nowMs - t2) / d;
-    const w2 = (t1 - nowMs) / d;
+    // Clip the render time to a fixed budget past the newer of the two
+    // snapshots. Written over max(t1, t2) rather than t2 so it still holds if
+    // the pair is ever handed over in the other order.
+    const limit = Math.max(t1, t2) + NET_MAX_EXTRAP_MS;
+    const t = nowMs > limit ? limit : nowMs;
+    const w1 = (t - t2) / d;
+    const w2 = (t1 - t) / d;
     return { x: p1.x * w1 + p2.x * w2, y: p1.y * w1 + p2.y * w2 };
   }
 

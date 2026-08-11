@@ -564,8 +564,11 @@ deviation (`jitterK`). One accessor on one camera field reaches all of them.
 
 ### The trade
 
-The lerp is deliberately unclamped, so a stall is extrapolated through rather
-than frozen. It is taken half a tick behind the clock (`renderLag`, in ticks)
+The lerp extrapolates rather than freezing, so a stall is coasted through — but
+only for 200ms past the newest snapshot (`NET_MAX_EXTRAP_MS`), after which the
+render time is clipped and the player parks at the end of that coast instead of
+sliding away on a velocity the server stopped confirming a fifth of a second
+ago. It is taken half a tick behind the clock (`renderLag`, in ticks)
 rather than at `t_now`: rendering at `t_now` exactly means the newest
 snapshot's pseudotime is always slightly in the past, so *every* frame leans
 past the end of the data, and half a tick of playout centres the render on the
@@ -584,11 +587,15 @@ What the playout delay buys, from `netcode_sim.js`:
 | jerk vs stock, strafing (clean link) | +458% | +170% |
 | shape error, hard reversals | 1.74u | 1.18u |
 | overshoot stopping, no stall | 0.167u | 0.025u |
-| overshoot stopping, 300ms stall | 2.80u | 2.50u |
+| overshoot stopping, 300ms stall | 1.20u | 1.20u |
 | latency vs stock, straight line | 50ms ahead | 17ms ahead |
 
 So about 35ms of the latency lead buys back roughly half the stutter and most
 of the stop overshoot, and the render still arrives ahead of stock survev's.
+The two 300ms-stall figures match because the 200ms extrapolation cap has
+already engaged by then: past that point the overshoot is set by the cap rather
+than by the playout delay, and it no longer grows with the stall.
+
 What remains is inherent: during a stall there is no data to interpolate
 between, so the renderer extends the last line and is corrected when the stream
 resumes. Set `renderLag` to 0 in the MOD tab for the lowest-latency,

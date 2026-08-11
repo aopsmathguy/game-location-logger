@@ -31,9 +31,6 @@ window.__SURVEV_MANGLED__ = {
     activeWeapon: 'kgr',
     dead:         'zTJbIl',
     downed:       'xTH',
-    // Action enum: 0 None, 1 Reload, 2 ReloadAlt, 3 UseItem, 4 Revive.
-    // Autoshoot holds fire off while this is a reload.
-    actionType:   'sMSm',
   },
 
   // ---- Player.localData (the sub-object named by player.localData above) ----

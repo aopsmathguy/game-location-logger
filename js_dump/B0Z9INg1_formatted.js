@@ -33,10 +33,10 @@ var e = Object.create,
             });
         return e
     },
-    u = (n, r, a) => (a = n == null ? {} : e(i(n)), l(r || !n || !n.__esModule ? t(a, `default`, {
+    u = (n, r, o) => (o = n == null ? {} : e(i(n)), l(r || !n || !n.__esModule || !a.call(n, `default`) ? t(o, `default`, {
         value: n,
         enumerable: !0
-    }) : a, n)),
+    }) : o, n)),
     d = e => a.call(e, `module.exports`) ? e[`module.exports`] : l(t({}, `__esModule`, {
         value: !0
     }), e);

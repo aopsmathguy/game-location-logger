@@ -68,6 +68,7 @@ const NET_MIN_UPDATE_MS = grabConst('NET_MIN_UPDATE_MS');
 const NET_MAX_UPDATE_MS = grabConst('NET_MAX_UPDATE_MS');
 const NET_EWMA_ALPHA = grabConst('NET_EWMA_ALPHA');
 const NET_SNAP_CAP = grabConst('NET_SNAP_CAP');
+const NET_MAX_EXTRAP_MS = grabConst('NET_MAX_EXTRAP_MS');
 const NETCODE = eval('(' + /const NETCODE = (\{[\s\S]*?\n  \});/.exec(src)[1] + ')');
 
 // The Player field names the extracted code reads through. In the browser
@@ -81,6 +82,10 @@ const performance = { now: () => NOW };
 // The clock, the snapshot renderer and the smoother all come out of inject.js
 // together, so the harness exercises the real pipeline end to end.
 const netClock = eval('(' + /const netClock = (\{[\s\S]*?\n  \});/.exec(src)[1] + ')');
+// clockOnPacket also logs each arrival into the HUD's residual ring, so that
+// has to exist here even though nothing in the sim reads it back.
+const CLOCK_RESID_CAP = grabConst('CLOCK_RESID_CAP');
+const clockResid = eval('(' + /const clockResid = (\{[\s\S]*?\n  \});/.exec(src)[1] + ')');
 const bundle = eval(`(function () {
   ${extract('recordUpdateInterval')}
   ${extract('clockOnPacket')}
@@ -342,11 +347,16 @@ for (const stall of [0, 100, 200, 300]) {
 }
 console.log('');
 
-// These two are the residual cost of an unclamped lerp: during a stall there
-// is no data to interpolate between, so the renderer keeps extending the last
-// line and is corrected when the stream resumes. That is what eliminates
-// freezes outright (froz% is ~0 on every link above), and it costs accuracy
-// whenever a player turns or stops inside the gap.
+// These two are the residual cost of extrapolating: during a stall there is no
+// data to interpolate between, so the renderer keeps extending the last line
+// and is corrected when the stream resumes. That is what eliminates freezes
+// outright (froz% is ~0 on every link above), and it costs accuracy whenever a
+// player turns or stops inside the gap.
+//
+// NET_MAX_EXTRAP_MS caps how far that coast runs past the newest snapshot, so
+// the overshoot stops growing with the stall length: at the shipped 200ms the
+// stop-accuracy rows above flatten out once the stall exceeds it, instead of
+// climbing with every extra tick of silence.
 //
 // `renderLag` sets how much of it is paid in the steady state, by holding the
 // render that many ticks behind the clock. At 0 the render sits exactly at
@@ -361,13 +371,13 @@ console.log('');
 // choice rather than a bug.
 if (worstRegression > 0) {
   console.log(`NOTE: on a degraded link the renderer is up to ${worstRegression.toFixed(0)}% jerkier`);
-  console.log('      than stock on direction-changing motion (unclamped extrapolation');
+  console.log('      than stock on direction-changing motion (extrapolation');
   console.log('      overshoots each turn and is corrected by the next packet).');
 }
 if (worstOvershoot > MAX_STOP_OVERSHOOT) {
   console.log(`NOTE: stopping mid-stall overshoots by up to ${worstOvershoot.toFixed(2)}u`);
-  console.log('      before the next packet pulls it back — unbounded extrapolation');
-  console.log('      keeps predicting motion after the player has already stopped.');
+  console.log(`      before the next packet pulls it back — up to ${NET_MAX_EXTRAP_MS}ms of`);
+  console.log('      extrapolation keeps predicting motion after the player has stopped.');
 }
 console.log('\nFrozen frames are ~0% on every link: the clock never has to freeze,');
 console.log('which is what the recovered-clock design buys over survev\'s own lerp.');
