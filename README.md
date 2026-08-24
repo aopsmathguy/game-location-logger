@@ -17,6 +17,14 @@ none of them touches input or gameplay state.
   by the "ESP overlay" button in the MOD tab; turning it off only stops the
   drawing, sampling and aim keep running. Enemies you have no shot on are
   faded out — see [Fading out blocked enemies](#fading-out-blocked-enemies).
+- **Collidable only** — stops the game drawing everything that isn't part of
+  the collision set: building roofs come off, so a house shows its inside,
+  and bushes and destroyed-obstacle rubble go with them. Tree canopies are
+  collidable, so they stay — faded, so whoever is standing under them doesn't;
+  smoke stops nothing but hides everything, so it fades to the same value.
+  A display switch in the MOD tab's ESP section, off by default and
+  independent of the overlay toggle above it; see
+  [Collidable-only render](#collidable-only-render).
 - **Enemy name tags** — every enemy's name is drawn under their sprite in red,
   the same label the game already draws under a teammate in cyan. "Enemy
   names" in the MOD tab turns them off; on by default, and independent of the
@@ -42,6 +50,18 @@ none of them touches input or gameplay state.
   semi-auto, or shot-then-quickswap for a slow one. See
   [Autoshoot](#autoshoot). Off by default. It interrupts a reload to fire
   what is already loaded, but leaves an empty gun alone to finish reloading.
+- **Dodge bot** — while a live bullet is on course to hit us, the movement
+  keys are taken over and steered out of the way; the moment the user's own
+  course is clear again they are handed straight back. Every bullet in the
+  air is solved exactly, as a moving-circle quadratic rather than a sampled
+  path, so nothing tunnels; rounds that will die on a wall first are ignored,
+  so it doesn't walk out of cover. Each round is priced at what it would
+  actually take off us in HP, falloff and reflects included, so the plan that
+  eats an MP5 round to stay out of an AWC's line is the cheap one. Off by
+  default, "Dodge bot" in the MOD
+  tab. It wins ranged exchanges and does nothing at knife range — see
+  [Dodge bot](#dodge-bot) for why that is a property of the game and not of
+  the implementation.
 - **Auto-quickswap** — after firing a slow-firerate gun (sniper, pump
   shotgun, etc.) the extension synthesizes a `SwapWeapSlots` input on the
   next server tick so the other gun is ready immediately. "Slow" means a
@@ -62,6 +82,13 @@ none of them touches input or gameplay state.
 - **Ping readout** — live round-trip time above the top-left team panel,
   colour-coded green/amber/red. Read from the RTT samples survev already
   collects (`game.pings`), so it adds no traffic of its own.
+- **Debug render** — the "Debug" button in the MOD tab throws the game's art
+  away and draws the collision geometry instead: white ground under the map's
+  own grid, water in the map's own colour, every collidable object as a filled
+  borderless rectangle or circle exactly matching its collider, and every
+  player as a one-colour circle at the collision radius, drawn at the same
+  smoothed position the sprite would have been. Off by default; see
+  [Debug render](#debug-render).
 - **Position log** — periodic snapshots of self + enemy positions are sent
   to the service worker; click the toolbar icon to export as JSON
   (see `sample.json` for the schema).
@@ -497,6 +524,242 @@ Names come from `getPlayerInfo(id).name`, which is the raw name: survev's
 `anonPlayerNames` setting is applied by `getPlayerName()` on the paths that
 respect it, and the in-world label never went through that function.
 
+## Debug render
+
+"Debug" in the MOD tab replaces the rendered world with its hitboxes. Ground —
+grass, beach, riverbanks, ground patches — all becomes flat white, kept under
+the game's own grid so there is still a sense of scale and of how far something
+has moved; water keeps whatever colour the biome gives it, because water is
+terrain you swim in rather than something with a collider. Every collidable
+object is a filled shape drawn straight from `obstacle.collider`: an
+axis-aligned rectangle or a circle, no stroke, all one colour. Every player is
+a circle of `GameConfig.player.radius` in a second colour, with no
+teammate/enemy or downed distinction. Nothing is drawn with a border, because a
+border sits *outside* the shape and would make every hitbox read a pixel or two
+larger than it is.
+
+The switch works off survev's scene graph rather than off any drawing hook.
+`Game.init()` adds a flat list of children to the PIXI stage:
+
+```
+map.display.ground     terrain, in world coords, re-transformed to screen each frame
+renderer.layers[0]     ┐
+renderer.ground        │  every sprite: obstacles, buildings, ceilings,
+renderer.layers[1..3]  ┘  players, loot, bullets, particles
+debugDisplay
+gasRenderer.display    ┐
+emoteBarn.container    │  UI, above the world
+uiManager.container    ┘  (minimap, indicators, …)
+```
+
+So the whole world switches off by setting `renderable = false` on
+`renderer.ground` and the four layers. Nothing else on the page changes: the
+HUD is DOM, and the minimap is a texture `renderMap()` bakes from a Graphics of
+its own rather than from `display.ground`.
+
+`renderable`, not `visible`: the renderer rewrites `visible` on the layers every
+frame from the layer-transition alphas, so it would take the flag straight back
+off us. It never touches `renderable`, and PIXI checks it before descending into
+a container, so one `false` skips the container and its whole subtree.
+
+Our own geometry goes in as three `Graphics` children of `map.display.ground`.
+That parent is the one node on the stage already carrying the world→screen
+transform, so drawing in world units under it needs no camera read of our own
+and cannot drift a frame behind the game's: whatever transform the renderer
+resolves for the terrain is the one our shapes get, on the same pass. It also
+sits at stage index 0, under everything — which is where a replacement world
+belongs. The white sheet is painted *over* the game's terrain rather than
+replacing it, so switching the mode back off is one `renderable` flip with the
+game's own geometry still intact underneath.
+
+The three layers are split by how often they change:
+
+| Layer | Redrawn |
+| --- | --- |
+| Ground + water | Once per map, keyed on `map.terrain` identity |
+| Obstacle colliders | Only when a cheap signature over the collider set changes |
+| Player circles | Every frame |
+
+The signature is a rolling hash of obstacle count, ids, and the collider numbers
+quantized to 1/64 of a unit, computed without allocating. It catches an obstacle
+entering or leaving the pool, one being destroyed, and a door swinging its
+collider onto a new orientation — which is everything that can change a shape on
+screen — so the expensive part, clearing and re-tessellating a few hundred
+shapes, only runs on frames where the geometry actually moved. Players are
+deliberately outside that gate: they move every frame, so gating them would
+never pay off.
+
+The ground and water are laid down in the same order `renderTerrain` uses — one
+white sheet over the map and its 120-unit margin, then the play area minus the
+shore polygon as ocean, then each river's `waterPoly`, with looped rivers taking
+`lakeWater` when the biome defines it, then the grid over the lot. The shore is
+concave and hand-jittered, so the ocean is cut as a PIXI hole exactly the way
+the game cuts it, not approximated with a border. The grid is the game's own:
+`GameConfig.map.gridSize` spacing, black at 0.15, over the play area rather than
+the margin, and `2 / camera.ppu` wide — our Graphics hangs off
+`map.display.ground` and inherits its world→screen scale, so that width lands on
+the same pixels survev's grid does.
+
+### Player positions
+
+Players are drawn at `posAlt`, not `pos`. `pos` is where the last packet said
+the player was; `posAlt` is the render-interpolated position the game lerps
+toward it each frame, and it is the one the body sprite's own `pointToScreen`
+is fed — so reading it is what puts the circle exactly where the hidden sprite
+was, rather than a fraction of a tick ahead of it.
+
+It is also the field [Netcode smoothing](#netcode-smoothing) installs its
+accessor on. So the circles play back on the recovered tick clock whenever
+Smoothing is on, respond live to `jitterK`, `clockHalfLife` and `renderLag`,
+and fall back to survev's stock lerp the moment it is switched off — the same
+playback the sprite itself would have been drawn with, which is the whole point
+of a view that claims to show where things really are. `pos` is only the
+fallback for a player the game has not interpolated yet.
+
+`window.__debugRenderDiag()` reports what the mode found. `rendererFound: false`
+means the layer containers are still on screen and the hitboxes are drawing
+underneath them; `mapFound: false` in a live match means `findMapOnGame` lost
+the map shape and `mangled.js` may need re-deriving.
+
+## Collidable-only render
+
+"Collidable only" in the MOD tab's ESP section stops the game drawing anything
+that isn't in the collision set. In practice that is three things: **building
+roofs**, **bushes**, and the **rubble a destroyed obstacle leaves behind**.
+What is left on screen is what a bullet and a body can actually hit — the same
+set `__bulletGeom` reports and the aim path solves against. **Tree canopies**
+are on the other side of that line, since a tree does stop a bullet, so they
+are faded rather than removed, and **smoke** — which is on neither side of it,
+being no part of the world at all — is faded to the same value.
+
+It is a display switch and nothing more. No geometry is read from it, nothing
+about aim, sampling or input changes, and it is deliberately **independent of
+the "ESP overlay" toggle above it**: it puts nothing on the overlay canvas, so
+gating it behind the canvas would only be surprising. Off by default, and
+persisted like every other row.
+
+### Roofs
+
+A house's inside is already being rendered. Its floor, its walls, the loot and
+the players in it all draw on the same layer as the world outside, and the roof
+is only a sprite laid over the top of them at `zOrd = 750 - zIdx`. `Building`
+keeps both halves of that art in one `imgs` array with each entry tagged
+`isCeiling`, so switching off the ceiling ones leaves the building standing,
+its layer, its bounds and its zoom regions untouched, and reveals what was
+underneath.
+
+`renderable = false` per sprite, for the same reason the debug render uses it
+on the layer containers: the game rewrites both of the other candidates on
+every update — `positionSprite` sets a ceiling img's `alpha` from
+`ceiling.fadeAlpha`, and a `removeOnDamaged` img gets a `visible` — so anything
+written there is gone within a frame. `renderable` it never touches, and PIXI
+checks it before drawing.
+
+This does **not** open up a bunker. Underground art lives on
+`renderer.layers[2]`, which the renderer masks down to the stairwell openings
+the whole time the local player is aboveground, so there is no roof to hide:
+those sprites are being clipped away, not covered up.
+
+### Bushes and rubble
+
+Obstacles use the same flag under the game's own rule for what an object is.
+`collidable` is its line between an object and scenery — a bush carries a
+collider and doesn't stop you — and a destroyed obstacle keeps its collider
+object but stops colliding, so both are art in front of nothing. A door's
+casing is a second sprite the obstacle positions alongside its own, so a dead
+door takes its frame with it rather than leaving one floating.
+
+A **skinned player's disguise** falls out of the same rule: the client builds a
+skin as an obstacle and sets `collidable = def.collidable && !isSkin`, so a
+skin is never collidable and never drawn here. The player sprite it was
+covering is drawn as usual.
+
+### Tree canopies
+
+A tree is collidable. It stops a bullet and it is cover, so removing it would
+make the view lie about exactly the thing the view is for — but its leaves are
+drawn on top of whoever is standing under them, which is the problem this mode
+exists to solve. So canopy art is faded to `0.35` instead: the tree still reads
+as a tree, and the player under it reads as a player.
+
+Which art counts as a canopy comes from the game's own rule rather than a list
+of type names that would rot on the next content patch. `sprite.zOrd` is the
+obstacle def's `img.zIdx`, and `Obstacle.render` treats `>= 50` as "this draws
+above the player" — it lifts exactly those onto the player's layer and pushes
+them past their z-order. Tree canopies sit at 200 and 801. Tables, pipes and
+statue tops share the rule and get the same treatment, for the same reason:
+they are all art the game deliberately puts in front of a body.
+
+The alpha is written straight onto the sprite rather than through an accessor,
+because an obstacle only assigns `sprite.alpha` on the rare frame it swaps a
+texture — spawn, death, a button toggling. That is also what makes the value
+to restore free: every sprite carries its own `imgAlpha`, which is the number
+the game last put there, so a table that ships at `0.8` goes back to `0.8`
+rather than to a blanket `1`.
+
+### Smoke
+
+A smoke cloud is the canopy problem out of a different barn. It is not an
+obstacle, it is in no collision set, it stops neither a bullet nor a body — and
+it is drawn over everyone inside it, which is the thing this mode exists to
+stop. So it is faded to the same `0.35`, and a tree seen through smoke reads at
+one depth instead of two.
+
+The smoke barn hangs off the `Game` rather than the map, and keeps its
+particles in a plain array beside its entity pool. Both are mangled, so the
+pair is found by what the array's entries are: a particle declares
+`radTarget`, `fadeTicker`, `rotVel`, `interior` and `sprite` as readable
+fields, and nothing else on the `Game` carries that set. As with the obstacle
+and building pools, that needs one live entry — one smoke thrown this round —
+and until then the barn is simply unidentified. Arrays are skipped rather than
+descended into during the scan: the `Game` keeps `pings` and `updateIntervals`
+beside its barns, both one entry per server update and both unbounded over a
+match.
+
+Unlike a canopy's, smoke's alpha is **rewritten every frame** — the barn sets
+`alpha = clamp(1 - fadeTicker / fadeDuration) * 0.9` in the same tick that
+renders the particle, so there is no point in a frame where a value written
+from the overlay's own loop is the one that gets drawn. So the write is
+intercepted rather than repeated: an own accessor keeps the game's number and
+hands back the lower of it and `0.35`. The barn goes on assigning exactly as it
+did, and a puff's own fade-out still plays, because those values are under the
+cap and pass straight through. What is capped is how solid the cloud gets, not
+how it dies.
+
+Because each particle is capped rather than the cloud, a **dense cloud still
+builds up** where many particles overlap — every one of them is at most as
+opaque as a tree canopy, but they composite. That is the honest reading of a
+per-sprite cap; hiding smoke outright is the alternative, and it would put the
+mode back to lying about what is on screen.
+
+### Handing sprites back
+
+Each held property — `renderable` for what is hidden, `alpha` for what is
+faded, the `alpha` accessor for what is capped — is tracked by a pair of
+`Set`s swapped each frame: one holds what is
+currently held, the other collects the frame being built, and anything in the
+first that the new frame didn't re-claim is handed back before the swap.
+
+That is what restores a sprite when a pool entry is recycled into a different
+object, when the toggle goes off, and when the round ends. It is also what
+moves one cleanly between the two states: a tree that gets destroyed stops
+being canopy and starts being rubble, so the same frame that hides it also
+gives its alpha back. Swapping rather than allocating keeps a per-frame pass
+over a few hundred sprites free of garbage.
+
+`renderable` is only ever set back to `true`, which is the value the game ships
+sprites with and never writes itself; a faded `alpha` goes back to the sprite's
+own `imgAlpha`; a capped one has its accessor deleted and the game's own last
+number assigned in its place, which puts a plain data property back where PIXI
+put one.
+
+`window.__collidableOnlyDiag()` reports what the mode found, including live
+`hiddenSprites`, `fadedSprites` and `cappedSprites` counts. `buildings: 0` in
+a live match means `findBuildingPool` hasn't identified the building pool —
+roofs are still up, and if it stays that way once a match is running,
+`mangled.js` may need re-deriving. `smokeBarnKey: null` only means no smoke has
+been thrown yet.
+
 ## Netcode smoothing
 
 survev only learns positions from server update packets. On each packet it
@@ -561,6 +824,50 @@ Everything that is not a player — loot, obstacles, projectiles, the gas circle
 — still goes through survev's own lerp, so the raw gap it divides by is
 replaced with an EWMA of the mean plus an allowance proportional to measured
 deviation (`jitterK`). One accessor on one camera field reaches all of them.
+
+
+### Bullets on the render clock
+
+Everything drawn should represent the same instant, and by default it does not.
+Players render at the recovered clock held `renderLag` ticks back; bullets are a
+pure client-side simulation the barn advances by frame dt, so they are drawn at
+`t_now`. Every tracer on screen is half a tick ahead of every body on screen. At
+20Hz that is 25ms, which a Barrett round spends 5.4 units of travel on — five
+player radii, and the difference between a round that looks like it missed and
+one that looks like it hit.
+
+This is survev's own inconsistency rather than one the smoothing introduces:
+stock lerps players a whole tick behind the newest snapshot while running
+bullets in real time, so the gap there is wider. The clock narrows it;
+`Bullets on clock` closes it, by walking each round back along its own direction
+by exactly the lag the player render is held at.
+
+The substitution happens in the barn's render pass and nowhere else. `pos` is
+left exactly as the barn computed it, because the barn's own update integrates
+it, tests the swept segment against obstacles and players for the tracer-stop
+and the whiz sound, and the dodge bot reads it to build its threat list — all of
+which want the true simulated position and none of which is a render. Only the
+value handed to the sprite transform moves, and it is put back before the frame
+ends, including if the render throws. The barn recomputes the tracer's length
+from `pos - startPos` in the same pass, so a round drawn earlier in its flight
+gets the shorter trail it had then for free.
+
+The render pass is found by shape, since its name is mangled and rotates every
+deploy: survev leaves `onMapLoad`, `addBullet` and `createBulletHit` readable
+and mangles the other two, and of those the update takes eight arguments while
+the render takes one — so the render is the only arity-1 method on the prototype
+that is not `onMapLoad`. If a future bundle makes that ambiguous the lookup
+returns nothing and the feature turns itself off, which is the right failure:
+a wrong guess would wrap the update and quietly corrupt the simulation.
+
+The one thing it cannot do is un-draw a round that had not been fired yet at
+render time. Walking back is clamped at the muzzle instead, so a new bullet sits
+at its start point for up to half a tick and then sets off.
+
+Off by default. It is strictly more coherent and it costs half a tick of warning
+on incoming fire, which is a real trade for a human at the keyboard — the dodge
+bot is unaffected either way, since it reads the barn's true positions and never
+looks at a sprite.
 
 ### The trade
 
@@ -734,6 +1041,386 @@ retired by the arming tick on its next frame, which makes it exactly one frame
 wide — the same width survev's own `keysOld`/`keys` edge gives a real key
 press. The equip inputs stay one-shot: they have a single reader, and a second
 read would swap twice.
+
+## Dodge bot
+
+Takes the movement keys for exactly as long as a bullet is going to hit us,
+and hands them back when one isn't. Off by default; "Dodge bot" in the MOD
+tab.
+
+### What is and isn't dodgeable
+
+A player moves at 12 u/s (`GameConfig.player.moveSpeed`) and the guns in
+`GUN_BULLET_SPEED` fire between 66 u/s (M870) and 214 u/s (Barrett). Nothing
+here out-runs a bullet, and no amount of planning changes that. The only
+reason a dodge ever works is that the shot was aimed where we were *going*,
+and a shot led against a path we then leave misses.
+
+That reframes the arithmetic usefully. Clearing our own radius — one world
+unit — takes ~83ms from a standstill, during which an mp5 round covers 7
+units and a mosin round 15. Add a round trip and the shot has to have come
+from ~18 units away (mp5) or ~38 (mosin) before we can be out of it in time.
+
+But we don't have to displace in world space, only to diverge from the path
+the shooter led against. From a standstill we can diverge at 12 u/s. If we
+were already strafing across the shot when it left and we simply *reverse*,
+the two paths separate at 24 u/s and the clearance takes ~42ms, halving every
+threshold above. That is the whole reason the planner is allowed to keep
+moving, and why standing still — which scores perfectly safe against one
+bullet already in the air — carries a standing penalty anyway.
+
+The consequence worth being honest about: **at close range there is no
+dodge.** An SMG round from 8 units arrives in under 100ms, which is less than
+the link's own round trip, and no input we send can be in time. This is a
+ranged-exchange feature.
+
+### Solving the bullets
+
+Threats come from the bullet barn (`bn` in the bundle), which is found by
+shape: it is the only object the `Game` owns that has all of a `bullets`
+array, a `tracerColors` map and an `addBullet` method, and all three are real
+readable class fields, so it survives a re-mangle and needs no `mangled.js`
+entry. Each live bullet carries `pos`, `dir`, `speed`, `startPos` and
+`distance` under equally readable names, is advanced client-side every frame,
+and travels a deterministic straight line from spawn — so the whole future
+path is known rather than guessed.
+
+Four things happen to each bullet before it is scored:
+
+1. **Ours and our squad's are dropped.** Our own rounds only come back at us
+   as shrapnel or off a reflector, which is exactly what the barn's own
+   `damageSelf` flag already means. A squadmate's round passes through us in
+   every non-FF mode, so dodging it would hand the keys away for nothing.
+   Hostility is asked through the same `isHostileTo` the sampler and the name
+   tags use, so the three can't disagree.
+2. **It is advanced by the measured round trip.** What we render is the
+   server's world one one-way trip ago, and an input we send now is acted on
+   one one-way trip from now, so the bullet the server tests against us has
+   travelled roughly a full round trip further than the one on screen. Same
+   lead, from the same `game.pings` samples, that the aim helper uses.
+
+   **Our own start state is led the same way.** Whatever we choose this frame
+   is not acted on until it reaches the server, and until then we keep going
+   the way we are already going — so the rollout starts from where that leaves
+   us, not from where we are. Leading the bullets but not ourselves credits the
+   planner with an escape beginning a full round trip early, which at 60ms is
+   most of a player radius of head start it does not have; it is the difference
+   between correctly reporting a close shot as unavoidable and confidently
+   walking into it. The prefix is capped at half the horizon so a bad link
+   cannot move the start of the plan further than the plan is long.
+
+   **That correction is not a leg of the plan, and running it as one was a
+   bug** — `dodgeCarry` exists to say so. Threats are placed where they will be
+   when our input lands, so plan-time zero is that moment *for them*; our own
+   position is a round trip behind it. Closing the gap with a scored leg
+   advances the threats a second time along with it, because their positions
+   are a function of plan time, and every bullet is then solved against us from
+   a round trip too far away. At 60ms on an mp5 round that is five units of
+   error and it mostly still works; at 140ms it is twelve, and the bot cleanly
+   proves to itself that a round about to hit it will miss.
+   `dodgebot-test/bench.js` is what caught it: at 140ms the hit rate with the
+   bot driving was indistinguishable from having no bot at all, and at 60ms it
+   was costing a factor of seven. So the gap is closed by a position correction
+   that walls still clip — we really can be stopped during it — but that sweeps
+   nothing and charges nothing, leaving the whole horizon to the plan.
+3. **It is truncated at the first wall on its own path**, via the same
+   `firstBulletHit` the aim helper and the ESP fade use. A round that dies on
+   a crate is not a threat, and treating it as one is precisely what would
+   walk the bot out of cover.
+4. **It is dropped unless it can reach us.** Solved against our radius
+   inflated by `speed × horizon` — everywhere we could possibly stand before
+   the plan ends — so a round rejected here is one no candidate plan could be
+   touched by. This is what makes the 48-threat cap mean something: the barn
+   is in arrival order, which has nothing to do with danger, and without the
+   filter a firefight's worth of tracers flying somewhere else fills every
+   slot while the round that is actually going to hit us never gets one. At
+   the cap a newcomer displaces whichever slot is furthest from mattering.
+
+Collision is then solved in closed form, not sampled. For a candidate
+velocity `v` and a bullet `(b, w)`, with `q = b - p` and `u = w - v`:
+
+```
+a = u·u,  bb = q·u,  c = q·q - R²
+c ≤ 0   → already overlapping
+bb ≥ 0  → separating
+disc = bb² - a·c ;  t = (-bb - √disc)/a
+```
+
+Sampling is not an option: a Barrett round crosses a player's diameter in 9ms
+and would step straight over a 16ms frame without ever testing as
+overlapping. The closest-approach distance is recorded even for a clean miss,
+because a binary hit test has a cliff at the hitbox edge and a plan scored on
+it will happily shave that edge — after which one tick of jitter turns the
+shave into a hit.
+
+### What a round is worth
+
+Not one. Each threat carries its damage in HP, and both searches minimise
+expected HP lost rather than expected hit count — so a plan that eats an MP5
+round to stay out of an AWC's line is correctly the cheap one, which under a
+flat hit count it never could be.
+
+The number comes from `BULLET_DAMAGE`, a transcription of survev's
+`shared/defs/gameObjects/bulletDefs.ts` holding `[damage, falloff]` for all 63
+bullet types, derived the same way `GUN_BULLET_SPEED` was. Those two are the
+only figures the server's formula needs that aren't already on the client's own
+barn entry:
+
+```
+finalDamage  = def.damage × damageMult
+finalDamage ×= 1 / (reflectCount + 1)
+distT        = clamp(distanceTraveled / bullet.distance, 0, 1)
+finalDamage ×= remap(distT, 0, 1, 1, def.falloff)
+```
+
+`distance` is deliberately not in the table. The instance's own distance —
+after the reflect decay, the `distanceMult`, the variance and the ±1 spray
+jitter — is what the falloff divides by, and the barn entry already carries
+exactly that number. Copying the def's would silently use the wrong
+denominator. Falloff is evaluated at the point along the path where the round
+reaches *us*, not where it is now; at sniper range those differ by most of its
+life. The estimate uses the earliest time it could touch anywhere we might be,
+which is the shortest flight and so the most the round can still be worth —
+erring high, which can only make the bot take a threat more seriously than it
+deserves.
+
+**The type is not on the barn entry, and cannot be inferred from what is.**
+`addBullet` is handed the wire bullet, resolves `bulletType` to a def, and
+copies out only what the renderer needs; the name never survives. Identifying
+it afterwards doesn't work either — `speed` is `def.speed` times a variance the
+wire also doesn't carry, and speeds collide anyway: every shotgun in the game
+fires at 66 u/s, and buckshot, birdshot and slug do 12.5, 4 and 77 damage.
+
+So the type is taken on the way past. `addBullet` is wrapped, and the type
+stamped onto the entry that call wrote — which has to be worked out rather than
+observed, because the barn pools its entries and `addBullet` returns nothing.
+It takes the first slot that is neither `alive` nor `collided` and pushes a
+fresh one when there isn't one, so finding that slot before the call by the
+same rule, and falling back to the array's new tail, names it exactly. Reuse
+can't go stale: a pooled slot is re-stamped every time it is handed out, and is
+only ever read while `alive`.
+
+Two things stay out of reach. `damageMult` never goes on the wire, so a perk
+that scales damage is invisible and every round is priced at its base value.
+And a round we can't name at all — the hook went on mid-flight, or survev has
+shipped a bullet the table doesn't list — is priced at `DODGE_DMG_REF`, which
+is exactly the flat hit-counting the planner did before the table existed.
+
+Flares and the invisible round do 0 damage, and are dropped rather than scored
+as zero. Both would take a threat slot from something that can actually hurt
+us, and the takeover reads time-to-impact regardless of what a threat is worth
+— so one flare on course would hold the keys for as long as it stayed in the
+air.
+
+### Planning
+
+Nine candidate headings: the eight the protocol can express, plus standing
+still. Diagonals are unit length, because the server normalizes the move
+vector before scaling it by speed — a diagonal is not faster, and believing
+otherwise would have the planner counting on an escape it cannot execute.
+
+Each heading is first scored held for the rest of the window. The best few
+then get a second leg, every heading tried for it. One leg is enough to get
+out of the way of one bullet and is reliably wrong about two: the heading that
+clears the first can be the one with nowhere left to go when the second
+arrives, and only a plan allowed to turn can see that coming.
+
+**Which first legs earn that second leg comes from two rankings, not one.**
+Ranking by the full window alone discards every opening that is right for its
+first quarter-second and wrong after — a step into a doorway, a dash across a
+shot before turning back — which is exactly the class of plan two legs exist
+to find, and which by construction never places well on a one-leg score. So
+the branch set is the best few by the full window *plus* the best few by the
+commit leg alone, interleaved and deduped.
+
+Legs are advanced through a context object rather than run as one closed
+function, because within a frame most of the work is shared. Every plan starts
+with the same latency prefix and every second leg of a branch starts from the
+same first leg, so each is advanced once and then copied; the context carries
+the per-threat minima with it, so a copy resumes exactly where the original
+left off, and a branch's wall march — the expensive part — is handed to its
+nine continuations rather than repeated by each. Measured at 0.14ms per plan
+against 24 threats and 20 walls, against a 16ms frame.
+
+
+### The deep search
+
+Two legs is the answer to one bullet and usually to two. It runs out of room
+against a fast round, where the escape is not a heading but a *sequence* — go,
+then stop, then go back — and where a quarter-second commit is longer than the
+whole flight. `Deep search`, on by default, replaces the branch search with the
+question the fight actually poses: over the next `horizon` seconds, chopped
+into `Step` decisions, which sequence of headings takes the least damage?
+
+At the default 0.1s step that is eight decisions and 9⁸ ≈ 43 million sequences,
+which is hopeless as a tree — and it is not a tree. Two paths that arrive at the
+same place at the same time are worth exactly the same from there on, so they
+merge, and what is left is a shortest path over a graph whose nodes are
+`(cell, layer)`, where `Grid` is what position gets snapped to. Time only moves
+forward, so that graph is a DAG and its layers are already in topological order:
+no priority queue, no Dijkstra, just a forward sweep keeping the cheapest way
+into each cell. The reachable set at layer *k* is a disc of radius
+`speed·k·step` rather than 9ᵏ, and that is the whole difference — a few thousand
+states rather than 43 million rollouts.
+
+Merging is sound only if cost is additive per edge and the cost of finishing
+depends on nothing but `(cell, layer)`. Damage is; the graze, standing and
+wall-pinned terms are per-second and so are too. The turn penalty is the
+exception, because it needs the previous heading, which is history — so it is
+charged once, on the first leg, against the course we are really on. That is
+also the only turn that is real: legs past the first are re-planned from scratch
+next frame and never executed as written.
+
+Three things are approximate, and none of them is hidden:
+
+**Snapping.** Position is quantised to `Grid` at every layer and the error is a
+random walk, not a fixed offset — worst case `steps·grid/2` by the end of the
+horizon. The leg that actually gets executed is the first, whose geometry is
+exact; the drift only degrades the value of a tail that gets thrown away next
+frame anyway.
+
+**Re-billing.** A threat is charged on the leg where contact *starts*, and legs
+that open already overlapping score it as a graze of zero rather than a second
+hit. Without that a slow round would be billed on every step it spends inside
+us. A round crosses a body in about 20ms against a 100ms step, so contact
+starts and ends inside one leg in practice.
+
+**The beam.** Only the cheapest 64 states per layer are expanded. A firefight
+puts several times as many rounds in the air as a duel and every one of them is
+swept on every edge, so the exact search is the thing whose cost is not under
+our control — the frontier is. On the bench 64 measured inside the noise of
+exact, 3.4% against 3.2%, for a quarter of the time.
+
+The objective is a sum of damage in HP — see [What a round is worth](#what-a-round-is-worth).
+
+Measured in `dodgebot-test/bench.js`, 60 trials × 12s, against the same seeded
+fights with the same shot noise:
+
+```
+  Barrett 214u/s      no bot   branch      deep    ms/plan
+  ---------------------------------------------------------
+    0ms                96.9%     8.7%      3.2%    0.02 / 1.36
+   60ms                96.9%    29.7%     22.7%    0.02 / 1.42
+```
+
+Slower guns are already fully dodged by both — an M870 round at 66 u/s takes
+long enough that one turn is all anyone needs — and the difference there is
+noise in both directions. The deep search is worth having for the rounds that
+arrive before a two-leg plan can finish, and it costs nothing for the rest.
+
+Costs, in the order they matter:
+
+| | |
+| --- | --- |
+| **a hit** | `w × 1e6`, less `w × 1e4` per second of delay before it lands |
+| **a graze** | `w × exp(-gap / 0.6)` — graded, so the edge isn't shaved |
+| **pinned against a wall** | `2.5` per second of a leg spent not moving |
+| **standing still** | `0.5` per second, for the divergence it forfeits |
+| **changing heading** | `0.15`, enough to stop dithering and not to stop turning |
+
+`w` is the round's damage over `DODGE_DMG_REF` (25 HP, about a mid-tier round),
+so a typical threat weighs about 1 and every absolute constant in the table
+keeps the meaning it was tuned with. The graze carries the same `w` as the hit
+because that is what the term is — a hit discounted by how unlikely it is, with
+`exp(-gap / 0.6)` standing in for the probability. Shaving an AWC round is worth
+avoiding more than shaving a Vector round, in the ratio of what they would do
+to us.
+
+Standing and turning are charged per leg, against the course we are really on
+— ours while engaged, the user's otherwise. Charging standing only to a plan's
+opening heading made "dash, then stop" a free way to buy exactly the standing
+the penalty exists to discourage, and the 2x-divergence argument above is
+forfeited just as completely by stopping at 0.25s as by never starting.
+
+A hit outweighs everything else by six orders of magnitude, so the planner
+never trades one away for tidier geometry. Between two plans that both get
+hit it takes the *later* one: the extra tenth of a second is free option
+value — the shooter can lose the line, the round can find a wall, and we may
+simply be somewhere else by then.
+
+Damage outranks that delay bonus rather than competing with it. Over a 2s
+horizon the bonus is at most 2% of the hit term, so it only ever breaks ties
+between rounds within 2% of each other in damage — which is what it was always
+for. Taking an MP5 round now to avoid an AWC round later falls straight out of
+`11/25 × 1e6` against `180/25 × 1e6`.
+
+Walls are the collidable obstacles near us, inflated by our own radius so the
+planner can treat itself as a point, and each leg is clipped at the first one
+and split into the part actually spent moving and the part spent pinned where
+it stopped. A step is refused only if it puts us *deeper* into an obstacle
+than we already are — a plain inside/outside test would report every
+wall-ward heading as blocked the moment we touched a wall, and the bot would
+stand against it and eat the shot instead of sliding along it, which is the
+one thing it most needs to do while cornered.
+
+Speed is measured rather than assumed. `GameConfig` says 12, but water, being
+downed and a heavy weapon all scale it, and a planner that believes in 12
+while the player wades at 9 plans escapes it cannot make. Only frames where
+we were plainly moving update the estimate; a standing player would otherwise
+drag it to zero.
+
+### Taking the keys, and giving them back
+
+The trigger is one question, asked every frame: **does the course the user is
+already on get hit inside `trigger` seconds?** Nothing else engages the bot —
+not proximity, not the number of bullets in the air. If the user's own line
+happens to clear the shot, they keep the keys.
+
+That question is asked through `realBindDown`, which reads past our own
+synthetic input layer, so the bot can never see its own held keys and latch
+on itself. The arrow keys are tracked separately, because the bundle's
+movement path ORs the binds with a raw read of them:
+
+```js
+moveLeft = isBindDown(MoveLeft) || keyDown(Left) && !isKeyBound(Left)
+```
+
+Driving an axis, rather than adding to one, means the user's keys have to
+come *off* — their W and our S otherwise cancel and the dodge goes nowhere.
+`heldInputs` could only ever add, so this adds its inverse, `suppressedInputs`,
+which makes `isBindDown` and `isBindPressed` report false whatever the
+keyboard is doing. Nothing in the bind layer can suppress that raw `keyDown`
+above, but reporting the arrow as *bound* falsifies the second half of the
+`&&`, so `isKeyBound` is wrapped too, and only while the bot is driving.
+
+The keys go back after `releaseMs` of that same question answering no. It is
+a hold-over rather than an instant handback so a plan isn't abandoned halfway
+through the frame it starts working. Anything that can go wrong hands them
+back immediately: the toggle going off, the local player dying or
+disappearing, a new match, or an exception anywhere in the step.
+
+### Knobs
+
+| MOD tab | default | |
+| --- | --- | --- |
+| Dodge bot | off | master switch |
+| Take over at | 0.45s | seconds-to-impact at which the bot engages |
+| Horizon | 0.8s | how far ahead a plan is scored |
+| Clearance | 0.35 | safety added to the player radius when deciding what is a hit |
+| Ping lead | 1.0 | multiplier on the measured round trip when advancing threats |
+| Hand back | 150ms | how long the user's course must stay clear |
+
+`window.__dodge()` reports the live state — engaged or not, current heading,
+measured speed, threat and wall counts, the worst round in the air in HP and
+how many of the current threats we could actually name, the lead actually being
+applied, and time-to-impact both on the user's course and on the plan's. A
+`typed` well under `threats` means the `addBullet` hook went on mid-flight or
+survev has shipped a bullet `BULLET_DAMAGE` doesn't list.
+
+### What it doesn't do
+
+Only bullets that already exist are dodged. The larger source of damage is
+the shot that hasn't been fired yet, aimed at where a predictable path says
+we'll be — countering that means modelling each enemy as a threat source and
+bounding how long any one heading is held, and none of that is here. The gas
+isn't modelled either, so a dodge can push us into it; the bursts are under a
+second, which makes that survivable rather than solved.
+
+Our own health isn't an input. A round is priced at what it would take off us,
+never at what fraction of what's left that is — so the bot plays a hit the same
+way at 12 HP as at 100, when at 12 the right move is to accept a wall-pin
+penalty that would be silly at full health. Armour and helmets aren't modelled
+either, and neither is `damageMult`.
 
 ## Aiming on the clock
 

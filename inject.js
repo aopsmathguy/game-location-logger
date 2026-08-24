@@ -81,6 +81,60 @@
     potato_cannon: 100, potato_smg: 100, potato_lmg: 100, bugle: 100
   };
 
+  // bulletType (as it arrives on the wire, and as stamped onto barn entries by
+  // the addBullet hook) -> [damage, falloff], lifted verbatim from
+  // survev's `shared/defs/gameObjects/bulletDefs.ts`. Two numbers because those
+  // are the only two the server's damage formula needs that aren't already on
+  // the client's own barn entry:
+  //
+  //     finalDamage  = def.damage * damageMult
+  //     finalDamage *= 1 / (reflectCount + 1)
+  //     distT        = clamp(distanceTraveled / bullet.distance, 0, 1)
+  //     finalDamage *= remap(distT, 0, 1, 1, def.falloff)
+  //
+  // `distance` is deliberately not in here. The instance's own distance —
+  // after the reflect decay, the distanceMult, the variance and the ±1 spray
+  // jitter — is what the falloff divides by, and the client's barn entry
+  // already carries exactly that number under `distance`. Copying the def's
+  // would silently use the wrong denominator.
+  //
+  // `damageMult` is the one factor that can't be recovered: it never goes on
+  // the wire (see updateMsg's bullet block), so a perk that scales damage is
+  // invisible here and every round is priced at its base value.
+  //
+  // Same static-table caveat as GUN_BULLET_SPEED: re-derive when survev ships
+  // new guns. An unlisted type falls back to DODGE_DMG_REF, which is exactly
+  // the flat hit-counting the bot did before this table existed.
+  const BULLET_DAMAGE = {
+    bullet_mp5: [11, 0.8], bullet_ak47: [13.5, 0.9], bullet_scar: [15, 0.85],
+    bullet_an94: [20, 0.94], bullet_groza: [12.5, 0.85], bullet_grozas: [13, 0.87],
+    bullet_model94: [44, 0.75], bullet_blr: [56, 0.9], bullet_mosin: [72, 0.95],
+    bullet_sv98: [80, 0.96], bullet_awc: [180, 0.94], bullet_scarssr: [81, 0.85],
+    bullet_m39: [28, 0.9], bullet_svd: [37, 0.9], bullet_garand: [44, 0.94],
+    bullet_buckshot: [12.5, 0.3], bullet_flechette: [8.75, 0.85], bullet_frag: [12, 0.3],
+    bullet_slug: [77, 0.85], bullet_birdshot: [4, 0.25], bullet_m9: [13, 0.7],
+    bullet_m9_cursed: [13, 0.7], bullet_m93r: [12, 0.7], bullet_p30l: [21, 0.75],
+    bullet_ot38: [26, 0.75], bullet_ots38: [32, 0.77], bullet_colt45: [29, 0.7],
+    bullet_m1911: [16, 0.7], bullet_m1a1: [13, 0.8], bullet_mkg45: [29, 0.75],
+    bullet_deagle: [35, 0.75], bullet_barrett: [99, 0.975], bullet_sw500: [64, 0.92],
+    bullet_ash12: [31, 0.875], bullet_mac10: [9.25, 0.6], bullet_ump9: [15, 0.75],
+    bullet_vector: [7.5, 0.6], bullet_vector45: [9.5, 0.6], bullet_scorpion: [10.75, 0.77],
+    bullet_vss: [24, 0.85], bullet_dp28: [14, 0.9], bullet_bar: [17.5, 0.9],
+    bullet_imbel: [12, 0.9], bullet_pkp: [18, 0.9], bullet_glock: [9, 0.5],
+    bullet_famas: [17, 0.8], bullet_hk416: [11, 0.85], bullet_m4a1: [14, 0.82],
+    bullet_mk12: [23, 0.9], bullet_l86: [27, 0.9], bullet_m249: [14, 0.9],
+    bullet_qbb97: [14, 0.9], bullet_scout: [56, 0.92],
+    // Zero damage, and the bot drops them rather than dodging them. The flare's
+    // falloff of 10 is a real value from the defs and is harmless against a
+    // base of 0 — it is kept so the table stays a faithful copy.
+    bullet_flare: [0, 10], bullet_invis: [0, 1],
+    // Explosion fragments. Flat falloff, and they reach us as `damageSelf`
+    // rounds, which is the one way our own shot comes back at us.
+    shrapnel_barrel: [2, 1], shrapnel_stove: [5, 1], shrapnel_frag: [20, 1],
+    shrapnel_strobe: [3, 1], shrapnel_usas: [5, 1], shrapnel_mirv_mini: [6, 1],
+    shrapnel_bomb_iron: [10, 1], shrapnel_cobalt: [5, 1],
+  };
+
   function looksLikePlayer(obj) {
     // The Player class (`er`) declares many of its sprite fields with real
     // readable names that are stable across builds: bodySprite, helmetSprite,
@@ -1528,6 +1582,12 @@
     // the wrong-layer fade: both mean "no shot on this one", so they read as
     // the same state rather than as a hierarchy of two different problems.
     blockedAlpha: UNREACHABLE_ALPHA,
+    // Render only what is actually part of the collision set: building roofs,
+    // bushes and destroyed-obstacle rubble stop being drawn, so a house shows
+    // its inside. Off by default and independent of `enabled` above — it
+    // draws nothing on the overlay canvas, it only stops the game drawing
+    // some of its own art. See the collidable-only render block below.
+    collidableOnly: 0,
   };
 
   // Bank shots: when the direct line is walled off, look for a one-bounce path
@@ -2997,6 +3057,12 @@
     // on turns and stops); netcode_sim.js measures the trade either way. Aim
     // is unaffected — it solves on true clock time, not render time.
     renderLag: 0.5,
+    // Draw bullets at the same instant the players are drawn at, instead of at
+    // t_now. Off by default: it is strictly more coherent, and it costs you
+    // half a tick of warning on incoming fire, which is a real trade for a
+    // human at the keyboard even though the dodge bot is unaffected either way
+    // (it reads the barn's true positions, not the sprites).
+    bulletClock: 0,
   };
 
   // Ping readout shown above the team panel. Hoisted for the same
@@ -3014,6 +3080,54 @@
   // that ship off.
   const NAME_TAGS = {
     enabled: 1,
+  };
+
+  // Debug render: throw the art away and draw the collision geometry instead.
+  // Hoisted with the rest for the same temporal-dead-zone reason. Off by
+  // default — it is a display switch and touches no gameplay state, but it
+  // makes the game unplayable-looking, so it is never on by accident.
+  const DEBUG_RENDER = {
+    enabled: 0,
+  };
+
+  // Dodge bot: while a bullet is on course to hit us, take the movement keys
+  // and steer out of the way; hand them straight back when none is. Hoisted
+  // with the rest for the temporal-dead-zone reason, and off by default —
+  // it is the only thing here that drives movement, so it never engages by
+  // accident. The solver, and what each of these knobs actually buys, are in
+  // the dodge-bot section below.
+  const DODGE = {
+    enabled: 0,
+    // Seconds-to-impact at which the bot takes over. Bigger means it engages
+    // earlier and holds the keys more of the time; smaller means it only
+    // steps in for a shot that is nearly landed, which is often too late,
+    // since clearing our own radius already costs ~83ms.
+    trigger: 0.45,
+    // How far ahead a plan is scored. Long enough to see the second bullet
+    // of a burst, short enough that the enemy's own aim hasn't gone stale.
+    horizon: 0.8,
+    // Extra clearance added to the player radius when deciding what counts
+    // as a hit. Pure safety factor against position and clock error.
+    margin: 0.35,
+    // Multiplier on the measured round trip when advancing threats to where
+    // the server will have them. 1.0 is the derivation in the section header;
+    // drop it toward 0 to dodge what is drawn instead of what is real.
+    leadK: 1,
+    // How long the user's own course has to stay clear before the keys go
+    // back. A hold-over, so a working dodge isn't abandoned halfway.
+    releaseMs: 150,
+    // Which search runs. Off is the two-leg branch search: nine headings held
+    // for the horizon, a second leg for the best few. On is the shortest path
+    // over (cell, time), which plans horizon/stepS decisions deep instead of
+    // two — worth several points of hit rate against fast rounds, where two
+    // legs run out of room, and the same everywhere else. See dodgeDpPlan.
+    deep: 1,
+    // Seconds one decision covers. horizon/stepS is how deep the plan goes.
+    stepS: 0.1,
+    // What position is snapped to so that paths can merge. Finer is more
+    // faithful and squarely more expensive; 0.2 measured a fifth of a point
+    // better than 0.35 for nearly twice the time.
+    cell: 0.35,
   };
 
   // ---------------------------------------------------------------------
@@ -3054,6 +3168,7 @@
       section: 'ESP' },
     { id: 'esp.losDim',   store: ESP,    key: 'losDim',  label: 'Dim blocked', kind: 'toggle' },
     { id: 'esp.blockedAlpha', store: ESP, key: 'blockedAlpha', label: 'Blocked fade',      min: 0,    max: 1,    step: 0.05, decimals: 2 },
+    { id: 'esp.collidableOnly', store: ESP, key: 'collidableOnly', label: 'Collidable only', kind: 'toggle' },
     { id: 'names.enemy',  store: NAME_TAGS, key: 'enabled', label: 'Enemy names', kind: 'toggle',
       section: 'Name tags' },
     { id: 'bank.enabled', store: BANK,  key: 'enabled', label: 'Bank shots', kind: 'toggle',
@@ -3061,6 +3176,16 @@
     { id: 'bank.prefer',  store: BANK,  key: 'prefer',  label: 'Prefer banks', kind: 'toggle' },
     { id: 'autoshoot.enabled', store: AUTOSHOOT, key: 'enabled', label: 'Autoshoot', kind: 'toggle',
       section: 'Autoshoot' },
+    { id: 'dodge.enabled',  store: DODGE, key: 'enabled',   label: 'Dodge bot', kind: 'toggle',
+      section: 'Dodge bot' },
+    { id: 'dodge.trigger',  store: DODGE, key: 'trigger',   label: 'Take over at', unit: 's',  min: 0.05, max: 1.5,  step: 0.05, decimals: 2 },
+    { id: 'dodge.horizon',  store: DODGE, key: 'horizon',   label: 'Horizon',      unit: 's',  min: 0.2,  max: 2,    step: 0.05, decimals: 2 },
+    { id: 'dodge.margin',   store: DODGE, key: 'margin',    label: 'Clearance',                min: 0,    max: 1.5,  step: 0.05, decimals: 2 },
+    { id: 'dodge.leadK',    store: DODGE, key: 'leadK',     label: 'Ping lead',                min: 0,    max: 2,    step: 0.05, decimals: 2 },
+    { id: 'dodge.releaseMs', store: DODGE, key: 'releaseMs', label: 'Hand back',   unit: 'ms', min: 0,    max: 1000, step: 25,   decimals: 0 },
+    { id: 'dodge.deep',     store: DODGE, key: 'deep',      label: 'Deep search', kind: 'toggle' },
+    { id: 'dodge.stepS',    store: DODGE, key: 'stepS',     label: 'Step',         unit: 's',  min: 0.05, max: 0.4,  step: 0.01, decimals: 2 },
+    { id: 'dodge.cell',     store: DODGE, key: 'cell',      label: 'Grid',         unit: 'u',  min: 0.15, max: 1,    step: 0.05, decimals: 2 },
     { id: 'aim.reactionMs',     store: AIM_HUMAN, key: 'reactionMs',     label: 'Reaction',  unit: 'ms', min: 0,    max: 400,  step: 5,    decimals: 0,
       section: 'Aim humanization' },
     { id: 'aim.followFraction', store: AIM_HUMAN, key: 'followFraction', label: 'Follow',                min: 0.01, max: 1,    step: 0.01, decimals: 2 },
@@ -3074,8 +3199,11 @@
     { id: 'net.jitterK',        store: NETCODE,   key: 'jitterK',        label: 'Jitter buf',            min: 0,    max: 5,    step: 0.1,  decimals: 1 },
     { id: 'net.clockHalfLife',  store: NETCODE,   key: 'clockHalfLife',  label: 'Clock',     unit: ' pkt', min: 5,  max: 400,  step: 5,    decimals: 0 },
     { id: 'net.renderLag',      store: NETCODE,   key: 'renderLag',      label: 'Playout',   unit: ' tick', min: 0, max: 2,   step: 0.05, decimals: 2 },
+    { id: 'net.bulletClock',    store: NETCODE,   key: 'bulletClock',    label: 'Bullets on clock', kind: 'toggle' },
     { id: 'hud.ping',           store: PING_UI,   key: 'enabled',        label: 'Ping readout', kind: 'toggle',
       section: 'HUD' },
+    { id: 'debug.render',       store: DEBUG_RENDER, key: 'enabled',     label: 'Debug', kind: 'toggle',
+      section: 'Debug' },
   ];
 
   // ---------------------------------------------------------------------
@@ -3690,6 +3818,23 @@
   const pendingInputs = new Set();
   const framePressInputs = new Set();
   const heldInputs = new Set();
+  //   suppressedInputs — the inverse of heldInputs: isBindDown and
+  //                      isBindPressed both report false for anything in it,
+  //                      whatever the user's keyboard is doing. Needed the
+  //                      moment something wants to *drive* an axis rather
+  //                      than add to it — the dodge bot's S is worthless if
+  //                      the user's W is still going out on the same packet.
+  //                      heldInputs wins over it, so the two are kept
+  //                      disjoint by whoever sets them.
+  const suppressedInputs = new Set();
+  // Arrow keys, which the movement path reads raw:
+  //     moveLeft = isBindDown(MoveLeft) || keyDown(Left) && !isKeyBound(Left)
+  // Nothing in the bind layer can suppress that `keyDown`, but reporting the
+  // key as *bound* falsifies the second half of the `&&`, which is what this
+  // flag makes isKeyBound do. Set by the dodge bot for as long as it is
+  // driving; nothing else uses it.
+  const ARROW_KEYCODES = new Set([37, 38, 39, 40]);
+  let suppressArrowMovement = false;
 
   function ensureBindHook(binds) {
     if (!binds || binds === bindHookTarget) return;
@@ -3702,12 +3847,24 @@
         pendingInputs.delete(input);
         return true;
       }
+      if (suppressedInputs.has(input)) return false;
       return origPressed.call(this, input);
     };
     binds.isBindDown = function(input) {
       if (heldInputs.has(input)) return true;
+      if (suppressedInputs.has(input)) return false;
       return origDown.call(this, input);
     };
+    // Only wrapped when it exists, so a re-mangle that renames it degrades to
+    // "the arrow keys still work while the dodge bot drives" rather than to a
+    // thrown exception on every input frame.
+    if (typeof binds.isKeyBound === 'function') {
+      const origKeyBound = binds.isKeyBound;
+      binds.isKeyBound = function(key) {
+        if (suppressArrowMovement && ARROW_KEYCODES.has(key)) return true;
+        return origKeyBound.call(this, key);
+      };
+    }
     origIsBindPressed = origPressed;
     origIsBindDown = origDown;
     bindHookTarget = binds;
@@ -3746,6 +3903,15 @@
     if (!on) { heldInputs.delete(input); return; }
     if (!heldInputs.has(input)) framePressInputs.add(input);
     heldInputs.add(input);
+  }
+
+  // Force an input to read as up regardless of the user's keyboard. No
+  // ensureBindHook here on purpose: suppression is only ever meaningful once
+  // something is already holding an input through the hook, and taking a key
+  // away is not a reason to install one.
+  function setInputSuppressed(input, on) {
+    if (on) suppressedInputs.add(input);
+    else suppressedInputs.delete(input);
   }
 
   // Edge-trigger on the user's Fire bind, whatever key/button that is.
@@ -3837,16 +4003,28 @@
   //            swap → shoot the other one beats waiting out the delay. Exactly
   //            the trick auto-quickswap does off the user's trigger, driven
   //            off ours instead. With two guns it alternates between them;
-  //            with one it taps melee and comes back.
+  //            with one it taps melee and comes back. An automatic on this
+  //            path holds the trigger for the shot rather than tapping it —
+  //            see below.
   //   auto    — hold the trigger. `fireMode: 'auto'` is the only case survev
   //            reads `isBindDown(Fire)` for, and it keeps firing on its own.
   //   press   — everything else: a press per shot, paced at the gun's
   //            fireDelay, which is as fast as a semi-auto can go.
   //
-  // Slow wins over auto where they overlap (the USAS at the default threshold,
-  // and more of them if it is dialled down), because the swap beats the wait
-  // either way. The press path covers auto guns too, incidentally: `shootStart`
-  // is built off `isBindPressed` regardless of fire mode.
+  // Slow wins over auto where they overlap — the USAS-12 at the default
+  // threshold, joined by the Saiga-12 at 0.4 and the SPAS-16 at 0.35 as it is
+  // dialled down — because the swap beats the wait either way.
+  //
+  // Those guns take the slow path *holding* the trigger rather than tapping
+  // it, which is the one thing the three cases don't otherwise share. A tap
+  // sets `shootStart` without `shootHold`, and an automatic empirically will
+  // not fire on that: tapped, the magazine simply never moves, so the tap
+  // path left every auto gun that counted as slow silent forever rather than
+  // merely slow. (Nothing client-side explains it — the input message builds
+  // both flags regardless of fire mode — so the gate is server-side.) They
+  // hold until the magazine confirms the shell, then release and swap, and
+  // that release is also what stops a held auto gun from firing on straight
+  // through its own swap.
   //
   // The AUTOSHOOT store itself lives up beside AIMBOT, for the same
   // temporal-dead-zone reason: SETTINGS_SPECS binds a row to it.
@@ -3978,10 +4156,12 @@
     const tol = Math.atan2(PLAYER_RADIUS, Math.max(dist, PLAYER_RADIUS));
     if (Math.abs(angleDelta(aimState.theta, Math.atan2(dy, dx))) > tol) return null;
 
-    const mode = isSlowFireGun(weapon) ? 'swap'
-      : (GUN_AUTO.has(weapon) || GUN_BURST.has(weapon)) ? 'hold'
-      : 'press';
-    return { mode, weapon, ammo, game, me };
+    const auto = GUN_AUTO.has(weapon) || GUN_BURST.has(weapon);
+    const mode = isSlowFireGun(weapon) ? 'swap' : auto ? 'hold' : 'press';
+    // Carried separately from `mode` because the swap path needs it too: a
+    // slow gun that is also automatic still swaps, but it has to fire first,
+    // and tapping one does not fire it.
+    return { mode, weapon, ammo, game, me, auto };
   }
 
   function autoShootStep() {
@@ -4010,13 +4190,6 @@
       plan = autoShootPlan(obs);
     } catch {}
 
-    const binds = capturedGame?.[GAME_BINDS];
-    // Only the hold path leaves the trigger down. The other two work in
-    // presses and must not also be holding it, or an auto gun that counts as
-    // slow would keep firing straight through its own swap.
-    if (binds) setInputHeld(binds, AUTO_SWAP_INPUT_FIRE, plan?.mode === 'hold');
-    else heldInputs.delete(AUTO_SWAP_INPUT_FIRE);
-
     // Did the shot we pressed for actually go out? The magazine says so, and
     // it is checked against the reading taken at the press rather than against
     // the previous frame, so a gap in the readings can't swallow the drop.
@@ -4043,11 +4216,37 @@
       autoShootState.swapQueued = false;
     }
 
+    // An automatic on the swap path: hold the trigger until its shell is
+    // confirmed, then hand it straight back so the swap can happen off an
+    // unheld trigger. Dropping out of this the moment `swapQueued` goes up is
+    // what keeps the hold from firing on through the swap it just queued.
+    const autoHold = !!plan && plan.mode === 'swap' && plan.auto
+      && !autoShootState.swapQueued;
+
+    // Only the two hold cases leave the trigger down; the tap cases must not
+    // also be holding it. Decided after the swap bookkeeping above rather
+    // than before it, so a shell confirmed on this very tick releases the
+    // trigger on this tick too instead of a frame later.
+    const binds = capturedGame?.[GAME_BINDS];
+    if (binds) setInputHeld(binds, AUTO_SWAP_INPUT_FIRE, plan?.mode === 'hold' || autoHold);
+    else heldInputs.delete(AUTO_SWAP_INPUT_FIRE);
+
     // Nothing to press: an auto gun paces itself, and no plan means no shot.
     // Clearing the gate means the first shot of the next engagement goes out
     // on the frame it becomes available rather than waiting out a stale timer.
-    if (!plan || plan.mode === 'hold') {
+    if (!plan || plan.mode === 'hold' || autoHold) {
       autoShootState.nextPressAt = 0;
+      // The swap triggers off the magazine falling below a reading taken
+      // before the shot, and the held gun never reaches the press below that
+      // would take one. Without this it fires and never swaps — the same
+      // "shoots and waits" failure, arrived at from the other side.
+      //
+      // An unreadable magazine leaves this null, and the gun then just keeps
+      // holding: no confirmation, no swap. That is the safe way to fail here,
+      // since it degrades to exactly the automatic's own `hold` behaviour.
+      if (autoHold && autoShootState.ammoAtPress == null) {
+        autoShootState.ammoAtPress = plan.ammo;
+      }
       return;
     }
     if (autoShootState.swapQueued) return;
@@ -4092,6 +4291,1226 @@
     requestAnimationFrame(autoShootFrameTick);
   }
   requestAnimationFrame(autoShootFrameTick);
+
+  // ---------------------------------------------------------------------
+  // Dodge bot: hold the movement keys for exactly as long as a bullet is
+  // going to hit us, and hand them straight back when one isn't.
+  //
+  // What is and isn't dodgeable. A player moves at 12 u/s and the guns in
+  // GUN_BULLET_SPEED fire between 66 and 214 u/s, so nothing here can
+  // out-run a bullet: the only reason a dodge ever works is that the shot
+  // was aimed where we were *going*, and a shot led against a path we then
+  // leave misses. Clearing our own radius takes ~83ms of movement from a
+  // standstill but only ~42ms if we were already strafing across the shot
+  // and merely reverse, because then the two paths diverge at 2x speed
+  // rather than 1x. That is why the planner is allowed to keep moving —
+  // and why standing still, which looks perfectly safe to a one-bullet
+  // scoring pass, carries a standing penalty.
+  //
+  // The consequence to be honest about: at knife range there is no dodge.
+  // An SMG round from 8 units away arrives in under 100ms, less than the
+  // link's own round trip, and no input we send can be in time. This wins
+  // ranged exchanges and does nothing at all in a close one.
+  //
+  // Continuous collision, not sampled. Every threat is solved as a
+  // moving-circle-vs-moving-circle quadratic. A per-frame sample is not an
+  // option: a Barrett round crosses a player's diameter in 9ms and would
+  // step straight over a 16ms frame without ever testing as overlapping.
+  //
+  // Where the numbers come from. The barn's bullets carry `pos`, `dir`,
+  // `speed`, `startPos` and `distance` under real readable names, are
+  // advanced client-side every frame, and are deterministic straight lines
+  // from spawn — so the whole future path is known, not guessed. Bullets
+  // are then truncated at the first wall on their own path, because a round
+  // that dies on a crate is not a threat and treating it as one is what
+  // walks the bot out of cover.
+  //
+  // What a round is worth. Not one — its damage in HP, from BULLET_DAMAGE,
+  // through survev's own falloff evaluated at the point along the path where
+  // it reaches us, halved again per reflect. So both searches minimise expected
+  // HP lost rather than expected hit count, and a plan that takes an mp5 round
+  // to stay out of an awc's line is correctly the cheap one. The type is not on
+  // the barn entry and cannot be inferred from what is — see hookBulletBarn for
+  // how it is taken on the way past instead. A round we can't name is priced at
+  // DODGE_DMG_REF, which is the flat hit-counting this did before.
+  //
+  // Clocks. What we render is the server's world one one-way trip ago, and
+  // an input we send now is acted on one one-way trip from now, so the
+  // bullet the server tests against us has travelled roughly a full round
+  // trip further than the one we are looking at. Threats are advanced by
+  // `leadK * ping` before anything is solved, the same measured round trip
+  // the aim helper leads by, for the same reason.
+  //
+  // Takeover. The trigger is a single question asked every frame — does the
+  // course the *user* is already on get hit inside `trigger` seconds? — and
+  // it is asked against their real binds, read through realBindDown so the
+  // bot can never see its own synthetic input and latch on itself. Only
+  // then are their movement keys taken away. They come back after
+  // `releaseMs` of that same question answering no, which is a hold-over
+  // rather than an instant handback so that a plan doesn't get abandoned
+  // halfway through the frame it starts working.
+  // ---------------------------------------------------------------------
+
+  // The four movement binds, from the same Input enum as AUTO_SWAP_INPUT_*.
+  const DODGE_INPUT_LEFT = 0;
+  const DODGE_INPUT_RIGHT = 1;
+  const DODGE_INPUT_UP = 2;
+  const DODGE_INPUT_DOWN = 3;
+  const DODGE_MOVE_INPUTS = [DODGE_INPUT_LEFT, DODGE_INPUT_RIGHT, DODGE_INPUT_UP, DODGE_INPUT_DOWN];
+
+  // The nine things the server can be asked for: eight unit headings plus
+  // standing still, at index 0. World y is up — `moveUp` increments y — so
+  // +y is Up and not Down. Diagonals are unit length because the server
+  // normalizes the move vector before scaling it by speed; a diagonal is not
+  // faster, and treating it as if it were would make the planner believe in
+  // an escape it can't execute.
+  const DODGE_K = Math.SQRT1_2;
+  const DODGE_DIRS = [
+    { x: 0, y: 0 },
+    { x: 1, y: 0 }, { x: DODGE_K, y: DODGE_K }, { x: 0, y: 1 }, { x: -DODGE_K, y: DODGE_K },
+    { x: -1, y: 0 }, { x: -DODGE_K, y: -DODGE_K }, { x: 0, y: -1 }, { x: DODGE_K, y: -DODGE_K },
+  ];
+
+  const DODGE_SPEED_FALLBACK = 12;  // GameConfig.player.moveSpeed
+  const DODGE_SPEED_MIN = 3;        // below this we assume we weren't moving
+  const DODGE_SPEED_MAX = 24;       // above it, a teleport or a bad frame
+  const DODGE_SPEED_ALPHA = 0.15;
+  const DODGE_PLAN_MS = 16;         // one plan per frame at 60Hz
+  const DODGE_COMMIT_S = 0.25;      // length of a two-leg plan's first leg
+  const DODGE_BRANCH = 4;           // how many first legs get a second leg
+  const DODGE_WALL_STEP = 0.3;      // world units per wall-march sample
+  const DODGE_MAX_THREATS = 48;
+
+  // A hit dominates everything else by six orders of magnitude, so the
+  // planner never trades one away for tidier geometry. Between two plans
+  // that both get hit it takes the later hit: the extra tenth of a second is
+  // free option value — the shooter can lose the line, the round can find a
+  // wall, and we may simply be somewhere else by then.
+  //
+  // A hit is now worth `w * (HIT_COST - t * HIT_TIME_BONUS)`, where `w` is the
+  // round's damage over DODGE_DMG_REF. Damage ordering strictly outranks the
+  // time bonus — over a 2s horizon the bonus is at most 2% of the hit term, so
+  // it only ever breaks ties between rounds within 2% of each other in damage,
+  // which is what it was always for. Taking an mp5 round now to avoid an awc
+  // round later falls straight out: 11/25 * 1e6 against 180/25 * 1e6.
+  const DODGE_HIT_COST = 1e6;
+  const DODGE_HIT_TIME_BONUS = 1e4;
+  // What one unit of cost means, in HP. Roughly a mid-tier round, chosen so a
+  // typical threat weighs ~1 and every absolute constant below — the graze, the
+  // standing and wall-pin rates, the switch cost — keeps the meaning it was
+  // tuned with. It is also the fallback weight for a round whose type we can't
+  // name, so an unrecognised bullet degrades to the flat hit-counting the
+  // planner did before BULLET_DAMAGE existed rather than to being ignored.
+  const DODGE_DMG_REF = 25;
+  // Near misses are graded rather than free. A binary hit test has a cliff at
+  // the hitbox edge, and a plan scored on it will happily shave the edge —
+  // then one tick of jitter, or one centimetre of position error, turns the
+  // shave into a hit.
+  //
+  // Scaled by the same `w` as the hit, because that is what the term is: a hit
+  // discounted by how unlikely it is, and `exp(-gap/sigma)` is standing in for
+  // the probability. Shaving an awc round is worth avoiding more than shaving a
+  // vector round, in exactly the ratio of what they'd do to us.
+  const DODGE_GRAZE_SIGMA = 0.6;
+  const DODGE_SWITCH_COST = 0.15;   // per heading change, incl. the one off our current course
+  const DODGE_STILL_COST = 0.5;     // per second stood still; forfeits the 2x divergence
+  const DODGE_WALL_COST = 2.5;      // per second of a leg spent pinned, not moving
+
+  const dodgeState = {
+    engaged: false,
+    dirIdx: 0,
+    lastPlanAt: 0,
+    safeSince: 0,
+    speed: DODGE_SPEED_FALLBACK,
+    prevPos: null,
+    prevPosAt: 0,
+    threats: [],
+    walls: [],
+    userHitIn: Infinity,
+    planHitIn: Infinity,
+    planCost: 0,
+    leadS: 0,
+    planMs: 0,
+  };
+
+  function dodgeClamp(v, lo, hi, fallback) {
+    return Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : fallback;
+  }
+
+  // Arrow-key state, tracked here because the bundle's movement path ORs the
+  // binds with a raw arrow read —
+  //     moveLeft = isBindDown(MoveLeft) || keyDown(Left) && !isKeyBound(Left)
+  // — and the input manager behind that `keyDown` is not something we hold a
+  // reference to. Without this a user who plays on the arrows would have the
+  // trigger read their heading as "standing still". Taking the arrows *away*
+  // is a separate job, done by the isKeyBound hook in the synthetic-input
+  // block: making the key report as bound is what falsifies the `&&`.
+  const dodgeArrowDown = new Map([[37, false], [38, false], [39, false], [40, false]]);
+  window.addEventListener('keydown', (e) => {
+    if (dodgeArrowDown.has(e.keyCode)) dodgeArrowDown.set(e.keyCode, true);
+  }, true);
+  window.addEventListener('keyup', (e) => {
+    if (dodgeArrowDown.has(e.keyCode)) dodgeArrowDown.set(e.keyCode, false);
+  }, true);
+  window.addEventListener('blur', () => {
+    for (const k of dodgeArrowDown.keys()) dodgeArrowDown.set(k, false);
+  });
+
+  // ---- Finding the bullets ----------------------------------------------
+  //
+  // The bullet barn (`bn` in the bundle) is the only object the Game owns
+  // that has all of a `bullets` array, a `tracerColors` map and an
+  // `addBullet` method — and all three are real readable class fields, not
+  // mangled ones, so it is found by shape and needs no mangled.js entry.
+  // Same cache-the-key-then-revalidate shape as findObstaclePool.
+  let cachedBulletBarnKey = null;
+
+  function looksLikeBulletBarn(v) {
+    return !!v && typeof v === 'object' && Array.isArray(v.bullets) &&
+      !!v.tracerColors && typeof v.tracerColors === 'object' &&
+      typeof v.addBullet === 'function';
+  }
+
+  function findBulletBarn(game) {
+    if (!game || typeof game !== 'object') return null;
+    try {
+      if (cachedBulletBarnKey) {
+        const v = game[cachedBulletBarnKey];
+        if (looksLikeBulletBarn(v)) return hookBulletBarn(v);
+        cachedBulletBarnKey = null;
+      }
+      const names = Object.getOwnPropertyNames(game);
+      for (let i = 0; i < names.length; i++) {
+        if (looksLikeBulletBarn(game[names[i]])) {
+          cachedBulletBarnKey = names[i];
+          return hookBulletBarn(game[names[i]]);
+        }
+      }
+    } catch {}
+    return null;
+  }
+
+  // ---- Recovering the bullet type ---------------------------------------
+  //
+  // The barn's entries are the one place the type is thrown away. `addBullet`
+  // is handed the wire bullet, which carries `bulletType`, resolves it to a def
+  // and copies out only what the renderer needs — speed, distance, layer,
+  // damageSelf, tracer colours. Damage never makes the trip, and neither does
+  // the name it could be looked up under.
+  //
+  // Identifying it after the fact from what survives doesn't work: `speed` is
+  // def.speed times a variance the wire also doesn't carry, and speeds collide
+  // anyway — every shotgun in the game fires at 66, and buckshot, birdshot and
+  // slug do 12.5, 4 and 77.
+  //
+  // So the type is taken on the way past, and stamped onto the entry that call
+  // wrote. Which entry that is has to be worked out rather than observed: the
+  // barn pools its entries and `addBullet` returns nothing. It takes the first
+  // slot that is neither `alive` nor `collided`, and pushes a fresh one when
+  // there isn't one — so finding that slot before the call, by the same rule,
+  // and falling back to the array's new tail, names it exactly.
+  //
+  // Reuse can't go stale: a pooled slot is re-stamped every time it is handed
+  // out, and is only ever read while `alive`. Bullets already in flight when
+  // the hook goes on have no stamp and price at DODGE_DMG_REF, which lasts as
+  // long as they do.
+  function hookBulletBarn(barn) {
+    if (!barn || barn.__dodgeTypeHook) return barn;
+    const orig = barn.addBullet;
+    if (typeof orig !== 'function') return barn;
+    // Marked before the attempt, not after: if assigning to a barn we can't
+    // write to throws, we want to give up on it rather than retry every frame
+    // for the rest of the round.
+    barn.__dodgeTypeHook = true;
+    try {
+      // Own-property assignment shadowing the class method, so it dies with
+      // the barn instead of leaking onto the next game's barn.
+      barn.addBullet = function(bullet) {
+        const list = this.bullets;
+        let slot = null;
+        if (Array.isArray(list)) {
+          for (let i = 0; i < list.length; i++) {
+            if (!list[i].alive && !list[i].collided) { slot = list[i]; break; }
+          }
+        }
+        const ret = orig.apply(this, arguments);
+        try {
+          const b = slot || (Array.isArray(list) ? list[list.length - 1] : null);
+          if (b) b.__dodgeType = bullet?.bulletType ?? null;
+        } catch {}
+        return ret;
+      };
+    } catch {}
+    return barn;
+  }
+
+  // What a round would take off us if it landed, in HP, at the point along its
+  // own path where it is going to reach us. survev's own formula, minus the
+  // `damageMult` the wire doesn't carry — see BULLET_DAMAGE.
+  //
+  // `travelled` is distance-at-impact rather than distance-now, because falloff
+  // is evaluated at the collision and the two differ by most of a round's life
+  // at sniper range. Reflects halve, third, quarter — a shot that has already
+  // bounced off a pan is the one case where a round we can see is worth
+  // markedly less than its table entry.
+  function dodgeBulletDamage(type, travelled, distance, reflectCount) {
+    const def = type ? BULLET_DAMAGE[type] : null;
+    if (!def) return DODGE_DMG_REF;
+    let dmg = def[0];
+    if (!(dmg > 0)) return 0;
+    const n = Number(reflectCount);
+    if (Number.isFinite(n) && n > 0) dmg /= n + 1;
+    if (distance > 0) {
+      const distT = Math.min(Math.max(travelled / distance, 0), 1);
+      dmg *= 1 + distT * (def[1] - 1);
+    }
+    return dmg;
+  }
+
+  function dodgePlayerInfo(roster, id) {
+    try {
+      return roster?.getPlayerInfo?.(id) ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  // Live bullets, in plan-time coordinates: position advanced to where the
+  // server will have it when our input lands, velocity as a vector, and
+  // `tMax` as the seconds of life it has left after truncation at the first
+  // wall on its own path.
+  //
+  // `reach` is how far we could possibly move inside the horizon: a round that
+  // cannot come within our radius plus that of where we stand is scenery, and
+  // is dropped before it costs anything. Without the filter a firefight's worth
+  // of tracers flying somewhere else fills the DODGE_MAX_THREATS slots in barn
+  // order — which is arrival order, and has nothing to do with danger — and the
+  // round that is actually going to hit us never gets one.
+  function dodgeBuildThreats(game, selfId, selfInfo, roster, layer, leadS, margin,
+                             px, py, reach, horizon) {
+    const out = dodgeState.threats;
+    out.length = 0;
+    const barn = findBulletBarn(game);
+    const bullets = barn?.bullets;
+    if (!Array.isArray(bullets)) return out;
+
+    const R = PLAYER_RADIUS + margin;
+    for (let i = 0; i < bullets.length; i++) {
+      const b = bullets[i];
+      if (!b || !b.alive) continue;
+      const speed = Number(b.speed);
+      if (!(speed > 0)) continue;
+      const pos = b.pos, dir = b.dir, start = b.startPos;
+      if (!pos || !dir || !start) continue;
+      if (!Number.isFinite(pos.x) || !Number.isFinite(dir.x)) continue;
+
+      // Our own rounds only come back at us as shrapnel or off a reflector,
+      // which is exactly what the barn's own damageSelf flag already means.
+      const shooter = Number(b.playerId);
+      if (selfId != null && shooter === selfId && !b.damageSelf) continue;
+      // A squadmate's round passes through us in every non-FF mode, so
+      // dodging it would hand the keys away for nothing. Unknown shooter
+      // counts as hostile, matching isHostileTo's own default.
+      if (roster && shooter !== selfId &&
+          !isHostileTo(selfInfo, dodgePlayerInfo(roster, shooter))) continue;
+      // The game's own bullet-vs-player layer test, `sameLayer(player.layer,
+      // bullet.layer) || player.layer & 2`: standing on a stairwell exposes
+      // us to rounds from both layers at once, and dropping that clause would
+      // make the bot blind on exactly the tile where it is most cornered.
+      if (!sameLayerAs(layer, b.layer) && !(layer & 2)) continue;
+
+      // Flares and the invisible round do no damage. Dropping them here rather
+      // than letting them score as zero matters twice over: they would take a
+      // threat slot from a round that can actually hurt us, and the trigger
+      // reads `firstHit` regardless of what a threat is worth, so one flare on
+      // course would take the keys away for the whole time it was in the air.
+      const btype = b.__dodgeType ?? null;
+      const bdef = btype ? BULLET_DAMAGE[btype] : null;
+      if (bdef && !(bdef[0] > 0)) continue;
+
+      const total = Number(b.distance);
+      let remaining = total - Math.hypot(pos.x - start.x, pos.y - start.y);
+      if (!(remaining > 0)) continue;
+
+      const lead = Math.min(leadS * speed, remaining);
+      const x = pos.x + dir.x * lead;
+      const y = pos.y + dir.y * lead;
+      remaining -= lead;
+      if (!(remaining > 0)) continue;
+      // How far it has flown by plan-time zero. Captured before the wall clip
+      // below shortens `remaining` for a reason unrelated to distance flown.
+      const flown = total - remaining;
+
+      const wall = firstBulletHit(x, y, x + dir.x * remaining, y + dir.y * remaining, layer, 0);
+      if (wall && wall.dist < remaining) {
+        if (!(wall.dist > 0)) continue;
+        remaining = wall.dist;
+      }
+
+      const wx = dir.x * speed, wy = dir.y * speed;
+      const tMax = remaining / speed;
+      // How soon it could reach anywhere we could be. Negative means never,
+      // and past the horizon means not while this plan lasts; either way every
+      // rollout would score it as a clean miss.
+      const due = dodgeReachTime(x, y, wx, wy, tMax, px, py, R + reach);
+      if (due < 0 || due > horizon) continue;
+
+      // Damage is what both searches minimise. `due` is the earliest this round
+      // could touch anywhere we might be, so it is the best estimate of where
+      // along its own path the falloff gets evaluated — and being the earliest,
+      // it is also the shortest flight and so the most damage the round can
+      // still be worth. Erring high is the right side: it can only make the bot
+      // take a threat more seriously than it deserves.
+      const dmg = dodgeBulletDamage(btype, flown + speed * due, total, b.reflectCount);
+      // What the cost function actually charges. Precomputed per threat rather
+      // than per sweep because the deep search evaluates every threat on every
+      // edge of a few thousand states, and this would otherwise be a division
+      // in the innermost loop in the whole mod.
+      const w = dmg / DODGE_DMG_REF;
+
+      if (out.length < DODGE_MAX_THREATS) {
+        out.push({ x, y, wx, wy, tMax, R, due, dmg, w, type: btype });
+        continue;
+      }
+      // At the cap, the newcomer displaces whichever slot is furthest from
+      // mattering, so the set we keep is the most urgent rather than the first.
+      let worst = 0;
+      for (let j = 1; j < out.length; j++) if (out[j].due > out[worst].due) worst = j;
+      if (due < out[worst].due) out[worst] = { x, y, wx, wy, tMax, R, due, dmg, w, type: btype };
+    }
+    return out;
+  }
+
+  // Earliest time in [0, tMax] at which a threat starting at (x,y) and
+  // travelling at (wx,wy) comes within `R` of the fixed point (px,py); -1 if it
+  // never does. The same quadratic dodgeSweep solves, run against a stationary
+  // us with `R` inflated by everywhere we could move to — which makes a pass
+  // conservative: anything it rejects is unreachable by every plan.
+  function dodgeReachTime(x, y, wx, wy, tMax, px, py, R) {
+    const qx = x - px, qy = y - py;
+    const c = qx * qx + qy * qy - R * R;
+    if (c <= 0) return 0;
+    const a = wx * wx + wy * wy;
+    if (!(a > 1e-9)) return -1;
+    const b = qx * wx + qy * wy;
+    if (b >= 0) return -1;
+    const disc = b * b - a * c;
+    if (disc < 0) return -1;
+    const t = (-b - Math.sqrt(disc)) / a;
+    return t <= tMax ? Math.max(t, 0) : -1;
+  }
+
+  // ---- The collision primitive ------------------------------------------
+  //
+  // Earliest touch between a disc of radius `th.R` centred on (px,py) moving
+  // at (vx,vy) and threat `th`, over the leg [t0, t0+dur] of the plan. Both
+  // bodies are on constant velocities for the whole leg, so this is one
+  // quadratic and no iteration:
+  //     |q + u*t| = R,  q = bullet - us,  u = bullet velocity - ours
+  // Writes into the caller's minima arrays rather than returning, so a plan's
+  // legs accumulate into one answer per threat — and so a partial rollout can
+  // be snapshotted and resumed, which is what lets the shared prefix and the
+  // shared first leg below be computed once instead of once per plan.
+  function dodgeSweep(i, px, py, vx, vy, th, t0, dur, hitAt, minGap) {
+    const span = Math.min(dur, th.tMax - t0);
+    if (!(span > 0)) return;
+    const qx = th.x + th.wx * t0 - px;
+    const qy = th.y + th.wy * t0 - py;
+    const R = th.R;
+    const c = qx * qx + qy * qy - R * R;
+    if (c <= 0) {                       // already overlapping at the leg's start
+      if (t0 < hitAt[i]) hitAt[i] = t0;
+      minGap[i] = 0;
+      return;
+    }
+    const ux = th.wx - vx;
+    const uy = th.wy - vy;
+    const a = ux * ux + uy * uy;
+    if (!(a > 1e-9)) {                  // no relative motion; the gap is fixed
+      const gap = Math.sqrt(c + R * R) - R;
+      if (gap < minGap[i]) minGap[i] = gap;
+      return;
+    }
+    const b = qx * ux + qy * uy;
+    // Closest approach, clipped to the leg, recorded even for a clean miss —
+    // that is what makes a graze cost something. See DODGE_GRAZE_SIGMA.
+    const ts = Math.min(Math.max(-b / a, 0), span);
+    const gap = Math.hypot(qx + ux * ts, qy + uy * ts) - R;
+    if (gap < minGap[i]) minGap[i] = gap;
+    if (b >= 0) return;                 // separating for the whole leg
+    const disc = b * b - a * c;
+    if (disc < 0) return;
+    const t = (-b - Math.sqrt(disc)) / a;
+    if (t >= 0 && t <= span && t0 + t < hitAt[i]) hitAt[i] = t0 + t;
+  }
+
+  // ---- Walls -------------------------------------------------------------
+  //
+  // Movement blockers near us, inflated by our own radius so the planner can
+  // then treat itself as a point. Inflating an AABB squares off its corners,
+  // which is conservative — it keeps us slightly further from a corner than
+  // the game would — and erring toward clearance is the right side to err on
+  // for something whose whole job is not being touched.
+  function dodgeBuildWalls(x, y, reach, layer) {
+    const out = dodgeState.walls;
+    out.length = 0;
+    const pad = PLAYER_RADIUS;
+    const obstacles = getObstacles();
+    for (let i = 0; i < obstacles.length; i++) {
+      const o = obstacles[i];
+      // Movement collision, not bullet collision: a window stops us and not a
+      // bullet, a bush stops neither, so this is `collidable` and nothing else.
+      if (!o || !o.active || o.dead || !o.collidable) continue;
+      if (!sameLayerAs(layer, o.layer)) continue;
+      const c = o.collider;
+      if (!c) continue;
+      if (c.type === COLLIDER_AABB) {
+        if (!c.min || !c.max) continue;
+        if (c.max.x + pad < x - reach || c.min.x - pad > x + reach) continue;
+        if (c.max.y + pad < y - reach || c.min.y - pad > y + reach) continue;
+        out.push({ box: true, minX: c.min.x - pad, minY: c.min.y - pad,
+                   maxX: c.max.x + pad, maxY: c.max.y + pad });
+      } else if (c.type === COLLIDER_CIRCLE) {
+        if (!c.pos) continue;
+        const r = c.rad + pad;
+        if (Math.hypot(c.pos.x - x, c.pos.y - y) > reach + r) continue;
+        out.push({ box: false, x: c.pos.x, y: c.pos.y, rad: r });
+      }
+    }
+    return out;
+  }
+
+  // How far inside the inflated set a point is; 0 when it is clear of all of
+  // them. Depth rather than a boolean because that is what lets us tell
+  // "moving into the wall" from "sliding along one we are already touching".
+  function dodgeDepth(x, y, walls) {
+    let worst = 0;
+    for (let i = 0; i < walls.length; i++) {
+      const w = walls[i];
+      const d = w.box
+        ? Math.min(x - w.minX, w.maxX - x, y - w.minY, w.maxY - y)
+        : w.rad - Math.hypot(x - w.x, y - w.y);
+      if (d > worst) worst = d;
+    }
+    return worst;
+  }
+
+  // How far we actually get this way before something stops us. A step is
+  // only refused if it puts us *deeper* into an obstacle than we already
+  // are — a plain inside/outside test would report every wall-ward heading as
+  // blocked the moment we touched a wall, and the bot would stand against it
+  // and eat the shot instead of sliding along it, which is the one thing it
+  // most needs to be able to do while cornered.
+  function dodgeTravel(x, y, dx, dy, maxDist, walls) {
+    if (!walls.length || !(maxDist > 0)) return maxDist > 0 ? maxDist : 0;
+    const start = dodgeDepth(x, y, walls);
+    const steps = Math.ceil(maxDist / DODGE_WALL_STEP);
+    let got = 0;
+    for (let s = 1; s <= steps; s++) {
+      const d = Math.min(s * DODGE_WALL_STEP, maxDist);
+      if (dodgeDepth(x + dx * d, y + dy * d, walls) > start + 1e-4) break;
+      got = d;
+    }
+    return got;
+  }
+
+  // ---- Scoring a plan ----------------------------------------------------
+  //
+  // A plan is a sequence of (heading, duration) legs. Each leg is clipped at
+  // the first wall and split in two — the part actually spent moving and the
+  // part spent pinned where it stopped — so a heading that runs out of room is
+  // scored on what it really does rather than on what it intended.
+  //
+  // Legs are advanced through a context object rather than run as one closed
+  // function, because within a frame most of the work is shared. Every plan
+  // starts with the same latency prefix (see dodgeStep), and every second leg
+  // of a branch starts from the same first leg; advancing a context once and
+  // copying it is how those get paid for once instead of once per plan. The
+  // context carries the per-threat minima with it, so a copy resumes exactly
+  // where the original left off.
+  function dodgeMakeCtx() {
+    return {
+      x: 0, y: 0, t: 0,
+      pinned: 0,        // seconds stopped against a wall, wanting to move
+      still: 0,         // seconds deliberately standing
+      turns: 0,         // heading changes, counting the one off our current course
+      lastDir: -1,
+      lastTravel: 0,    // distance the most recent leg actually covered
+      hitAt: new Float64Array(DODGE_MAX_THREATS),
+      minGap: new Float64Array(DODGE_MAX_THREATS),
+    };
+  }
+
+  const dodgeCtxPrefix = dodgeMakeCtx();  // where the latency prefix leaves us
+  const dodgeCtxFirst = dodgeMakeCtx();   // where a candidate first leg leaves us
+  const dodgeCtxWork = dodgeMakeCtx();    // the rollout currently being scored
+
+  function dodgeCtxReset(c, x, y, dirIdx, n) {
+    c.x = x; c.y = y; c.t = 0;
+    c.pinned = 0; c.still = 0; c.turns = 0;
+    c.lastDir = dirIdx; c.lastTravel = 0;
+    for (let i = 0; i < n; i++) { c.hitAt[i] = Infinity; c.minGap[i] = Infinity; }
+  }
+
+  function dodgeCtxCopy(dst, src, n) {
+    dst.x = src.x; dst.y = src.y; dst.t = src.t;
+    dst.pinned = src.pinned; dst.still = src.still; dst.turns = src.turns;
+    dst.lastDir = src.lastDir; dst.lastTravel = src.lastTravel;
+    for (let i = 0; i < n; i++) { dst.hitAt[i] = src.hitAt[i]; dst.minGap[i] = src.minGap[i]; }
+  }
+
+  // One leg, in place, clipped at the horizon. `travel` hands in a distance the
+  // caller has already marched for this exact (position, heading, duration) —
+  // the branch search reuses one first-leg wall march across all of that leg's
+  // continuations, since the march is the expensive part and none of them can
+  // change it. Pass -1 to march it here.
+  function dodgeAdvance(c, dirIdx, dur, threats, speed, walls, horizon, travel) {
+    const n = threats.length;
+    const d = Math.min(dur, horizon - c.t);
+    if (!(d > 0)) return;
+    if (c.lastDir >= 0 && dirIdx !== c.lastDir) c.turns++;
+    c.lastDir = dirIdx;
+
+    const dir = DODGE_DIRS[dirIdx];
+    if (dir.x === 0 && dir.y === 0) {
+      c.still += d;
+      c.lastTravel = 0;
+      for (let i = 0; i < n; i++) {
+        dodgeSweep(i, c.x, c.y, 0, 0, threats[i], c.t, d, c.hitAt, c.minGap);
+      }
+      c.t += d;
+      return;
+    }
+
+    const want = speed * d;
+    const got = travel >= 0 ? travel : dodgeTravel(c.x, c.y, dir.x, dir.y, want, walls);
+    c.lastTravel = got;
+    const tMove = want > 0 ? d * (got / want) : 0;
+    if (tMove > 0) {
+      const vx = dir.x * speed, vy = dir.y * speed;
+      for (let i = 0; i < n; i++) {
+        dodgeSweep(i, c.x, c.y, vx, vy, threats[i], c.t, tMove, c.hitAt, c.minGap);
+      }
+      c.x += dir.x * got;
+      c.y += dir.y * got;
+    }
+    const tStuck = d - tMove;
+    if (tStuck > 0) {
+      c.pinned += tStuck;
+      for (let i = 0; i < n; i++) {
+        dodgeSweep(i, c.x, c.y, 0, 0, threats[i], c.t + tMove, tStuck, c.hitAt, c.minGap);
+      }
+    }
+    c.t += d;
+  }
+
+  // Carry our start state forward by the lead, un-scored: a position
+  // correction, not a leg of anybody's plan.
+  //
+  // This has to be separate from dodgeAdvance(), and getting it wrong is
+  // subtle enough to be worth the paragraph. Threats are placed where they
+  // will be when our input lands — a full round trip ahead of the frame we are
+  // looking at — so plan-time zero is that moment for them. Our own position is
+  // a round trip *behind* it, and closing that gap by running a scored leg
+  // through dodgeAdvance() advances the threats a second time along with it,
+  // because their positions are a function of plan time. Every bullet is then
+  // solved against us from a round trip too far away.
+  //
+  // At 60ms on an mp5 round that is 5 units of error and it mostly still works;
+  // at 140ms it is 12, and the bot cleanly proves to itself that a round about
+  // to hit us will miss. dodgebot-test/bench.js measures exactly that — at
+  // 140ms the hit rate with the bot driving was indistinguishable from having
+  // no bot at all, and at 60ms it was costing a factor of seven.
+  //
+  // So the gap is closed here instead: walls still clip it, since we really can
+  // be stopped during it, but nothing is swept and no cost is charged, and plan
+  // time stays at zero so the whole horizon belongs to the plan.
+  function dodgeCarry(c, dirIdx, dur, speed, walls) {
+    if (!(dur > 0)) return;
+    const dir = DODGE_DIRS[dirIdx];
+    if (dir.x === 0 && dir.y === 0) return;
+    const want = speed * dur;
+    const got = dodgeTravel(c.x, c.y, dir.x, dir.y, want, walls);
+    c.x += dir.x * got;
+    c.y += dir.y * got;
+  }
+
+  // What a finished rollout is worth. Standing and turning are charged here,
+  // per leg, rather than being added to the first leg by the caller: a plan
+  // that dashes and then stops still forfeits the divergence the header's 2x
+  // argument depends on, and charging only the opening heading made "move,
+  // then stand" a free way to buy the standing the penalty exists to discourage.
+  // Scored once per rollout and read immediately, so it is one object rather
+  // than forty-odd short-lived ones per frame.
+  const dodgeCostOut = { cost: 0, firstHit: Infinity };
+
+  function dodgeCtxCost(c, threats) {
+    const n = threats.length;
+    let cost = c.pinned * DODGE_WALL_COST + c.still * DODGE_STILL_COST +
+      c.turns * DODGE_SWITCH_COST;
+    let firstHit = Infinity;
+    for (let i = 0; i < n; i++) {
+      const w = threats[i].w;
+      const hit = c.hitAt[i];
+      if (hit < Infinity) {
+        cost += w * (DODGE_HIT_COST - hit * DODGE_HIT_TIME_BONUS);
+        // Weighted for cost, unweighted for the trigger: `firstHit` answers
+        // "when are we hit", which is the question the takeover asks and has
+        // nothing to do with how hard.
+        if (hit < firstHit) firstHit = hit;
+      } else if (c.minGap[i] < Infinity) {
+        cost += w * Math.exp(-Math.max(c.minGap[i], 0) / DODGE_GRAZE_SIGMA);
+      }
+    }
+    dodgeCostOut.cost = cost;
+    dodgeCostOut.firstHit = firstHit;
+    return dodgeCostOut;
+  }
+
+  // Every heading held for the rest of the window, then a second leg for the
+  // few that looked best. One leg is enough to get out of the way of one bullet
+  // and is reliably wrong about two: the heading that clears the first can be
+  // the one with nowhere left to go when the second arrives, and only a plan
+  // allowed to turn can see that coming.
+  //
+  // Which first legs earn that second leg comes from two rankings rather than
+  // one. Ranking by the full window alone discards every opening that is right
+  // for its first quarter-second and wrong after — a step into a doorway, a
+  // dash across a shot before turning back — which is exactly the class of plan
+  // that two legs exist to find, and which by construction never places well on
+  // a one-leg score. So the branch set is the best few by the full window plus
+  // the best few by the commit leg alone.
+  //
+  // Both start from dodgeCtxPrefix, which dodgeStep has already advanced to
+  // where our current heading leaves us once this frame's input can act.
+  const dodgeScoredFull = [];
+  const dodgeScoredEarly = [];
+  const dodgeBranchDirs = [];
+  const dodgeFirstTravel = new Float64Array(DODGE_DIRS.length);
+  const dodgeBest = { dir: 0, cost: Infinity, firstHit: Infinity };
+
+  function dodgePlan(threats, speed, walls, horizon) {
+    const prefix = dodgeCtxPrefix;
+    const work = dodgeCtxWork;
+    const n = threats.length;
+    const window = horizon - prefix.t;
+    const commit = Math.min(DODGE_COMMIT_S, window * 0.5);
+    const best = dodgeBest;
+    best.dir = prefix.lastDir >= 0 ? prefix.lastDir : 0;
+    best.cost = Infinity;
+    best.firstHit = Infinity;
+
+    dodgeScoredFull.length = 0;
+    for (let d = 0; d < DODGE_DIRS.length; d++) {
+      dodgeCtxCopy(work, prefix, n);
+      dodgeAdvance(work, d, window, threats, speed, walls, horizon, -1);
+      const r = dodgeCtxCost(work, threats);
+      dodgeScoredFull.push({ dir: d, cost: r.cost });
+      if (r.cost < best.cost) {
+        best.dir = d; best.cost = r.cost; best.firstHit = r.firstHit;
+      }
+    }
+    if (!(commit > 0.01)) return best;
+    dodgeScoredFull.sort((a, b) => a.cost - b.cost);
+
+    dodgeScoredEarly.length = 0;
+    for (let d = 0; d < DODGE_DIRS.length; d++) {
+      dodgeCtxCopy(work, prefix, n);
+      dodgeAdvance(work, d, commit, threats, speed, walls, horizon, -1);
+      dodgeFirstTravel[d] = work.lastTravel;
+      dodgeScoredEarly.push({ dir: d, cost: dodgeCtxCost(work, threats).cost });
+    }
+    dodgeScoredEarly.sort((a, b) => a.cost - b.cost);
+
+    // The two rankings interleaved, best-first, deduped, capped at the budget.
+    dodgeBranchDirs.length = 0;
+    for (let i = 0; i < DODGE_DIRS.length && dodgeBranchDirs.length < DODGE_BRANCH; i++) {
+      const a = dodgeScoredFull[i].dir;
+      if (dodgeBranchDirs.indexOf(a) < 0) dodgeBranchDirs.push(a);
+      const b = dodgeScoredEarly[i].dir;
+      if (dodgeBranchDirs.length < DODGE_BRANCH && dodgeBranchDirs.indexOf(b) < 0) {
+        dodgeBranchDirs.push(b);
+      }
+    }
+
+    const tail = window - commit;
+    for (let i = 0; i < dodgeBranchDirs.length; i++) {
+      const first = dodgeBranchDirs[i];
+      dodgeCtxCopy(dodgeCtxFirst, prefix, n);
+      dodgeAdvance(dodgeCtxFirst, first, commit, threats, speed, walls, horizon,
+        dodgeFirstTravel[first]);
+      for (let d = 0; d < DODGE_DIRS.length; d++) {
+        if (d === first) continue;   // that is the one-leg plan, already scored
+        dodgeCtxCopy(work, dodgeCtxFirst, n);
+        dodgeAdvance(work, d, tail, threats, speed, walls, horizon, -1);
+        const r = dodgeCtxCost(work, threats);
+        if (r.cost < best.cost) {
+          best.dir = first; best.cost = r.cost; best.firstHit = r.firstHit;
+        }
+      }
+    }
+    return best;
+  }
+
+  // ---- Driving the keys --------------------------------------------------
+
+  // ---- The deep search: a shortest path over (cell, time) ---------------
+  //
+  // dodgePlan asks "which of nine headings, then which of nine again" and is
+  // done. This asks the question the fight actually poses: over the next
+  // `horizon` seconds, chopped into DODGE.stepS decisions, which *sequence* of
+  // headings takes the least damage? At the default 0.1s step that is eight
+  // decisions and 9^8 ~ 43 million sequences, which is hopeless as a tree.
+  //
+  // It is not a tree. Two paths that arrive at the same place at the same time
+  // are worth exactly the same from there on, so they merge, and what is left
+  // is a shortest path over a graph whose nodes are (cell, layer). Time only
+  // moves forward, so that graph is a DAG and its layers are already in
+  // topological order — no priority queue, no Dijkstra, just a forward sweep
+  // keeping the cheapest way into each cell. The reachable set at layer k is a
+  // disc of radius speed*k*stepS rather than 9^k, which is the whole
+  // difference: a few thousand states instead of 43 million rollouts.
+  //
+  // Merging is only sound if cost is additive per edge and the cost of
+  // finishing depends on nothing but (cell, layer). Damage is; the graze,
+  // standing and wall-pinned terms are per-second and so are too.
+  // DODGE_SWITCH_COST is the exception — it needs the previous heading, which
+  // is history — so it is charged once, on the first leg, against the course we
+  // are really on. That is also the only turn that is real: legs past the first
+  // are re-planned from scratch next frame and never executed as written.
+  //
+  // Measured in dodgebot-test/bench.js against the two-leg search, 60 trials,
+  // Barrett at 214 u/s where a two-leg plan runs out of room: 8.7% hit rate ->
+  // 3.2% at 0ms, 29.7% -> 22.7% at 60ms, and no worse anywhere else. Slower
+  // guns are already fully dodged by both and the difference there is noise.
+  const DODGE_DP_BEAM = 64;   // states kept per layer; 0 would be exact
+
+  let dodgeDpW = 0, dodgeDpEpoch = 0, dodgeDpVisit = 0;
+  let dodgeDpCost = null, dodgeDpCostB = null;
+  let dodgeDpFirst = null, dodgeDpFirstB = null;
+  let dodgeDpHit = null, dodgeDpHitB = null;
+  let dodgeDpSeen = null, dodgeDpSeenB = null;
+  let dodgeDpList = null, dodgeDpListB = null;
+  let dodgeDpTravel = null, dodgeDpStamp = null;
+  const dodgeDpGap = new Float64Array(DODGE_MAX_THREATS);
+  const dodgeDpTouch = new Float64Array(DODGE_MAX_THREATS);
+  const dodgeDpOut = { cost: 0, hit: Infinity, x: 0, y: 0 };
+  const dodgeDpOrder = [];
+
+  function dodgeDpEnsure(w) {
+    if (w === dodgeDpW) return;
+    const n = w * w;
+    dodgeDpW = w;
+    dodgeDpCost = new Float64Array(n); dodgeDpCostB = new Float64Array(n);
+    dodgeDpFirst = new Int8Array(n); dodgeDpFirstB = new Int8Array(n);
+    dodgeDpHit = new Float64Array(n); dodgeDpHitB = new Float64Array(n);
+    dodgeDpSeen = new Int32Array(n); dodgeDpSeenB = new Int32Array(n);
+    dodgeDpList = new Int32Array(n); dodgeDpListB = new Int32Array(n);
+    dodgeDpTravel = new Float32Array(n * 9); dodgeDpStamp = new Int32Array(n * 9);
+    dodgeDpEpoch = 0; dodgeDpVisit = 0;
+  }
+
+  // dodgeSweep, but per leg instead of per plan, and it refuses to charge for
+  // contact that was already underway when the leg opened. That is what stops
+  // one bullet being billed on every step it spends inside us: the hit lands on
+  // the leg where contact starts, and the legs after it see an overlap they did
+  // not cause and score it as a graze of zero. A round crosses a body in ~20ms
+  // against a 100ms step, so contact starts and ends inside one leg in
+  // practice, and the two agree.
+  function dodgeDpSweep(i, px, py, vx, vy, th, t0, dur) {
+    const span = Math.min(dur, th.tMax - t0);
+    if (!(span > 0)) return;
+    const qx = th.x + th.wx * t0 - px;
+    const qy = th.y + th.wy * t0 - py;
+    const R = th.R;
+    const c = qx * qx + qy * qy - R * R;
+    if (c <= 0) { dodgeDpGap[i] = 0; return; }
+    const ux = th.wx - vx, uy = th.wy - vy;
+    const a = ux * ux + uy * uy;
+    if (!(a > 1e-9)) {
+      const fixed = Math.sqrt(c + R * R) - R;
+      if (fixed < dodgeDpGap[i]) dodgeDpGap[i] = fixed;
+      return;
+    }
+    const b = qx * ux + qy * uy;
+    const ts = Math.min(Math.max(-b / a, 0), span);
+    const gap = Math.hypot(qx + ux * ts, qy + uy * ts) - R;
+    if (gap < dodgeDpGap[i]) dodgeDpGap[i] = gap;
+    if (b >= 0) return;
+    const disc = b * b - a * c;
+    if (disc < 0) return;
+    const t = (-b - Math.sqrt(disc)) / a;
+    if (t >= 0 && t <= span && t0 + t < dodgeDpTouch[i]) dodgeDpTouch[i] = t0 + t;
+  }
+
+  // How far heading `di` gets from this cell. Keyed by cell rather than by
+  // (cell, layer) because the answer cannot depend on when we arrive — and the
+  // wall march is the most expensive thing in the loop, so the several layers
+  // that can reach a cell pay for it once between them.
+  function dodgeDpTravelFor(idx, di, px, py, want, walls) {
+    const key = idx * 9 + di;
+    if (dodgeDpStamp[key] === dodgeDpEpoch) return dodgeDpTravel[key];
+    const dir = DODGE_DIRS[di];
+    const got = dodgeTravel(px, py, dir.x, dir.y, want, walls);
+    dodgeDpStamp[key] = dodgeDpEpoch;
+    dodgeDpTravel[key] = got;
+    return got;
+  }
+
+  // One leg: what it costs, the first contact inside it, and where it ends.
+  function dodgeDpEdge(px, py, t0, di, dt, speed, travel, threats) {
+    const n = threats.length;
+    let i;
+    for (i = 0; i < n; i++) { dodgeDpGap[i] = Infinity; dodgeDpTouch[i] = Infinity; }
+    let cost = 0, nx = px, ny = py;
+    const dir = DODGE_DIRS[di];
+
+    if (dir.x === 0 && dir.y === 0) {
+      cost = DODGE_STILL_COST * dt;
+      for (i = 0; i < n; i++) dodgeDpSweep(i, px, py, 0, 0, threats[i], t0, dt);
+    } else {
+      const want = speed * dt;
+      const tMove = want > 0 ? dt * (travel / want) : 0;
+      if (tMove > 0) {
+        const vx = dir.x * speed, vy = dir.y * speed;
+        for (i = 0; i < n; i++) dodgeDpSweep(i, px, py, vx, vy, threats[i], t0, tMove);
+        nx = px + dir.x * travel;
+        ny = py + dir.y * travel;
+      }
+      const tStuck = dt - tMove;
+      if (tStuck > 0) {
+        cost += DODGE_WALL_COST * tStuck;
+        for (i = 0; i < n; i++) dodgeDpSweep(i, nx, ny, 0, 0, threats[i], t0 + tMove, tStuck);
+      }
+    }
+
+    let hit = Infinity;
+    for (i = 0; i < n; i++) {
+      const tt = dodgeDpTouch[i];
+      const w = threats[i].w;
+      if (tt < Infinity) {
+        // HP is the objective. `w` is this round's damage over DODGE_DMG_REF,
+        // priced by dodgeBulletDamage off the BULLET_DAMAGE table — so a path
+        // that eats an mp5 round to stay out of an awc's line is now cheaper
+        // than one that does the reverse, which under a flat hit count it
+        // never could be. Summed over edges, this is expected HP lost.
+        cost += w * (DODGE_HIT_COST - tt * DODGE_HIT_TIME_BONUS);
+        if (tt < hit) hit = tt;
+      } else if (dodgeDpGap[i] < Infinity) {
+        // Graze-seconds, so the tiebreak does not depend on how the horizon
+        // happens to have been chopped up.
+        cost += w * dt * Math.exp(-Math.max(dodgeDpGap[i], 0) / DODGE_GRAZE_SIGMA);
+      }
+    }
+    dodgeDpOut.cost = cost; dodgeDpOut.hit = hit; dodgeDpOut.x = nx; dodgeDpOut.y = ny;
+    return dodgeDpOut;
+  }
+
+  function dodgeDpPlan(threats, speed, walls, horizon) {
+    const prefix = dodgeCtxPrefix;
+    const best = dodgeBest;
+    const window = horizon - prefix.t;
+    const curDir = prefix.lastDir >= 0 ? prefix.lastDir : 0;
+
+    best.dir = curDir;
+    best.cost = Infinity;
+    best.firstHit = Infinity;
+    if (!(window > 1e-3)) return best;
+
+    let dt = dodgeClamp(DODGE.stepS, 0.02, 0.5, 0.1);
+    const steps = Math.max(1, Math.round(window / dt));
+    dt = window / steps;
+    const cell = dodgeClamp(DODGE.cell, 0.1, 2, 0.35);
+
+    // Half-width: everywhere the body can reach, plus the drift snapping can
+    // add, plus a cell of slack — anything landing outside is unreachable and
+    // dropping it is free. Rounded up to a multiple of 8 because `speed` is a
+    // measurement that drifts every frame, and a width tracking it exactly
+    // would reallocate a quarter-megabyte of grid at 60Hz.
+    let half = Math.ceil((speed * window + steps * cell + 2 * cell) / cell);
+    half = (Math.ceil(half / 8) | 0) * 8;
+    const w = 2 * half + 1;
+    dodgeDpEnsure(w);
+    // The stamps are counters compared against, never cleared, so they only
+    // have to outlive one plan — but they do have to stay inside an Int32.
+    if (dodgeDpEpoch > 2e9 || dodgeDpVisit > 2e9) {
+      dodgeDpStamp.fill(0); dodgeDpSeen.fill(0); dodgeDpSeenB.fill(0);
+      dodgeDpEpoch = 0; dodgeDpVisit = 0;
+    }
+    dodgeDpEpoch++;
+
+    const ox = prefix.x, oy = prefix.y;
+    const want = speed * dt;
+    const start = half * w + half;
+    let curLen = 1, q, layer;
+
+    dodgeDpList[0] = start;
+    dodgeDpSeen[start] = ++dodgeDpVisit;
+    dodgeDpCost[start] = 0;
+    dodgeDpFirst[start] = -1;
+    dodgeDpHit[start] = Infinity;
+
+    for (layer = 0; layer < steps; layer++) {
+      const t0 = layer * dt;
+      const visitNext = ++dodgeDpVisit;
+      let nextLen = 0;
+
+      for (q = 0; q < curLen; q++) {
+        const idx = dodgeDpList[q];
+        const base = dodgeDpCost[idx];
+        const ix = idx % w, iy = (idx / w) | 0;
+        const px = ox + (ix - half) * cell, py = oy + (iy - half) * cell;
+        const f0 = dodgeDpFirst[idx], h0 = dodgeDpHit[idx];
+
+        for (let di = 0; di < DODGE_DIRS.length; di++) {
+          const travel = di === 0 ? 0 : dodgeDpTravelFor(idx, di, px, py, want, walls);
+          const e = dodgeDpEdge(px, py, t0, di, dt, speed, travel, threats);
+          let c = base + e.cost;
+          if (layer === 0 && di !== curDir) c += DODGE_SWITCH_COST;
+
+          const jx = half + Math.round((e.x - ox) / cell);
+          const jy = half + Math.round((e.y - oy) / cell);
+          if (jx < 0 || jy < 0 || jx >= w || jy >= w) continue;
+          const j = jy * w + jx;
+
+          const fresh = dodgeDpSeenB[j] !== visitNext;
+          if (!fresh && c >= dodgeDpCostB[j]) continue;
+          if (fresh) { dodgeDpSeenB[j] = visitNext; dodgeDpListB[nextLen++] = j; }
+          dodgeDpCostB[j] = c;
+          dodgeDpFirstB[j] = layer === 0 ? di : f0;
+          dodgeDpHitB[j] = h0 < e.hit ? h0 : e.hit;
+        }
+      }
+
+      let t;
+      t = dodgeDpCost; dodgeDpCost = dodgeDpCostB; dodgeDpCostB = t;
+      t = dodgeDpFirst; dodgeDpFirst = dodgeDpFirstB; dodgeDpFirstB = t;
+      t = dodgeDpHit; dodgeDpHit = dodgeDpHitB; dodgeDpHitB = t;
+      t = dodgeDpSeen; dodgeDpSeen = dodgeDpSeenB; dodgeDpSeenB = t;
+      t = dodgeDpList; dodgeDpList = dodgeDpListB; dodgeDpListB = t;
+      curLen = nextLen;
+      if (!curLen) break;
+
+      // The beam is what bounds a frame. A firefight puts several times as many
+      // rounds in the air as a duel and every one of them is swept on every
+      // edge, so the exact search is the thing whose cost is not under our
+      // control — the frontier is. 64 measured within noise of exact on the
+      // bench (3.4% against 3.2%) for a quarter of the time.
+      if (DODGE_DP_BEAM && curLen > DODGE_DP_BEAM) {
+        dodgeDpOrder.length = 0;
+        for (q = 0; q < curLen; q++) dodgeDpOrder.push(dodgeDpList[q]);
+        const costs = dodgeDpCost;
+        dodgeDpOrder.sort((a, b) => costs[a] - costs[b]);
+        for (q = 0; q < DODGE_DP_BEAM; q++) dodgeDpList[q] = dodgeDpOrder[q];
+        curLen = DODGE_DP_BEAM;
+      }
+    }
+
+    let bi = -1;
+    for (q = 0; q < curLen; q++) {
+      const e2 = dodgeDpList[q];
+      if (dodgeDpCost[e2] < best.cost) { best.cost = dodgeDpCost[e2]; bi = e2; }
+    }
+    if (bi >= 0) {
+      best.dir = dodgeDpFirst[bi] >= 0 ? dodgeDpFirst[bi] : curDir;
+      best.firstHit = dodgeDpHit[bi];
+    }
+    return best;
+  }
+
+  function dodgeDirIndex(dx, dy) {
+    if (!dx && !dy) return 0;
+    for (let i = 1; i < DODGE_DIRS.length; i++) {
+      const d = DODGE_DIRS[i];
+      if (Math.sign(d.x) === Math.sign(dx) && Math.sign(d.y) === Math.sign(dy)) return i;
+    }
+    return 0;
+  }
+
+  // The heading the user is actually asking for, read past our own synthetic
+  // layer. This has to go through realBindDown or the trigger would see the
+  // bot's own held keys and latch itself on forever.
+  function dodgeUserDirIdx(binds) {
+    const left = realBindDown(binds, DODGE_INPUT_LEFT) || dodgeArrowDown.get(37);
+    const right = realBindDown(binds, DODGE_INPUT_RIGHT) || dodgeArrowDown.get(39);
+    const up = realBindDown(binds, DODGE_INPUT_UP) || dodgeArrowDown.get(38);
+    const down = realBindDown(binds, DODGE_INPUT_DOWN) || dodgeArrowDown.get(40);
+    return dodgeDirIndex((right ? 1 : 0) - (left ? 1 : 0), (up ? 1 : 0) - (down ? 1 : 0));
+  }
+
+  function dodgeApply(binds, dirIdx) {
+    const d = DODGE_DIRS[dirIdx];
+    setInputHeld(binds, DODGE_INPUT_RIGHT, d.x > 0);
+    setInputHeld(binds, DODGE_INPUT_LEFT, d.x < 0);
+    setInputHeld(binds, DODGE_INPUT_UP, d.y > 0);
+    setInputHeld(binds, DODGE_INPUT_DOWN, d.y < 0);
+    // Whatever we aren't holding, the user doesn't get to hold either —
+    // otherwise their W and our S cancel and the dodge goes nowhere.
+    for (const inp of DODGE_MOVE_INPUTS) setInputSuppressed(inp, !heldInputs.has(inp));
+    suppressArrowMovement = true;
+  }
+
+  function dodgeRelease() {
+    for (const inp of DODGE_MOVE_INPUTS) {
+      heldInputs.delete(inp);
+      setInputSuppressed(inp, false);
+    }
+    suppressArrowMovement = false;
+    dodgeState.engaged = false;
+    dodgeState.dirIdx = 0;
+    dodgeState.safeSince = 0;
+    dodgeState.userHitIn = Infinity;
+    dodgeState.planHitIn = Infinity;
+  }
+
+  // Our real speed, measured rather than assumed. GameConfig says 12, but
+  // water, being downed and a heavy weapon all scale it, and a planner that
+  // believes in 12 while the player wades at 9 plans escapes it cannot make.
+  // Only frames where we were plainly moving teach it anything — a standing
+  // player would otherwise drag the estimate to zero.
+  function dodgeTrackSpeed(pos, now) {
+    const prev = dodgeState.prevPos;
+    const dt = (now - dodgeState.prevPosAt) / 1000;
+    dodgeState.prevPos = { x: pos.x, y: pos.y };
+    dodgeState.prevPosAt = now;
+    if (!prev || !(dt > 0.02) || dt > 0.5) return;
+    const v = Math.hypot(pos.x - prev.x, pos.y - prev.y) / dt;
+    if (v < DODGE_SPEED_MIN || v > DODGE_SPEED_MAX) return;
+    dodgeState.speed += (v - dodgeState.speed) * DODGE_SPEED_ALPHA;
+  }
+
+  function dodgeStep() {
+    // Movement is read with isBindDown, but a rising edge in setInputHeld
+    // also arms isBindPressed for a frame and nothing else would take it
+    // back down — and a stale one would sit in front of our own suppression.
+    for (const inp of DODGE_MOVE_INPUTS) framePressInputs.delete(inp);
+
+    const game = capturedGame;
+    const binds = game?.[GAME_BINDS];
+    if (!DODGE.enabled || !binds) {
+      if (dodgeState.engaged) dodgeRelease();
+      return;
+    }
+
+    const me = findLocalPlayerOnGame(game);
+    const pos = me ? getXY(me[PLAYER_POS] ?? me.pos) : null;
+    if (!pos || me[PLAYER_NET]?.[NET_DEAD]) {
+      if (dodgeState.engaged) dodgeRelease();
+      return;
+    }
+
+    const now = Date.now();
+    dodgeTrackSpeed(pos, now);
+    if (now - dodgeState.lastPlanAt < DODGE_PLAN_MS) return;
+    dodgeState.lastPlanAt = now;
+
+    const layer = Number.isFinite(me.layer) ? me.layer : 0;
+    const selfId = Number(me.__id ?? me.playerId ?? 0) || null;
+    const roster = findRosterOnGame(game) || game?.[GAME_ROSTER];
+    const selfInfo = roster && selfId != null ? dodgePlayerInfo(roster, selfId) : null;
+
+    const ping = medianPingMs();
+    const leadS = Math.max(0, (Number.isFinite(ping) ? ping : 0) / 1000) *
+      dodgeClamp(DODGE.leadK, 0, 2, 1);
+    const horizon = dodgeClamp(DODGE.horizon, 0.2, 2, 0.8);
+    const trigger = Math.min(dodgeClamp(DODGE.trigger, 0.05, 2, 0.45), horizon);
+    const margin = dodgeClamp(DODGE.margin, 0, 1.5, 0.35);
+
+    const speed = dodgeState.speed;
+    const reach = speed * horizon;
+    const threats = dodgeBuildThreats(game, selfId, selfInfo, roster, layer, leadS, margin,
+      pos.x, pos.y, reach, horizon);
+    // The overwhelmingly common case, and the one that has to cost nothing:
+    // no bullets in the air and the keys already the user's.
+    if (!threats.length && !dodgeState.engaged) return;
+
+    const walls = dodgeBuildWalls(pos.x, pos.y, reach + PLAYER_RADIUS, layer);
+
+    // The plan's own start state has to be led, not just the threats'. Whatever
+    // we choose this frame is not acted on until it reaches the server, and
+    // until then we keep going the way we are already going — so the rollout
+    // starts from where that leaves us, not from where we are. Capped at half
+    // the horizon so a bad link cannot move the start of the plan further than
+    // the plan is long. It is a position correction and nothing else: see
+    // dodgeCarry for why running it as a scored leg is a bug and not a
+    // shortcut.
+    //
+    // The current heading is ours while engaged and the user's otherwise, and
+    // either way it seeds the context's lastDir — so DODGE_SWITCH_COST is
+    // charged against the course we are really on, which is what it was always
+    // meant to measure.
+    const prefixS = Math.min(leadS, horizon * 0.5);
+    dodgeState.leadS = prefixS;
+    const userDir = dodgeUserDirIdx(binds);
+    const curDir = dodgeState.engaged ? dodgeState.dirIdx : userDir;
+    dodgeCtxReset(dodgeCtxPrefix, pos.x, pos.y, curDir, threats.length);
+    dodgeCarry(dodgeCtxPrefix, curDir, prefixS, speed, walls);
+
+    // Does the course the user is on get hit? On handback the keys revert to
+    // what they are really holding, and that handback is led the same way.
+    dodgeCtxCopy(dodgeCtxWork, dodgeCtxPrefix, threats.length);
+    dodgeAdvance(dodgeCtxWork, userDir, horizon, threats, speed, walls, horizon, -1);
+    const userHitIn = dodgeCtxCost(dodgeCtxWork, threats).firstHit;
+    dodgeState.userHitIn = userHitIn;
+    const inDanger = userHitIn <= trigger;
+
+    if (inDanger) {
+      dodgeState.safeSince = 0;
+    } else if (dodgeState.engaged) {
+      if (!dodgeState.safeSince) dodgeState.safeSince = now;
+      if (now - dodgeState.safeSince >= dodgeClamp(DODGE.releaseMs, 0, 1000, 150)) {
+        dodgeRelease();
+        return;
+      }
+    } else {
+      return;   // not engaged and not in danger: stock survev, untouched
+    }
+
+    const planAt = performance.now();
+    const plan = DODGE.deep
+      ? dodgeDpPlan(threats, speed, walls, horizon)
+      : dodgePlan(threats, speed, walls, horizon);
+    dodgeState.planMs = performance.now() - planAt;
+    dodgeState.engaged = true;
+    dodgeState.dirIdx = plan.dir;
+    dodgeState.planHitIn = plan.firstHit;
+    dodgeState.planCost = plan.cost;
+    dodgeApply(binds, plan.dir);
+  }
+
+  function dodgeFrameTick() {
+    try {
+      dodgeStep();
+    } catch {
+      // Never leave the movement keys taken away because of our own bug.
+      try { dodgeRelease(); } catch {}
+    }
+    requestAnimationFrame(dodgeFrameTick);
+  }
+  requestAnimationFrame(dodgeFrameTick);
+
+  // Console handle, matching __bulletGeom / __wallDiag.
+  window.__dodge = () => ({
+    enabled: !!DODGE.enabled,
+    engaged: dodgeState.engaged,
+    heading: ['stand', 'E', 'NE', 'N', 'NW', 'W', 'SW', 'S', 'SE'][dodgeState.dirIdx],
+    speed: Number(dodgeState.speed.toFixed(2)),
+    pingMs: medianPingMs(),
+    threats: dodgeState.threats.length,
+    // Worst round in the air, in HP, and how many of the current threats we
+    // could actually name. A `typed` well under `threats` means the addBullet
+    // hook went on mid-flight or survev has shipped a bullet BULLET_DAMAGE
+    // doesn't list — either way those rounds are priced at DODGE_DMG_REF.
+    worstDmg: Number(dodgeState.threats.reduce((m, t) => Math.max(m, t.dmg), 0).toFixed(1)),
+    typed: dodgeState.threats.filter((t) => !!BULLET_DAMAGE[t.type]).length,
+    walls: dodgeState.walls.length,
+    leadMs: Math.round(dodgeState.leadS * 1000),
+    userHitIn: dodgeState.userHitIn,
+    planHitIn: dodgeState.planHitIn,
+    search: DODGE.deep ? 'deep' : 'branch',
+    planMs: Number(dodgeState.planMs.toFixed(2)),
+    barnFound: !!findBulletBarn(capturedGame),
+  });
 
   // ---------------------------------------------------------------------
   // Netcode smoothing: kill the stutter survev shows on a jittery link.
@@ -4663,6 +6082,122 @@
     netStats.playersHooked++;
   }
 
+  // ---- Bullets on the render clock --------------------------------------
+  //
+  // Everything drawn should represent the same instant, and by default it does
+  // not. Players render at `renderNowMs()` — the recovered clock, held
+  // `renderLag` ticks back — while bullets are a pure client-side simulation
+  // that the barn advances by frame dt, so they are drawn at
+  // `performance.now()`. Every tracer on screen is therefore half a tick ahead
+  // of every body on screen. At 20Hz that is 25ms, which a Barrett round
+  // spends 5.4 units of travel on — five player radii, and the difference
+  // between a round that looks like it missed and one that looks like it hit.
+  //
+  // This is survev's own inconsistency rather than one the smoothing
+  // introduces: stock survev lerps players a whole tick behind the newest
+  // snapshot while running bullets in real time, so the gap there is larger.
+  // Part A narrows it. This closes it.
+  //
+  // The correction is one substitution in the barn's render pass and nothing
+  // else. `pos` is left exactly as the barn computed it, because the barn's
+  // own update integrates it, tests the segment it swept against obstacles and
+  // players for the tracer-stop and the whiz sound, and the dodge bot reads it
+  // to build its threat list — every one of which wants the true simulated
+  // position and none of which is a render. Only the value the sprite
+  // transform is handed gets moved, by walking each round back along its own
+  // direction by the same lag the player render is held at, and it is put back
+  // before the frame ends. The barn recomputes the tracer's length from
+  // `pos - startPos` in that same pass, so a round drawn earlier in its flight
+  // gets the shorter trail it had then for free.
+  //
+  // The one thing this cannot do is un-draw a round that had not been fired
+  // yet at render time. Walking back is clamped at the muzzle instead, so a
+  // new bullet sits at its start point for up to half a tick and then sets
+  // off — which is what the shot looked like from the server's side anyway.
+  const netBulletShift = { idx: [], x: [], y: [] };
+  let netBarnRenderKey = null;
+  let netBarnHooked = null;
+
+  // The barn's render pass, by shape. survev leaves `onMapLoad`, `addBullet`
+  // and `createBulletHit` readable and mangles the other two; of those, the
+  // update takes eight arguments and the render takes one. So the render is
+  // the only arity-1 method on the prototype that is not `onMapLoad`. If a
+  // future bundle makes that ambiguous this returns null and the whole feature
+  // turns itself off, which is the right failure: a wrong guess here would
+  // wrap the update and quietly corrupt the simulation.
+  function findBarnRenderKey(barn) {
+    const proto = Object.getPrototypeOf(barn);
+    if (!proto || proto === Object.prototype) return null;
+    let found = null;
+    for (const name of Object.getOwnPropertyNames(proto)) {
+      if (name === 'constructor' || name === 'onMapLoad') continue;
+      let fn;
+      try { fn = proto[name]; } catch { continue; }
+      if (typeof fn !== 'function' || fn.length !== 1) continue;
+      if (found) return null;   // ambiguous: refuse rather than guess
+      found = name;
+    }
+    return found;
+  }
+
+  // How far behind `performance.now()` the render is taken — identically
+  // `performance.now() - renderNowMs()`, written out because that is the whole
+  // quantity. Zero until the clock fit is usable, so a fresh round draws
+  // stock until there is a slope to trust.
+  function netRenderLagS() {
+    if (!NETCODE.enabled || !NETCODE.bulletClock || !netClock.ready) return 0;
+    const ms = netClock.slope * NETCODE.renderLag;
+    if (!Number.isFinite(ms) || ms <= 0) return 0;
+    return Math.min(ms, NET_MAX_UPDATE_MS) / 1000;
+  }
+
+  // Wrapped on the prototype rather than the instance: a new round builds a
+  // fresh barn but reuses the class, so this installs once and survives. The
+  // toggle is read per call, so turning it off restores stock drawing live
+  // rather than leaving a dead wrapper behind.
+  function installBulletRenderHook(game) {
+    const barn = findBulletBarn(game);
+    if (!barn) return;
+    const proto = Object.getPrototypeOf(barn);
+    if (!proto || netBarnHooked === proto) return;
+    const key = netBarnRenderKey || findBarnRenderKey(barn);
+    if (!key) { netBarnHooked = proto; return; }   // give up once, not per frame
+    const orig = proto[key];
+    if (typeof orig !== 'function') { netBarnHooked = proto; return; }
+    netBarnRenderKey = key;
+    proto[key] = function (camera) {
+      const lag = netRenderLagS();
+      const list = this && this.bullets;
+      if (!lag || !Array.isArray(list)) return orig.call(this, camera);
+      const save = netBulletShift;
+      let n = 0;
+      for (let i = 0; i < list.length; i++) {
+        const b = list[i];
+        if (!b || (!b.alive && !b.collided)) continue;
+        const p = b.pos, d = b.dir, s = b.startPos;
+        if (!p || !d || !s || !(b.speed > 0)) continue;
+        const flown = Math.hypot(p.x - s.x, p.y - s.y);
+        const back = Math.min(b.speed * lag, flown);
+        if (!(back > 0)) continue;
+        save.idx[n] = i; save.x[n] = p.x; save.y[n] = p.y; n++;
+        p.x -= d.x * back;
+        p.y -= d.y * back;
+      }
+      try {
+        return orig.call(this, camera);
+      } finally {
+        // Unconditionally, including if the render threw: leaving a bullet
+        // displaced would feed a wrong position straight back into the barn's
+        // next integration step and into the dodge bot's threat list.
+        for (let k = 0; k < n; k++) {
+          const b = list[save.idx[k]];
+          if (b && b.pos) { b.pos.x = save.x[k]; b.pos.y = save.y[k]; }
+        }
+      }
+    };
+    netBarnHooked = proto;
+  }
+
   // Called from the sample loop: keep the camera hook attached to the live
   // Game and make sure every Player in the pool is smoothed. Both guards are
   // cheap no-ops once installed.
@@ -4670,6 +6205,7 @@
     if (!game) return;
     try {
       const camera = installCameraInterpHook(game);
+      installBulletRenderHook(game);
       // survev exposes interpolation as a user setting; with it off the client
       // snaps to each packet and there is nothing for us to smooth, so it is
       // held on. Re-asserted every tick so it survives the user toggling it,
@@ -4904,6 +6440,796 @@
           worldVisible: text ? text.worldVisible : null,
         };
       }),
+    };
+  };
+
+  // ---------------------------------------------------------------------
+  // Debug render: replace the world's art with its collision geometry.
+  //
+  // The game's scene graph is a flat list of stage children (client/src/
+  // game.ts init()): `map.display.ground` holds the terrain, drawn once into
+  // a Graphics in WORLD coordinates and then positioned/scaled to screen
+  // every frame; `renderer.layers[0..3]` and `renderer.ground` hold every
+  // sprite — obstacles, buildings, ceilings, players, loot, bullets — each
+  // positioned in screen pixels by its own render(). The UI above them (gas
+  // ring, minimap, indicators) is a separate set of stage children.
+  //
+  // So the whole world is switched off by setting `renderable = false` on
+  // those six containers, and nothing else on the page changes: the HUD is
+  // DOM, and the minimap is a texture baked by renderMap() from a Graphics of
+  // its own, not from `display.ground`. `renderable` rather than `visible`
+  // because the renderer rewrites `visible` on the layers every frame off the
+  // layer-transition alphas (Renderer.update) and would fight us for it;
+  // `renderable` it never touches, and PIXI checks it before descending, so a
+  // false there skips the container and its children whole.
+  //
+  // Our own geometry goes in as three children of `map.display.ground`. That
+  // parent is the one thing on the stage already carrying the world->screen
+  // transform, so drawing in world units under it needs no camera read of our
+  // own and cannot drift a frame behind the game's: whatever transform the
+  // renderer resolves for the terrain is the one our shapes get, on the same
+  // pass. It also sits at stage index 0, under everything — which is where a
+  // replacement world belongs. We paint an opaque sheet over the terrain
+  // rather than clearing it, so switching back off is just a `renderable`
+  // flip with the game's own geometry still intact underneath.
+  // ---------------------------------------------------------------------
+
+  // Ground is flat white, so the two things drawn on it need to read against
+  // white and against each other. Water keeps the map's own colour — the ask
+  // is a hitbox view of the *objects*, and water is terrain you can swim in,
+  // not something with a collider.
+  const DEBUG_GROUND_COLOR = 0xffffff;
+  const DEBUG_OBSTACLE_COLOR = 0x1a1a1a;
+  const DEBUG_PLAYER_COLOR = 0xff2a2a;
+  // Fallback biome water, for a mapDef we can't read colours off. survev's
+  // main-biome value.
+  const DEBUG_WATER_FALLBACK = 0x3282ab;
+  // The grid, taken from the one renderTerrain already draws: GameConfig.map
+  // .gridSize spacing, black at 0.15. The width is the game's own
+  // `2 / camera.ppu` with survev's hardcoded ppu of 16 substituted in — our
+  // Graphics hangs off `map.display.ground`, so it inherits the same
+  // world->screen scale and a line 0.125 units wide lands on the same 2 * zoom
+  // pixels the game's grid does.
+  const DEBUG_GRID_SIZE = 16;
+  const DEBUG_GRID_COLOR = 0x000000;
+  const DEBUG_GRID_ALPHA = 0.15;
+  const DEBUG_GRID_WIDTH = 2 / 16;
+
+  // The Renderer class (`yr`) declares its layer bookkeeping under real
+  // readable names, so this survives a re-mangle the way looksLikeRoster and
+  // looksLikeObstacle do.
+  function looksLikeRenderer(v) {
+    try {
+      return !!v && typeof v === 'object' &&
+        Array.isArray(v.layers) && 'ground' in v &&
+        'layerMask' in v && 'layerMaskActive' in v && 'underground' in v;
+    } catch {
+      return false;
+    }
+  }
+
+  let cachedRendererKey = null;
+
+  function findRendererOnGame(game) {
+    if (!game || typeof game !== 'object') return null;
+    try {
+      if (cachedRendererKey) {
+        const r = game[cachedRendererKey];
+        if (looksLikeRenderer(r)) return r;
+        cachedRendererKey = null;
+      }
+      const names = Object.getOwnPropertyNames(game);
+      for (let i = 0; i < names.length; i++) {
+        const v = game[names[i]];
+        if (looksLikeRenderer(v)) {
+          cachedRendererKey = names[i];
+          return v;
+        }
+      }
+    } catch {}
+    return null;
+  }
+
+  const debugRender = {
+    terrainGfx: null,    // ground + water, baked once per map
+    obstacleGfx: null,   // obstacle colliders, rebuilt when they change
+    playerGfx: null,     // player circles, rebuilt every frame
+    host: null,          // the map.display.ground we hung them off
+    terrainKey: null,    // identity of the terrain we baked from
+    obstacleSig: null,   // signature of the collider set we last drew
+    hiddenIn: null,      // the renderer we switched off, so we can switch it back
+    attachFailed: false,
+  };
+
+  // A sibling Graphics of `like`, built from its own constructor so we never
+  // need a handle on PIXI itself.
+  function makeGraphicsLike(like) {
+    try {
+      const Ctor = like && like.constructor;
+      if (typeof Ctor !== 'function') return null;
+      const g = new Ctor();
+      // Same treatment the game gives every stage child it adds.
+      g.interactiveChildren = false;
+      return g;
+    } catch {
+      return null;
+    }
+  }
+
+  // survev's own polygon trace (client/src/map.ts), reproduced so our terrain
+  // outlines are built exactly the way the ones we're covering were.
+  function traceDebugPoly(g, points) {
+    const first = points[0];
+    g.moveTo(first.x, first.y);
+    for (let i = 1; i < points.length; i++) g.lineTo(points[i].x, points[i].y);
+    g.closePath();
+  }
+
+  function biomeColor(v, fallback) {
+    return Number.isFinite(v) ? v : fallback;
+  }
+
+  // Ground and water, in world units, in the same order renderTerrain lays
+  // them down: one white sheet over the whole map and its margin, then the
+  // ocean as the play area minus the shore polygon, then each river's water
+  // polygon, then the grid over the lot. Everything renderTerrain draws in
+  // between — beach, grass, ground patches, riverbanks — is ground, and ground
+  // is white; the grid is the one piece of it kept, because a flat sheet with
+  // nothing on it gives no sense of scale or of how far anything has moved.
+  function bakeDebugTerrain(map, g) {
+    const t = map.terrain;
+    const w = map.width;
+    const h = map.height;
+    const colors = (map.mapDef && map.mapDef.biome && map.mapDef.biome.colors) || {};
+    const water = biomeColor(colors.water, DEBUG_WATER_FALLBACK);
+    const lake = biomeColor(colors.lakeWater, water);
+
+    g.clear();
+    g.beginFill(DEBUG_GROUND_COLOR);
+    g.drawRect(-120, -120, w + 240, h + 240);
+    g.endFill();
+
+    // The ocean is a hole shape, not a border: the shore polygon is concave
+    // and hand-jittered, so the water is whatever the play area has left over
+    // once it is cut out. Same construction the game uses.
+    if (t && t.shore && t.shore.length && typeof g.beginHole === 'function') {
+      g.beginFill(water);
+      g.moveTo(0, 0);
+      g.lineTo(0, h);
+      g.lineTo(w, h);
+      g.lineTo(w, 0);
+      g.beginHole();
+      traceDebugPoly(g, t.shore);
+      g.endHole();
+      g.closePath();
+      g.endFill();
+    }
+
+    const rivers = (t && t.rivers) || [];
+    for (let i = 0; i < rivers.length; i++) {
+      const r = rivers[i];
+      if (!r || !r.waterPoly || !r.waterPoly.length) continue;
+      g.beginFill(r.looped ? lake : water);
+      traceDebugPoly(g, r.waterPoly);
+      g.endFill();
+    }
+
+    // Last, and over the water as well as the ground — same order and same
+    // extent as renderTerrain, which rules the play area rather than the
+    // margin. Reset to a zero-width line afterwards so anything added to this
+    // bake later doesn't silently inherit a stroke.
+    g.lineStyle(DEBUG_GRID_WIDTH, DEBUG_GRID_COLOR, DEBUG_GRID_ALPHA);
+    for (let x = 0; x <= w; x += DEBUG_GRID_SIZE) {
+      g.moveTo(x, 0);
+      g.lineTo(x, h);
+    }
+    for (let y = 0; y <= h; y += DEBUG_GRID_SIZE) {
+      g.moveTo(0, y);
+      g.lineTo(w, y);
+    }
+    g.lineStyle(0);
+  }
+
+  // A cheap fingerprint of the drawn collider set: obstacle count, ids, and
+  // the collider numbers themselves quantized to 1/64 of a unit. That covers
+  // everything that can change a shape on screen — an obstacle entering or
+  // leaving the pool, one being destroyed, a door swinging its collider onto
+  // a new orientation — without allocating, so the expensive part (clearing
+  // and re-tessellating a few hundred shapes) only runs on frames where the
+  // geometry actually moved. Players are excluded deliberately: they move
+  // every frame, so gating them would never pay off, and they live in a
+  // Graphics of their own for that reason.
+  function debugObstacleSignature(obstacles) {
+    let sig = obstacles.length | 0;
+    for (let i = 0; i < obstacles.length; i++) {
+      const o = obstacles[i];
+      if (!o || !o.active || o.dead || !o.collidable) continue;
+      const c = o.collider;
+      if (!c) continue;
+      sig = (sig * 31 + (o.__id | 0)) | 0;
+      if (c.type === COLLIDER_AABB) {
+        if (!c.min || !c.max) continue;
+        sig = (sig * 31 + Math.round(c.min.x * 64)) | 0;
+        sig = (sig * 31 + Math.round(c.min.y * 64)) | 0;
+        sig = (sig * 31 + Math.round(c.max.x * 64)) | 0;
+        sig = (sig * 31 + Math.round(c.max.y * 64)) | 0;
+      } else {
+        if (!c.pos) continue;
+        sig = (sig * 31 + Math.round(c.pos.x * 64)) | 0;
+        sig = (sig * 31 + Math.round(c.pos.y * 64)) | 0;
+        sig = (sig * 31 + Math.round(c.rad * 64)) | 0;
+      }
+    }
+    return sig;
+  }
+
+  // Every collider currently in the world, as the flat filled shape it
+  // actually is. `collidable` is the line between "this is an object" and
+  // "this is scenery": a bush carries a collider and doesn't stop you, and a
+  // destroyed crate keeps its collider object but stops colliding, so both
+  // are dropped. No stroke — a border would draw outside the hitbox and make
+  // it read as larger than it is, which is the one thing this view exists to
+  // get right.
+  function drawDebugObstacles(g, obstacles) {
+    g.clear();
+    g.beginFill(DEBUG_OBSTACLE_COLOR);
+    for (let i = 0; i < obstacles.length; i++) {
+      const o = obstacles[i];
+      if (!o || !o.active || o.dead || !o.collidable) continue;
+      const c = o.collider;
+      if (!c) continue;
+      if (c.type === COLLIDER_AABB) {
+        if (!c.min || !c.max) continue;
+        g.drawRect(c.min.x, c.min.y, c.max.x - c.min.x, c.max.y - c.min.y);
+      } else if (c.type === COLLIDER_CIRCLE) {
+        if (!c.pos || !(c.rad > 0)) continue;
+        g.drawCircle(c.pos.x, c.pos.y, c.rad);
+      }
+    }
+    g.endFill();
+  }
+
+  // Players are all one colour — no teammate/enemy split, no downed shade.
+  // The circle is GameConfig.player.radius, i.e. the collision circle the
+  // server resolves movement against.
+  //
+  // It is drawn at `posAlt`, not `pos`. `pos` is where the last packet said
+  // the player was; `posAlt` is the render-interpolated position the game
+  // lerps toward it each frame, and it is what the body sprite's own
+  // pointToScreen is fed — so reading it is what puts the circle exactly where
+  // the (now hidden) sprite was. It is also the field the netcode smoothing
+  // installs its accessor on, so the position follows the Smoothing toggle and
+  // its knobs live, the same playback the sprite would have been drawn with.
+  // `pos` is only the fallback for a player the game has not interpolated yet.
+  function drawDebugPlayers(g) {
+    g.clear();
+    const roster = capturedGame ? findRosterOnGame(capturedGame) : null;
+    const pool = roster && roster.playerPool;
+    const players = (pool && typeof pool[POOL_GETALL] === 'function')
+      ? pool[POOL_GETALL]() : null;
+    if (!Array.isArray(players)) return;
+    g.beginFill(DEBUG_PLAYER_COLOR);
+    for (let i = 0; i < players.length; i++) {
+      const p = players[i];
+      if (!p || !p.active) continue;
+      const net = p[PLAYER_NET];
+      if (net && net[NET_DEAD]) continue;
+      const pos = p[PLAYER_POS2] || p[PLAYER_POS];
+      if (!pos || !Number.isFinite(pos.x) || !Number.isFinite(pos.y)) continue;
+      g.drawCircle(pos.x, pos.y, PLAYER_RADIUS);
+    }
+    g.endFill();
+  }
+
+  // Attach (or re-attach) our Graphics under the live map's terrain
+  // container, in draw order: ground and water, then obstacles, then players.
+  // The map is rebuilt per round and `display.ground` is destroyed with it,
+  // taking our children along, so identity is re-checked every frame rather
+  // than assumed.
+  function ensureDebugGfx(map) {
+    const host = map && map.display && map.display.ground;
+    // `children` goes null when PIXI destroys a container, and the map's is
+    // destroyed at the end of every round — without this the addChild below
+    // would throw once per frame until the next map arrives.
+    if (!host || host.destroyed || !Array.isArray(host.children)) return false;
+    const st = debugRender;
+    if (st.host === host && st.terrainGfx && st.obstacleGfx && st.playerGfx &&
+        st.terrainGfx.parent === host && st.obstacleGfx.parent === host &&
+        st.playerGfx.parent === host) {
+      return true;
+    }
+    const terrainGfx = makeGraphicsLike(host);
+    const obstacleGfx = makeGraphicsLike(host);
+    const playerGfx = makeGraphicsLike(host);
+    if (!terrainGfx || !obstacleGfx || !playerGfx) {
+      st.attachFailed = true;
+      return false;
+    }
+    try {
+      host.addChild(terrainGfx);
+      host.addChild(obstacleGfx);
+      host.addChild(playerGfx);
+    } catch {
+      st.attachFailed = true;
+      return false;
+    }
+    st.terrainGfx = terrainGfx;
+    st.obstacleGfx = obstacleGfx;
+    st.playerGfx = playerGfx;
+    st.host = host;
+    st.terrainKey = null;
+    st.obstacleSig = null;
+    st.attachFailed = false;
+    return true;
+  }
+
+  function setWorldRenderable(renderer, on) {
+    if (!renderer) return;
+    try {
+      if (renderer.ground) renderer.ground.renderable = on;
+      const layers = renderer.layers || [];
+      for (let i = 0; i < layers.length; i++) {
+        if (layers[i]) layers[i].renderable = on;
+      }
+    } catch {}
+  }
+
+  // Put the game's own rendering back and drop our geometry. Called both when
+  // the toggle goes off and when the pieces we were holding have gone stale,
+  // so a round change can't strand a hidden layer.
+  function teardownDebugRender() {
+    const st = debugRender;
+    if (st.hiddenIn) {
+      setWorldRenderable(st.hiddenIn, true);
+      st.hiddenIn = null;
+    }
+    for (const g of [st.terrainGfx, st.obstacleGfx, st.playerGfx]) {
+      if (!g) continue;
+      try {
+        if (g.parent) g.parent.removeChild(g);
+        g.destroy();
+      } catch {}
+    }
+    st.terrainGfx = null;
+    st.obstacleGfx = null;
+    st.playerGfx = null;
+    st.host = null;
+    st.terrainKey = null;
+    st.obstacleSig = null;
+  }
+
+  // One frame of the debug view. Cheap and self-restoring when off: the only
+  // work an idle tick does is the enabled check plus, once, the teardown.
+  function debugRenderTick() {
+    const st = debugRender;
+    if (DEBUG_RENDER.enabled !== 1) {
+      if (st.hiddenIn || st.terrainGfx) teardownDebugRender();
+      return;
+    }
+    const game = capturedGame;
+    const map = game ? findMapOnGame(game) : null;
+    if (!map || !map.mapLoaded) {
+      if (st.hiddenIn || st.terrainGfx) teardownDebugRender();
+      return;
+    }
+    if (!ensureDebugGfx(map)) return;
+
+    if (st.terrainKey !== map.terrain) {
+      bakeDebugTerrain(map, st.terrainGfx);
+      st.terrainKey = map.terrain;
+    }
+    const obstacles = getObstacles();
+    const sig = debugObstacleSignature(obstacles);
+    if (sig !== st.obstacleSig) {
+      drawDebugObstacles(st.obstacleGfx, obstacles);
+      st.obstacleSig = sig;
+    }
+    drawDebugPlayers(st.playerGfx);
+
+    // Hide the art last, and only once we have something to show in its
+    // place: a frame with both the world and our geometry up is a frame of
+    // clutter, a frame with neither is a black screen.
+    const renderer = findRendererOnGame(game);
+    if (renderer !== st.hiddenIn) {
+      setWorldRenderable(st.hiddenIn, true);
+      st.hiddenIn = renderer || null;
+    }
+    setWorldRenderable(renderer, false);
+  }
+
+  // `mapFound: false` in a match means findMapOnGame lost the map shape;
+  // `rendererFound: false` means the layer containers are still on screen and
+  // the hitboxes are drawing underneath them.
+  window.__debugRenderDiag = () => {
+    const game = capturedGame;
+    const map = game ? findMapOnGame(game) : null;
+    return {
+      enabled: DEBUG_RENDER.enabled === 1,
+      mapFound: !!map,
+      mapLoaded: !!(map && map.mapLoaded),
+      rendererFound: !!(game && findRendererOnGame(game)),
+      attached: !!(debugRender.terrainGfx && debugRender.terrainGfx.parent),
+      obstacleSig: debugRender.obstacleSig,
+      attachFailed: debugRender.attachFailed,
+      worldHidden: !!debugRender.hiddenIn,
+      terrainBaked: !!debugRender.terrainKey,
+      rivers: map && map.terrain && map.terrain.rivers ? map.terrain.rivers.length : null,
+    };
+  };
+
+  // ---------------------------------------------------------------------
+  // Collidable-only render: stop drawing everything that isn't part of the
+  // collision set — building roofs above all, plus bushes and the rubble a
+  // destroyed obstacle leaves behind.
+  //
+  // A house's inside is already being rendered. Its floor, its walls, the loot
+  // and the players in it are all drawn on the same layer as the world
+  // outside, and the roof is only a sprite laid over the top of them at
+  // `zOrd = 750 - zIdx`. `Building.imgs` holds both halves of that art in one
+  // array with each entry tagged `isCeiling`, so switching the ceiling ones
+  // off leaves the building standing and reveals what was under it, without
+  // touching the building's geometry, its layer or its zoom regions.
+  //
+  // `renderable = false` per sprite, for the same reason the debug view uses
+  // it on the layer containers: the game rewrites both fields we might
+  // otherwise use on every update — `positionSprite` sets a ceiling img's
+  // `alpha` from `ceiling.fadeAlpha`, and a `removeOnDamaged` img gets a
+  // `visible` — so anything written there is gone within a frame. `renderable`
+  // it never touches, and PIXI checks it before drawing the sprite.
+  //
+  // Obstacles use the same flag for the rest of the rule. `collidable` is the
+  // game's own line between an object and scenery — a bush carries a collider
+  // and doesn't stop you — and a dead obstacle keeps its collider object but
+  // stops colliding, so both are art in front of nothing and both go. That
+  // matches the set `__bulletGeom` and the aim path already work from, which
+  // is what makes the view honest: what is left on screen is what a bullet
+  // and a body can actually hit.
+  //
+  // A tree is on the other side of that line — it is collidable, it stops a
+  // bullet, and removing it would make the view lie about cover. But its
+  // leaves are drawn on top of whoever stands under them, which is exactly
+  // what this is here to stop, so canopy art is faded instead of removed. See
+  // CANOPY_ALPHA below for which art that is and how it is recognized.
+  //
+  // Smoke is the same problem out of a different barn. A grenade cloud is not
+  // an obstacle at all — it stops nothing and it is drawn over everything
+  // beneath it — so it is faded to that same CANOPY_ALPHA, and the two read at
+  // one depth instead of a tree seen through smoke reading as two. Only the
+  // mechanism differs: the barn assigns `sprite.alpha` on every frame it
+  // draws, so the number is caught rather than written. See capArt below.
+  //
+  // A display switch and nothing else: nothing reads geometry from it, and it
+  // is deliberately independent of the ESP overlay's master toggle even
+  // though it sits in that section — it puts nothing on the overlay canvas,
+  // so gating it behind the canvas would only be surprising.
+  //
+  // What it cannot open up is a bunker. Underground art lives on
+  // `renderer.layers[2]`, which the renderer masks down to the stairwell
+  // openings the whole time the local player is aboveground, so there is no
+  // roof to hide — those sprites are being clipped away, not covered up.
+  // ---------------------------------------------------------------------
+
+  // A Building, by the readable fields its class declares. `ceiling` and
+  // `surfaces` together are unique to it: a Structure carries `layers`,
+  // `stairs` and `mask` instead, and an Obstacle has none of the four.
+  function looksLikeBuilding(v) {
+    try {
+      return !!v && typeof v === 'object' &&
+        'ceiling' in v && 'ceilingDead' in v && 'surfaces' in v && Array.isArray(v.imgs);
+    } catch {
+      return false;
+    }
+  }
+
+  let cachedBuildingPoolKey = null;
+
+  // Same shape, and the same caveat, as findObstaclePool: the pool is under a
+  // mangled name, so it is identified by what its entries are, which needs at
+  // least one live building. Until there is one this returns null and the
+  // roofs stay up for a tick.
+  function findBuildingPool(map) {
+    if (!map || typeof map !== 'object') return null;
+    const isBuildingPool = (v) => {
+      if (!v || typeof v !== 'object' || typeof v[POOL_GETALL] !== 'function') return false;
+      const all = v[POOL_GETALL]();
+      if (!Array.isArray(all) || !all.length) return false;
+      return looksLikeBuilding(all[0]);
+    };
+    try {
+      if (cachedBuildingPoolKey) {
+        const p = map[cachedBuildingPoolKey];
+        if (isBuildingPool(p)) return p;
+        cachedBuildingPoolKey = null;
+      }
+      const names = Object.getOwnPropertyNames(map);
+      for (let i = 0; i < names.length; i++) {
+        if (isBuildingPool(map[names[i]])) {
+          cachedBuildingPoolKey = names[i];
+          return map[names[i]];
+        }
+      }
+    } catch {}
+    return null;
+  }
+
+  function getBuildings() {
+    const map = findMapOnGame(capturedGame);
+    if (!map) return [];
+    const pool = findBuildingPool(map);
+    if (!pool) return [];
+    const all = pool[POOL_GETALL]();
+    return Array.isArray(all) ? all : [];
+  }
+
+  // A smoke particle, by the readable fields its class declares. Survev leaves
+  // these unmangled the way it leaves `pos` and `sprite` unmangled elsewhere,
+  // and the radTarget/fadeTicker/rotVel trio is carried by nothing else.
+  function looksLikeSmokeParticle(v) {
+    try {
+      return !!v && typeof v === 'object' &&
+        'radTarget' in v && 'fadeTicker' in v && 'rotVel' in v &&
+        'interior' in v && 'sprite' in v;
+    } catch {
+      return false;
+    }
+  }
+
+  function isSmokeParticleArray(v) {
+    return Array.isArray(v) && v.length > 0 && looksLikeSmokeParticle(v[0]);
+  }
+
+  let cachedSmokeBarnKey = null;
+  let cachedSmokeArrayKey = null;
+
+  // The smoke barn hangs off the Game rather than the map, and holds its
+  // particles in a plain array beside its entity pool — both under mangled
+  // names, so the pair is found by what the array's entries are. Like the
+  // obstacle and building pools that needs one live entry, which here means
+  // one smoke that has been thrown this round; until then the barn is
+  // unidentified and this returns empty rather than wrong. The array is the
+  // barn's own recycling pool and is never rebuilt, so once the two keys are
+  // cached the per-frame cost is two property reads.
+  function findSmokeParticles() {
+    const game = capturedGame;
+    if (!game || typeof game !== 'object') return [];
+    try {
+      if (cachedSmokeBarnKey && cachedSmokeArrayKey) {
+        const barn = game[cachedSmokeBarnKey];
+        const arr = barn && typeof barn === 'object' && barn[cachedSmokeArrayKey];
+        if (isSmokeParticleArray(arr)) return arr;
+        cachedSmokeBarnKey = null;
+        cachedSmokeArrayKey = null;
+      }
+      const names = Object.getOwnPropertyNames(game);
+      for (let i = 0; i < names.length; i++) {
+        const barn = game[names[i]];
+        // Arrays are skipped rather than descended into: the barn is a class
+        // instance, and the Game keeps `pings` and `updateIntervals` beside it
+        // — both one entry per server update and both unbounded over a match,
+        // so listing their indices every frame is the one way this scan could
+        // cost anything.
+        if (!barn || typeof barn !== 'object' || Array.isArray(barn)) continue;
+        const keys = Object.getOwnPropertyNames(barn);
+        for (let j = 0; j < keys.length; j++) {
+          if (isSmokeParticleArray(barn[keys[j]])) {
+            cachedSmokeBarnKey = names[i];
+            cachedSmokeArrayKey = keys[j];
+            return barn[keys[j]];
+          }
+        }
+      }
+    } catch {}
+    return [];
+  }
+
+  // A tree is collidable, so it stays — but its leaves are drawn on top of
+  // whoever is standing under them, which is the one thing this view exists to
+  // stop. So canopy art is faded rather than removed: the tree still reads as
+  // a tree, and the player under it reads as a player. Smoke is faded to the
+  // same number, so everything this view leaves in front of a body is in front
+  // of it by the same amount.
+  const CANOPY_ALPHA = 0.35;
+  // Which art counts as a canopy, by the game's own rule rather than by a list
+  // of type names that would rot on the next content patch. `sprite.zOrd` is
+  // the obstacle def's `img.zIdx`, and Obstacle.render treats >= 50 as "this
+  // draws above the player" — it lifts exactly those onto the player's layer
+  // and pushes them past their z-order. Tree canopies sit at 200 and 801;
+  // tables, pipes and statue tops share the rule and get the same treatment,
+  // for the same reason.
+  const CANOPY_ZORD = 50;
+
+  // One property we are holding on a set of sprites. `live` is what is held
+  // right now, `next` collects the frame being built, and `restore` hands one
+  // sprite back. `commit` releases anything the new frame didn't re-claim and
+  // then swaps the two buffers, so the released set becomes the next frame's
+  // scratch — which is what restores a sprite when its obstacle changes state,
+  // when a pool entry is recycled into a different object, when the toggle
+  // goes off and when the round ends, and it keeps a per-frame pass over a few
+  // hundred sprites free of garbage.
+  function makeArtTracker(restore) {
+    return {
+      live: new Set(),
+      next: new Set(),
+      commit() {
+        for (const sprite of this.live) {
+          if (!this.next.has(sprite)) restore(sprite);
+        }
+        this.live.clear();
+        const empty = this.live;
+        this.live = this.next;
+        this.next = empty;
+      },
+      releaseAll() {
+        for (const sprite of this.live) restore(sprite);
+        this.live.clear();
+        this.next.clear();
+      },
+    };
+  }
+
+  function showArt(sprite) {
+    try { sprite.renderable = true; } catch {}
+  }
+
+  // Back to whatever the game last assigned. Every sprite carries its own
+  // `imgAlpha` — the def's alpha, which the obstacle copies into `alpha` on
+  // the rare frames it swaps a texture — so the value to hand back is on the
+  // sprite itself and needs no bookkeeping of ours.
+  function unfadeArt(sprite) {
+    try {
+      sprite.alpha = Number.isFinite(sprite.imgAlpha) ? sprite.imgAlpha : 1;
+    } catch {}
+  }
+
+  // Smoke's alpha, unlike a canopy's, is rewritten every frame — the barn sets
+  // `alpha = clamp(1 - fadeTicker / fadeDuration) * 0.9` in the same tick that
+  // renders the particle — so there is no point in a frame where a value we
+  // write is the one that gets drawn. The write is intercepted instead of
+  // repeated: an own accessor keeps the game's number in `raw` and hands back
+  // the lower of it and CANOPY_ALPHA. The barn goes on assigning exactly as it
+  // did, and a puff's own fade-out still plays, because those values are under
+  // the cap and pass straight through — what is capped is how solid the cloud
+  // gets, not how it dies.
+  //
+  // `alpha` on a PIXI DisplayObject is a plain instance field, so this
+  // replaces an own data property, and handing it back is deleting the
+  // accessor and assigning the game's last number in its place.
+  const cappedAlpha = new WeakMap();
+
+  function capArt(sprite, into) {
+    if (!sprite) return;
+    if (!cappedAlpha.has(sprite)) {
+      const rec = { raw: Number.isFinite(sprite.alpha) ? sprite.alpha : 1 };
+      try {
+        Object.defineProperty(sprite, 'alpha', {
+          configurable: true,
+          enumerable: true,
+          get() { return rec.raw < CANOPY_ALPHA ? rec.raw : CANOPY_ALPHA; },
+          set(v) { rec.raw = v; },
+        });
+      } catch { return; }
+      cappedAlpha.set(sprite, rec);
+    }
+    into.add(sprite);
+  }
+
+  function uncapArt(sprite) {
+    const rec = cappedAlpha.get(sprite);
+    cappedAlpha.delete(sprite);
+    try {
+      delete sprite.alpha;
+      sprite.alpha = rec && Number.isFinite(rec.raw) ? rec.raw : 1;
+    } catch {}
+  }
+
+  const collidableOnly = {
+    hidden: makeArtTracker(showArt),
+    faded: makeArtTracker(unfadeArt),
+    capped: makeArtTracker(uncapArt),
+  };
+
+  function hideArt(sprite, into) {
+    if (!sprite) return;
+    try { sprite.renderable = false; } catch { return; }
+    into.add(sprite);
+  }
+
+  function fadeArt(sprite, into) {
+    if (!sprite) return;
+    try { sprite.alpha = CANOPY_ALPHA; } catch { return; }
+    into.add(sprite);
+  }
+
+  // Hand every sprite back. Called when the toggle goes off and whenever the
+  // world we were reading disappears, so a round change can't strand an
+  // invisible roof, or a faded canopy, on a sprite the next map recycles.
+  function restoreHiddenArt() {
+    collidableOnly.hidden.releaseAll();
+    collidableOnly.faded.releaseAll();
+    collidableOnly.capped.releaseAll();
+  }
+
+  // One frame of the collidable-only view. Idle cost when off is the enabled
+  // check plus, once, the restore.
+  function collidableOnlyTick() {
+    const st = collidableOnly;
+    const holding = st.hidden.live.size || st.faded.live.size || st.capped.live.size;
+    if (ESP.collidableOnly !== 1) {
+      if (holding) restoreHiddenArt();
+      return;
+    }
+    const map = findMapOnGame(capturedGame);
+    if (!map || !map.mapLoaded) {
+      if (holding) restoreHiddenArt();
+      return;
+    }
+
+    const hide = st.hidden.next;
+    const fade = st.faded.next;
+    const cap = st.capped.next;
+
+    const buildings = getBuildings();
+    for (let i = 0; i < buildings.length; i++) {
+      const b = buildings[i];
+      if (!b || !b.active || !Array.isArray(b.imgs)) continue;
+      for (let j = 0; j < b.imgs.length; j++) {
+        const img = b.imgs[j];
+        if (img && img.isCeiling) hideArt(img.sprite, hide);
+      }
+    }
+
+    const obstacles = getObstacles();
+    for (let i = 0; i < obstacles.length; i++) {
+      const o = obstacles[i];
+      if (!o || !o.active) continue;
+      if (!o.collidable || o.dead) {
+        hideArt(o.sprite, hide);
+        // A door's frame is a second sprite the obstacle positions alongside
+        // its own, so a dead door that kept only the first would leave its
+        // casing floating with nothing to hold it up.
+        if (o.isDoor && o.door) hideArt(o.door.casingSprite, hide);
+        continue;
+      }
+      // Collidable, so it stays on screen — but if the game draws it over the
+      // player, it gets faded to show what is underneath.
+      const sprite = o.sprite;
+      if (sprite && sprite.zOrd >= CANOPY_ZORD) fadeArt(sprite, fade);
+    }
+
+    // Smoke sits in none of the pools above and is in no collision set, but it
+    // is drawn over whoever is inside it, so it gets the canopy treatment.
+    // Inactive particles are the barn's free list — already invisible, and
+    // capping one would only be handed back on the frame it is reused.
+    const smoke = findSmokeParticles();
+    for (let i = 0; i < smoke.length; i++) {
+      const p = smoke[i];
+      if (p && p.active) capArt(p.sprite, cap);
+    }
+
+    st.hidden.commit();
+    st.faded.commit();
+    st.capped.commit();
+  }
+
+  // `buildings: 0` in a live match means findBuildingPool hasn't identified the
+  // pool — the roofs are still up and `mangled.js` may need re-deriving if it
+  // stays that way once a match is running.
+  window.__collidableOnlyDiag = () => {
+    const map = findMapOnGame(capturedGame);
+    // Counted before `poolKey` is read: getBuildings is what resolves the key,
+    // and with the toggle off nothing else ever has.
+    const live = getBuildings().filter((b) => b && b.active).length;
+    return {
+      enabled: ESP.collidableOnly === 1,
+      mapFound: !!map,
+      mapLoaded: !!(map && map.mapLoaded),
+      poolKey: cachedBuildingPoolKey,
+      buildings: live,
+      hiddenSprites: collidableOnly.hidden.live.size,
+      fadedSprites: collidableOnly.faded.live.size,
+      cappedSprites: collidableOnly.capped.live.size,
+      smokeBarnKey: cachedSmokeBarnKey,
+      smokeParticles: findSmokeParticles().length,
     };
   };
 
@@ -5262,6 +7588,12 @@
   }
 
   function overlayFrame() {
+    // Ahead of the ESP gate below: both of these are their own toggle and have
+    // to keep working (and keep the world's art switched off) with the ESP
+    // overlay itself off.
+    try { debugRenderTick(); } catch {}
+    try { collidableOnlyTick(); } catch {}
+
     if (!ensureOverlayCanvas()) {
       requestAnimationFrame(overlayFrame);
       return;
