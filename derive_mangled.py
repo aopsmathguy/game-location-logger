@@ -488,6 +488,7 @@ window.__SURVEV_MANGLED__ = {{
     activeWeapon: {q("netData.activeWeapon")},
     dead:         {q("netData.dead")},
     downed:       {q("netData.downed")},
+    scale:        {q("netData.scale")},
   }},
 
   // ---- Player.localData (the sub-object named by player.localData above) ----
@@ -622,6 +623,11 @@ def main() -> None:
         ("netData.activeWeapon",  lambda: derive_field_on(text, values["player.netData"], "activeWeapon", "netData.activeWeapon", start=p_start)),
         ("netData.dead",          lambda: derive_field_on(text, values["player.netData"], "dead",         "netData.dead",         start=p_start)),
         ("netData.downed",        lambda: derive_field_on(text, values["player.netData"], "downed",       "netData.downed",       start=p_start)),
+        # scale multiplies GameConfig.player.radius into the collider the game
+        # actually tests bullets against (`this.<rad> = this.<netData>.<scale> *
+        # <cfg>.player.radius`), so the dodge bot's hitbox is wrong without it.
+        # Written in the same assignment run as activeWeapon/dead/downed.
+        ("netData.scale",         lambda: derive_field_on(text, values["player.netData"], "scale",        "netData.scale",        start=p_start)),
         ("localData.zoom",        lambda: derive_field_on(text, values["player.localData"], "zoom",       "localData.zoom",       start=p_start)),
         ("localData.curWeapIdx",  lambda: derive_field_on(text, values["player.localData"], "curWeapIdx", "localData.curWeapIdx", start=p_start)),
         ("localData.weapons",     lambda: derive_local_weapons(text, values["player.localData"], p_start)),

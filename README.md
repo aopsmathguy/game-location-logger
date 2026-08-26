@@ -81,7 +81,10 @@ none of them touches input or gameplay state.
   hand-edited entry can't drop a `NaN` into the aim or netcode paths.
 - **Ping readout** — live round-trip time above the top-left team panel,
   colour-coded green/amber/red. Read from the RTT samples survev already
-  collects (`game.pings`), so it adds no traffic of its own.
+  collects (`game.pings`), so it adds no traffic of its own, and averaged with
+  the same decayed-moment EWMA the clock regression runs on — an 8-sample
+  half-life, so about the twelve samples the old median held, with no window
+  edge. The aim lead and the dodge bot's threat advance read the same number.
 - **Debug render** — the "Debug" button in the MOD tab throws the game's art
   away and draws the collision geometry instead: white ground under the map's
   own grid, water in the map's own colour, every collidable object as a filled
@@ -838,8 +841,8 @@ one that looks like it hit.
 
 This is survev's own inconsistency rather than one the smoothing introduces:
 stock lerps players a whole tick behind the newest snapshot while running
-bullets in real time, so the gap there is wider. The clock narrows it;
-`Bullets on clock` closes it, by walking each round back along its own direction
+bullets in real time, so the gap there is wider. The clock narrows it, and the
+barn's render pass closes it, by walking each round back along its own direction
 by exactly the lag the player render is held at.
 
 The substitution happens in the barn's render pass and nowhere else. `pos` is
@@ -864,10 +867,34 @@ The one thing it cannot do is un-draw a round that had not been fired yet at
 render time. Walking back is clamped at the muzzle instead, so a new bullet sits
 at its start point for up to half a tick and then sets off.
 
-Off by default. It is strictly more coherent and it costs half a tick of warning
-on incoming fire, which is a real trade for a human at the keyboard — the dodge
-bot is unaffected either way, since it reads the barn's true positions and never
-looks at a sprite.
+The impact is the mirror image, and it is where a fixed offset stops being the
+same clock. On a hit the barn snaps `pos` onto the contact point, clears `alive`
+and holds it there while `scale` retracts the streak into that point over
+~167ms. A dead round is no longer where it was a lag ago — it *stopped* — so
+subtracting the same distance for the whole fade draws it at no instant at all,
+collapsing the trail 5.4 units short of the rock it visibly just hit (a Barrett
+at 214 u/s over half a 20Hz tick) with the spark stranded at the surface for ten
+frames.
+
+Reading the clock literally fixes it: the shift is `speed ×` *the part of the
+lag the round was still in the air for* — the whole lag while it flies, then
+running down to nothing over the lag after it dies. The tracer covers its last
+stretch, arrives at the contact point about a frame and a half after the spark,
+and rests there for the remainder of the fade.
+
+The stall case closes the same way. `renderOnClock` will not carry a player more
+than `NET_MAX_EXTRAP_MS` (200ms) past its newest snapshot, so a long stall parks
+the bodies at the end of that coast; the bullet lag is taken against that same
+clipped render time rather than against `t_now - renderLag`, so it grows at
+exactly the rate real time does and the tracers hold still beside them. Without
+it they fly on through a frozen world.
+
+This rides the master `Smoothing` switch rather than a toggle of its own: the
+whole point of the clock is that one instant is drawn, and a smoothed world with
+bullets left at `t_now` is the incoherent half-state. It does cost half a tick of
+warning on incoming fire, which is the price of the tracer and the body agreeing
+about when they are — the dodge bot is unaffected either way, since it reads the
+barn's true positions and never looks at a sprite.
 
 ### The trade
 
@@ -1066,8 +1093,10 @@ the shooter led against. From a standstill we can diverge at 12 u/s. If we
 were already strafing across the shot when it left and we simply *reverse*,
 the two paths separate at 24 u/s and the clearance takes ~42ms, halving every
 threshold above. That is the whole reason the planner is allowed to keep
-moving, and why standing still — which scores perfectly safe against one
-bullet already in the air — carries a standing penalty anyway.
+moving. It is not, however, pushed to: standing still carries no penalty of its
+own, and among plans that are equally clear of every round in the air it is only
+the `Follow input` term — the pull toward the keys the player is actually
+holding — that stops it being chosen by default.
 
 The consequence worth being honest about: **at close range there is no
 dodge.** An SMG round from 8 units arrives in under 100ms, which is less than
@@ -1127,14 +1156,17 @@ Four things happen to each bullet before it is scored:
    `firstBulletHit` the aim helper and the ESP fade use. A round that dies on
    a crate is not a threat, and treating it as one is precisely what would
    walk the bot out of cover.
-4. **It is dropped unless it can reach us.** Solved against our radius
-   inflated by `speed × horizon` — everywhere we could possibly stand before
+4. **It is dropped unless it can reach us.** Solved against our radius grown
+   by `speed × horizon` — everywhere we could possibly stand before
    the plan ends — so a round rejected here is one no candidate plan could be
-   touched by. This is what makes the 48-threat cap mean something: the barn
-   is in arrival order, which has nothing to do with danger, and without the
-   filter a firefight's worth of tracers flying somewhere else fills every
-   slot while the round that is actually going to hit us never gets one. At
-   the cap a newcomer displaces whichever slot is furthest from mattering.
+   touched by. This filter is now the only thing deciding the size of the
+   set — everything surviving it is kept and planned against, however many
+   that is. There used to be a hard cap of 48 on top of it, with a newcomer
+   displacing the slot furthest from mattering. Nothing replaces that bound,
+   so threat count now multiplies into the innermost loop unchecked; the
+   reachability filter is what makes that acceptable, since it already
+   rejects everything flying somewhere else, which in a firefight is nearly
+   all of it.
 
 Collision is then solved in closed form, not sampled. For a candidate
 velocity `v` and a bullet `(b, w)`, with `q = b - p` and `u = w - v`:
@@ -1146,12 +1178,20 @@ bb ≥ 0  → separating
 disc = bb² - a·c ;  t = (-bb - √disc)/a
 ```
 
+`R` is our own radius plus `Clearance`: we are treated as a point and the bullet
+carries the radius, which is what lets the planner be dimensionless everywhere
+else, including the wall march. The radius is read live rather than assumed —
+the game collides against `scale × GameConfig.player.radius`, and `scale` is a
+per-player field off the wire, so a planner solving a fixed `1` would be testing
+the wrong body. `Clearance` on top is the safety factor for the errors the
+geometry cannot see: the ping lead is an estimate and the server's idea of where
+we are is a round trip old.
+
 Sampling is not an option: a Barrett round crosses a player's diameter in 9ms
-and would step straight over a 16ms frame without ever testing as
-overlapping. The closest-approach distance is recorded even for a clean miss,
-because a binary hit test has a cliff at the hitbox edge and a plan scored on
-it will happily shave that edge — after which one tick of jitter turns the
-shave into a hit.
+and would step straight over a 16ms frame without ever testing as overlapping.
+
+What the planner does with the result is *not* a yes/no. See
+[Graded by what we don't know](#graded-by-what-we-dont-know).
 
 ### What a round is worth
 
@@ -1207,10 +1247,10 @@ shipped a bullet the table doesn't list — is priced at `DODGE_DMG_REF`, which
 is exactly the flat hit-counting the planner did before the table existed.
 
 Flares and the invisible round do 0 damage, and are dropped rather than scored
-as zero. Both would take a threat slot from something that can actually hurt
-us, and the takeover reads time-to-impact regardless of what a threat is worth
-— so one flare on course would hold the keys for as long as it stayed in the
-air.
+as zero. They would take a threat slot from something that can actually hurt
+us, and — since the bot drives for as long as anything is in the air that could
+reach us — one flare would keep it driving for the whole of that flight for no
+reason.
 
 ### Planning
 
@@ -1219,38 +1259,14 @@ still. Diagonals are unit length, because the server normalizes the move
 vector before scaling it by speed — a diagonal is not faster, and believing
 otherwise would have the planner counting on an escape it cannot execute.
 
-Each heading is first scored held for the rest of the window. The best few
-then get a second leg, every heading tried for it. One leg is enough to get
-out of the way of one bullet and is reliably wrong about two: the heading that
+What gets planned is not a heading, and not two. One heading is enough to get
+out of the way of one bullet and is reliably wrong about two: the one that
 clears the first can be the one with nowhere left to go when the second
-arrives, and only a plan allowed to turn can see that coming.
-
-**Which first legs earn that second leg comes from two rankings, not one.**
-Ranking by the full window alone discards every opening that is right for its
-first quarter-second and wrong after — a step into a doorway, a dash across a
-shot before turning back — which is exactly the class of plan two legs exist
-to find, and which by construction never places well on a one-leg score. So
-the branch set is the best few by the full window *plus* the best few by the
-commit leg alone, interleaved and deduped.
-
-Legs are advanced through a context object rather than run as one closed
-function, because within a frame most of the work is shared. Every plan starts
-with the same latency prefix and every second leg of a branch starts from the
-same first leg, so each is advanced once and then copied; the context carries
-the per-threat minima with it, so a copy resumes exactly where the original
-left off, and a branch's wall march — the expensive part — is handed to its
-nine continuations rather than repeated by each. Measured at 0.14ms per plan
-against 24 threats and 20 walls, against a 16ms frame.
-
-
-### The deep search
-
-Two legs is the answer to one bullet and usually to two. It runs out of room
-against a fast round, where the escape is not a heading but a *sequence* — go,
-then stop, then go back — and where a quarter-second commit is longer than the
-whole flight. `Deep search`, on by default, replaces the branch search with the
-question the fight actually poses: over the next `horizon` seconds, chopped
-into `Step` decisions, which sequence of headings takes the least damage?
+arrives. Against a fast round the escape is not a heading at all but a
+*sequence* — go, then stop, then go back — over a flight shorter than any
+commit worth making. So the question is asked over the whole horizon at once:
+over the next `horizon` seconds, chopped into `Step` decisions, which sequence
+of headings takes the least damage?
 
 At the default 0.1s step that is eight decisions and 9⁸ ≈ 43 million sequences,
 which is hopeless as a tree — and it is not a tree. Two paths that arrive at the
@@ -1263,13 +1279,19 @@ into each cell. The reachable set at layer *k* is a disc of radius
 `speed·k·step` rather than 9ᵏ, and that is the whole difference — a few thousand
 states rather than 43 million rollouts.
 
+The one rollout that is not part of that search — "is the course the user is
+already on going to be hit?" — runs through a context object instead, advanced
+once through the latency prefix and then copied, so the prefix is paid for
+once. It carries the per-threat contact times with it, so a copy resumes
+exactly where the original left off. That question used to be the takeover
+trigger; it now only feeds the HUD.
+
 Merging is sound only if cost is additive per edge and the cost of finishing
-depends on nothing but `(cell, layer)`. Damage is; the graze, standing and
-wall-pinned terms are per-second and so are too. The turn penalty is the
-exception, because it needs the previous heading, which is history — so it is
-charged once, on the first leg, against the course we are really on. That is
-also the only turn that is real: legs past the first are re-planned from scratch
-next frame and never executed as written.
+depends on nothing but `(cell, layer)`. The loss is a sum of damage over the
+rounds that land, so both hold outright — nothing in it needs to know how a
+state was reached. That was not free when turning, standing and wall-grinding
+were also charged: the turn penalty in particular needed the previous heading,
+which is history, and had to be special-cased onto the first layer.
 
 Three things are approximate, and none of them is hidden:
 
@@ -1277,19 +1299,22 @@ Three things are approximate, and none of them is hidden:
 random walk, not a fixed offset — worst case `steps·grid/2` by the end of the
 horizon. The leg that actually gets executed is the first, whose geometry is
 exact; the drift only degrades the value of a tail that gets thrown away next
-frame anyway.
+frame anyway. This is the approximation the graded hit test is built out of
+rather than in spite of — the band is exactly the half-cell the snapping costs.
 
-**Re-billing.** A threat is charged on the leg where contact *starts*, and legs
-that open already overlapping score it as a graze of zero rather than a second
-hit. Without that a slow round would be billed on every step it spends inside
-us. A round crosses a body in about 20ms against a 100ms step, so contact
-starts and ends inside one leg in practice.
+**Re-billing.** A threat is charged on the leg where it *enters the band*, and
+legs that open already inside it score nothing rather than a second hit. Without
+that a slow round would be billed on every step it spends near us, and the total
+would depend on how the horizon happened to be chopped up. A round crosses a
+body in about 20ms against a 100ms step, so an encounter opens and closes inside
+one leg in practice. The first leg is the exception and bills whatever it opens
+on, since no earlier leg exists to have done it.
 
 **The beam.** Only the cheapest 64 states per layer are expanded. A firefight
 puts several times as many rounds in the air as a duel and every one of them is
 swept on every edge, so the exact search is the thing whose cost is not under
-our control — the frontier is. On the bench 64 measured inside the noise of
-exact, 3.4% against 3.2%, for a quarter of the time.
+our control — the frontier is. On the bench 64 measured inside the noise of the
+exact search, 3.4% against 3.2%, for a quarter of the time.
 
 The objective is a sum of damage in HP — see [What a round is worth](#what-a-round-is-worth).
 
@@ -1297,57 +1322,139 @@ Measured in `dodgebot-test/bench.js`, 60 trials × 12s, against the same seeded
 fights with the same shot noise:
 
 ```
-  Barrett 214u/s      no bot   branch      deep    ms/plan
+  Barrett 214u/s      no bot   two-leg     this    ms/plan
   ---------------------------------------------------------
     0ms                96.9%     8.7%      3.2%    0.02 / 1.36
    60ms                96.9%    29.7%     22.7%    0.02 / 1.42
 ```
 
-Slower guns are already fully dodged by both — an M870 round at 66 u/s takes
-long enough that one turn is all anyone needs — and the difference there is
-noise in both directions. The deep search is worth having for the rounds that
-arrive before a two-leg plan can finish, and it costs nothing for the rest.
+The middle column is a two-leg branch search this replaced — nine headings held
+for the horizon, a second leg for the best few — kept here as the measurement
+that justifies the cost. Slower guns were already fully dodged by both, an M870
+round at 66 u/s taking long enough that one turn is all anyone needs, and the
+difference there was noise in both directions. The win is entirely in the
+rounds that arrive before a two-leg plan can finish, and it costs nothing for
+the rest.
 
-Costs, in the order they matter:
+The loss, in full:
 
-| | |
-| --- | --- |
-| **a hit** | `w × 1e6`, less `w × 1e4` per second of delay before it lands |
-| **a graze** | `w × exp(-gap / 0.6)` — graded, so the edge isn't shaved |
-| **pinned against a wall** | `2.5` per second of a leg spent not moving |
-| **standing still** | `0.5` per second, for the divergence it forfeits |
-| **changing heading** | `0.15`, enough to stop dithering and not to stop turning |
+```
+  sum over threats of   w × f × (1e6 - t_closest × 1e4)
+      +  follow × (how opposed each leg is to the keys being held)
+```
 
 `w` is the round's damage over `DODGE_DMG_REF` (25 HP, about a mid-tier round),
-so a typical threat weighs about 1 and every absolute constant in the table
-keeps the meaning it was tuned with. The graze carries the same `w` as the hit
-because that is what the term is — a hit discounted by how unlikely it is, with
-`exp(-gap / 0.6)` standing in for the probability. Shaving an AWC round is worth
-avoiding more than shaving a Vector round, in the ratio of what they would do
-to us.
+so a typical threat weighs about 1. `f` is how much of a hit the pass counts as.
+The first term is the whole of what the bot is for. Nothing is charged for
+standing still, for turning, or for grinding along a wall — all three used to
+carry a penalty and no longer do.
 
-Standing and turning are charged per leg, against the course we are really on
-— ours while engaged, the user's otherwise. Charging standing only to a plan's
-opening heading made "dash, then stop" a free way to buy exactly the standing
-the penalty exists to discourage, and the 2x-divergence argument above is
-forfeited just as completely by stopping at 0.25s as by never starting.
+### Graded by what we don't know
 
-A hit outweighs everything else by six orders of magnitude, so the planner
-never trades one away for tidier geometry. Between two plans that both get
-hit it takes the *later* one: the extra tenth of a second is free option
-value — the shooter can lose the line, the round can find a wall, and we may
-simply be somewhere else by then.
+`f` is not 0 or 1. A binary test asks whether our centre is inside the hitbox,
+which pretends we know where our centre is — and we don't. Position is snapped
+to `Grid` at every layer, and the ping lead is an estimate, so a plan that
+clears a round by a hair has not really cleared it. So:
+
+```
+  d ≤ R                f = 1                       band = grid
+  R < d < R + band     f = (R + band - d) / band   linear
+  d ≥ R + band         f = 0
+```
+
+with `d` the closest approach on that leg. At the default grid the fade runs
+`1.0 → 1.35`.
+
+**The band sits entirely outside the hitbox, and that is deliberate.** It can
+only ever *add* cost to what a binary test would charge, never remove it — a
+round whose closest approach is inside the body scores a full hit exactly as
+before. An earlier version centred the band on `R`, which also discounted
+marginal hits: a pass at `0.9u`, comfortably inside the body, billed `0.786` of
+a hit. That is the wrong direction to be uncertain in — uncertainty should make
+the planner more careful, not less.
+
+`R` is already our body plus `Clearance` — the two stack rather than overlap.
+`Clearance` decides where *certainly hit* ends; the band fades out over one grid
+cell beyond that. At the defaults that is a full hit out to `1.2` and zero by
+`1.55`.
+
+**The width is derived, not tuned.** It is the quantisation of the state space,
+so it tracks the `Grid` knob without anyone re-tuning it — sharpen the grid and
+the model sharpens with it. That is the whole difference from the graze term
+this replaces, which had a hand-picked `σ = 0.6` and, far worse, left a
+six-order-of-magnitude cliff at the hitbox edge:
+
+```
+  gap = 0⁻  (hit)    1.00e+6
+  gap = 0⁺  (graze)  1.00e+0
+```
+
+A plan could shave that edge and win by a factor of a million. The ramp is
+continuous across it, so it can't.
+
+The time is the **closest approach**, not the moment the hitbox is crossed. That
+crossing doesn't exist for a graze and appears discontinuously as one becomes a
+hit, which would put a cliff back into the very term the ramp exists to smooth.
+The two differ by less than the time a round takes to cross a body, against a
+bonus worth at most 2% of the hit.
+
+It is calibrated for the leg that actually executes: layer 1 carries about
+`0.10u` of snapping error against `h = 0.175`. The drift compounds to `~0.29u`
+by layer 8, so the band under-states the uncertainty in the tail — the right way
+round, since the tail is thrown away and re-planned next frame.
+
+The closed form costs almost nothing. Two rejections run ahead of it and are
+pure multiplies — a round separating from the leg's start never closes, and one
+whose unconstrained closest approach `|q|² - b²/a` still clears the band never
+enters it, which rearranges to `b² ≤ a(|q|² - (R+h)²)` with no division. The
+divide is paid only by rounds genuinely passing close, and the square root only
+by the ~0.4% of threat-edge pairs that land in the band. Measured at **+12%** on
+the sweep against the binary test it replaces.
+
+**The second term is why the first one being that blunt is survivable.** A
+hit-only loss scores every escape at exactly zero, and among the headings that
+all get clear it would return whichever the sweep happened to reach a cell by
+first — which, since headings are tried from index 0 and standing still is index
+0, means standing still wins every tie. `Follow input` breaks those ties toward
+what the player is already asking for:
+
+```
+  penalty = follow × dt × (1 - cos θ) / 2
+```
+
+where θ is the angle between the leg's heading and the heading the movement keys
+are really held on, read past the bot's own synthetic input. Running with the
+keys is free, running dead against them costs `follow` per second, and the
+diagonals either side cost about a seventh of that. Standing still sits at half,
+the same as running across — it is not what was asked for, but it is not the
+opposite of it either. A player holding nothing has no intent to agree with, so
+the term vanishes entirely rather than penalising every heading equally.
+
+It cannot buy a hit and is not meant to. The worst case is the knob at its
+maximum of 5 over a 2s horizon, which is 10, against the weakest hit in the game
+— a birdshot pellet at full falloff, 1 HP, worth `1/25 × 1e6` ≈ 39,200. There is
+a factor of ~4000 in hand even there, and about `1e6` for a typical round at the
+default of 1. Set it to 0 and the ties go back to being arbitrary.
+
+Because the penalty depends only on the heading of the leg being taken, it is
+additive per edge and needs no history, so it does not disturb the merging
+argument above the way the old turn penalty did.
+
+Between two plans that both get hit it takes the *later* one: the extra tenth
+of a second is free option value — the shooter can lose the line, the round can
+find a wall, and we may simply be somewhere else by then.
 
 Damage outranks that delay bonus rather than competing with it. Over a 2s
 horizon the bonus is at most 2% of the hit term, so it only ever breaks ties
-between rounds within 2% of each other in damage — which is what it was always
-for. Taking an MP5 round now to avoid an AWC round later falls straight out of
+between rounds within 2% of each other in damage — which is what it is for.
+Taking an MP5 round now to avoid an AWC round later falls straight out of
 `11/25 × 1e6` against `180/25 × 1e6`.
 
 Walls are the collidable obstacles near us, inflated by our own radius so the
 planner can treat itself as a point, and each leg is clipped at the first one
-and split into the part actually spent moving and the part spent pinned where
-it stopped. A step is refused only if it puts us *deeper* into an obstacle
+and split into the part actually spent moving and the part spent standing where
+it stopped — the pin itself is free, and only matters through the rounds that
+then reach us. A step is refused only if it puts us *deeper* into an obstacle
 than we already are — a plain inside/outside test would report every
 wall-ward heading as blocked the moment we touched a wall, and the bot would
 stand against it and eat the shot instead of sliding along it, which is the
@@ -1361,14 +1468,38 @@ drag it to zero.
 
 ### Taking the keys, and giving them back
 
-The trigger is one question, asked every frame: **does the course the user is
-already on get hit inside `trigger` seconds?** Nothing else engages the bot —
-not proximity, not the number of bullets in the air. If the user's own line
-happens to clear the shot, they keep the keys.
+The bot drives whenever a round is in the air that could reach us inside the
+horizon, and hands the keys back when there are none. That is the whole of it:
+there is no takeover threshold and no handback timer.
 
-That question is asked through `realBindDown`, which reads past our own
-synthetic input layer, so the bot can never see its own held keys and latch
-on itself. The arrow keys are tracked separately, because the bundle's
+There used to be both. A plan was pressed only once the user's own course was
+proven to be hit inside `trigger` seconds, and the keys went back after
+`releaseMs` of that question answering no. Both were answers to something the
+loss already answers better. A threshold has to be crossed, and crossing it is
+discrete: one frame the user is walking into a round, the next the bot is
+mid-dodge from a start state it did not choose, having spent the whole lead-up
+— the part where the dodge was still cheap — going the wrong way. The timer
+existed only to stop that threshold flapping, which is a problem the threshold
+created.
+
+The planner was never a dodge-or-don't decision in the first place. With
+nothing on course the hit term is zero everywhere and the loss is the alignment
+term alone, whose minimum is exactly the heading the user is holding — so the
+bot presses the user's own keys, and the handback is continuous rather than an
+event. As a round closes, its hit term grows against that alignment and the
+plan bends off the user's heading in proportion to what the round is worth and
+how sure the geometry is about it. It leans out of the way early and cheaply
+where that is enough, instead of waiting for a threshold and then dodging late
+and hard.
+
+The price is that **Follow input** is load-bearing rather than a tiebreak: it
+is the whole of how the user steers while the bot is on. At 0 the bot has no
+reason to prefer their heading over any other equally safe one, so 0 no longer
+means "don't interfere" — to stop the bot driving, turn the bot off.
+
+The user's heading is read through `realBindDown`, which reads past our own
+synthetic input layer, so the bot can never see its own held keys and follow
+itself in a circle. The arrow keys are tracked separately, because the bundle's
 movement path ORs the binds with a raw read of them:
 
 ```js
@@ -1383,22 +1514,19 @@ keyboard is doing. Nothing in the bind layer can suppress that raw `keyDown`
 above, but reporting the arrow as *bound* falsifies the second half of the
 `&&`, so `isKeyBound` is wrapped too, and only while the bot is driving.
 
-The keys go back after `releaseMs` of that same question answering no. It is
-a hold-over rather than an instant handback so a plan isn't abandoned halfway
-through the frame it starts working. Anything that can go wrong hands them
-back immediately: the toggle going off, the local player dying or
-disappearing, a new match, or an exception anywhere in the step.
+The keys go back the moment the threat set empties. Anything that can go wrong
+hands them back immediately too: the toggle going off, the local player dying
+or disappearing, a new match, or an exception anywhere in the step.
 
 ### Knobs
 
 | MOD tab | default | |
 | --- | --- | --- |
 | Dodge bot | off | master switch |
-| Take over at | 0.45s | seconds-to-impact at which the bot engages |
 | Horizon | 0.8s | how far ahead a plan is scored |
-| Clearance | 0.35 | safety added to the player radius when deciding what is a hit |
 | Ping lead | 1.0 | multiplier on the measured round trip when advancing threats |
-| Hand back | 150ms | how long the user's course must stay clear |
+| Clearance | 0.2 | added to our radius before anything is solved, as a safety factor |
+| Follow input | 1.0 | pull toward the keys you are holding, per second of opposition; also the only thing steering the bot when nothing is on course |
 
 `window.__dodge()` reports the live state — engaged or not, current heading,
 measured speed, threat and wall counts, the worst round in the air in HP and
@@ -1599,7 +1727,11 @@ let through — it blurs the box and closes the menu, as it does everywhere else
   interpolated aim direction. The two Player fields are installed per
   *instance* rather than on a prototype, because survev declares them as class
   fields, so an own data property would shadow anything put on the prototype
-  (the same mechanism that broke the constructor setter traps).
+  (the same mechanism that broke the constructor setter traps). It also wraps
+  the bullet barn's render pass — on the prototype, since a new round builds a
+  fresh barn off the same class — to draw each round at the same instant the
+  players are drawn at; that rides the same `Smoothing` switch and restores the
+  positions before the frame ends.
 - The ping readout inserts one `pointer-events:none` element as the first
   child of `#ui-top-left`, above `#ui-team`.
 - Sample JSON schema lives in `sample.json` — keys: `ts`, `self`, `enemies[]`.

@@ -31,6 +31,7 @@ window.__SURVEV_MANGLED__ = {
     activeWeapon: 'JJTyLg',
     dead:         'PjgTvG',
     downed:       'vqjzVe',
+    scale:        'OpFW',
   },
 
   // ---- Player.localData (the sub-object named by player.localData above) ----
