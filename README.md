@@ -1,9 +1,16 @@
 # enemy-location-logger
 
-Chrome extension that injects into [survev.io](https://survev.io), reads the
-live in-memory game state, and exposes it for analysis, an enemy overlay, an
-aim helper, and weapon quickswap. Intended for red-teaming the user's own
-authorized deployment of survev.
+Chrome extension that injects into [survev.io](https://survev.io) and
+[surviv.io](https://surviv.io), reads
+the live in-memory game state, and exposes it for analysis, an enemy overlay,
+an aim helper, and weapon quickswap. Intended for red-teaming the user's own
+authorized deployment.
+
+Both sites are the same game built two different ways — survev.io is
+the open-source reimplementation, surviv.io the original Webpack client — so
+each ships its own separately-mangled bundle. One `mangled.js` holds a
+dictionary per site and picks the right one by hostname; everything above that
+layer is shared. See [Supporting two sites](#supporting-two-sites).
 
 ## Features
 
@@ -109,33 +116,86 @@ Three layers, wired up by `manifest.json`:
 
 | File | World | Role |
 | --- | --- | --- |
-| `mangled.js` | MAIN | Single dictionary mapping semantic names (`netData`, `localPlayer`, `inputBinds`, …) to the bundle's current mangled identifiers. Auto-generated. |
-| `inject.js` | MAIN | All gameplay logic. Reads every mangled name through `window.__SURVEV_MANGLED__`. |
+| `mangled.js` | MAIN | One dictionary per supported site, mapping semantic names (`netData`, `localPlayer`, `inputBinds`, …) to that build's current mangled identifiers, plus the hostname match that selects one. Auto-generated. |
+| `inject.js` | MAIN | All gameplay logic. Reads every mangled name through `window.__SURVEV_MANGLED__`, the dictionary `mangled.js` selected. |
 | `content.js` | Isolated | Bridges `window.postMessage` from inject.js to the service worker. |
 | `background.js` | Service worker | Buffers samples, drives the toolbar badge, handles JSON export. |
 
 `mangled.js` runs before `inject.js` in the same content_scripts entry, so the
-dictionary is on `window` by the time inject.js's IIFE reads it.
+dictionary is on `window` by the time inject.js's IIFE reads it. On a host with
+no entry, `window.__SURVEV_MANGLED__` is null and inject.js logs why and
+returns without touching the page.
 
-## Updating mangled names when survev redeploys
+## Smoke test
 
-survev re-mangles its bundle on every deploy: readable TypeScript field names
-like `m_netData`, `m_localData`, `m_pos` become short opaque identifiers
+```sh
+node smoke_test.js
+```
+
+Loads `mangled.js` + `inject.js` for each supported hostname under stub DOM
+globals and asserts the IIFE runs to completion. `node --check` only parses —
+it can't see a temporal-dead-zone reference or a read of a dictionary group
+that isn't there, and either of those aborts inject.js before it defines a
+single global. In the browser that is indistinguishable from the extension
+never loading: no output on any channel, nothing on `window`. Run this after
+touching the alias block at the top of `inject.js` or the shape of
+`mangled.js`.
+
+## Supporting two sites
+
+Nothing above `mangled.js` branches on which site it is running on. That works
+because both builds descend from the same source, and keep the same
+real names on the landmarks the extension actually navigates by:
+
+- **The dictionary absorbs the mangling.** `inject.js` only ever reaches a
+  mangled field as `obj[SOME_CONST]`, where the const came from the
+  hostname-selected dictionary. surviv.io leaves several of those fields under
+  their real names (its `player.pos` really is `pos`), which needs no special
+  case — the dictionary just records `pos`.
+- **Object discovery is by shape, not by name.** The roster, the game, the map
+  and the bullet barn are all found by probing for readable fields every build
+  keeps (`playerInfo`/`playerStatus`/`playerIds`, `deadObstacleIds`/`terrain`/
+  `mapDef`, `tracerColors`+`addBullet`), so no site needs its own search.
+- **The derivation is one set of anchors, not two.** Every entry in
+  `update_mangled.py` is a list of alternatives tried in order; a site is
+  supported when some alternative matches its bundle. Most alternatives fire on
+  both builds.
+
+The one place a build difference reaches real code is the app-singleton
+capture, and it's a difference in *timing* rather than naming — see
+[How inject.js finds the game](#how-injectjs-finds-the-game).
+
+## Updating mangled names when a site redeploys
+
+Each site re-mangles its bundle on every deploy: readable TypeScript field
+names like `netData`, `localData`, `pos` become short opaque identifiers
 (`qJm`, `TXaUHs`, `lxf`, …) that change every build. When that happens,
-features that depend on those fields silently break.
+features that depend on those fields silently break — on that site only.
 
-`mangled.js` is the single source of truth, and two Python scripts regenerate
-it from a fresh bundle:
+`mangled.js` is the single source of truth, and `update_mangled.py`
+regenerates it from fresh bundles:
 
 ```sh
 pip install jsbeautifier              # one-time
-python fetch_survev_js.py             # downloads the current bundle into js_dump/
-python derive_mangled.py              # re-derives mangled.js from js_dump/
+python update_mangled.py              # for every site: download the current
+                                      # bundles into js_dump/<site>/, then
+                                      # re-derive that site's mangled.js entry
 # reload the extension in chrome://extensions
 ```
 
-`derive_mangled.py` doesn't pin to mangled names; it anchors every entry on
-*stable readable patterns* survev keeps un-mangled — class field declarations
+Narrow it with `--site survev.io` (repeatable) when only one site moved. Sites
+you don't derive keep whatever `mangled.js` already had for them, so a
+one-site run never drops the others — and a site that *fails* to derive keeps
+its old entry too, rather than being silently dropped. The two stages can also
+be run separately: `--fetch-only` downloads the bundles and leaves `mangled.js`
+alone, `--derive-only` re-derives from whatever is already in `js_dump/<site>/`.
+
+Adding a third site is an entry in `SITES` at the top of `update_mangled.py`
+plus its match patterns in `manifest.json`. If its build is close enough to one
+of the existing two, the anchors already cover it.
+
+`update_mangled.py` doesn't pin to mangled names; it anchors every entry on
+*stable readable patterns* the builds keep un-mangled — class field declarations
 (`bodySprite`, `helmetSprite`, `gunSwitchCooldown`, `anonPlayerNames`,
 `debugHUD`, `playerPool`, `onJoin`/`onQuit`, `posInterpTicker`,
 `dirInterpolationTicker`, `interpolationT`, `updateIntervalGraph`,
@@ -143,18 +203,24 @@ python derive_mangled.py              # re-derives mangled.js from js_dump/
 server-protocol field names on update payloads (`e.pos`, `e.dir`,
 `e.activeWeapon`, `e.zoom`, `e.health`, `e.curWeapIdx`, `e.dead`, `e.downed`).
 Each derived name is cross-checked against multiple anchors where possible.
-If any anchor fails to match, the script aborts naming the specific entry
-that broke — that's the signal a regex in `derive_mangled.py` needs a new
-fallback.
+Every entry is a *list* of such anchors, tried in order, because the two
+builds don't both express the same fact the same way. `netData.dead`, for
+instance, reads `e.dead` straight off the update payload on survev.io, which
+leaves protocol field names readable; surviv.io mangles those, so it falls
+through to the player-status object literal, whose
+`dead:`/`downed:` keys stay readable everywhere. Only when *every* alternative
+fails does the script abort, naming the entry and the site — that's the signal
+a new alternative is needed, not a new special case.
 
 The script prints an old → new diff and writes a `mangled.js.bak` before
 overwriting, so re-running is safe.
 
 ## How inject.js finds the game
 
-survev keeps its entire object graph module-private: the app singleton is an
-anonymous `Ri = new class { … }` and the Game instance lives on its `game`
-field, so neither is reachable by walking from `window`.
+Every build keeps its entire object graph module-private: the app singleton is
+an anonymous `Ri = new class { … }` (a plain `new L()` on surviv.io) and the
+Game instance lives on its `game` field, so neither is reachable by walking
+from `window`.
 
 **Primary path — `Function.prototype.bind` wrapper.** The app singleton wires
 its callbacks through `.bind(this)` (e.g.
@@ -165,6 +231,29 @@ app by its own class fields (`game`, `pixi`, `config`, `localization`,
 `audioManager`, `teamMenu` — all real readable names), keeps the reference,
 and uninstalls itself immediately. `app.game` is then re-read live on every
 sample tick, so a Game swapped in for a new round is picked up for free.
+
+**Capturing an app that isn't finished yet.** That check assumes all six
+fields exist when `.bind()` is called, which holds on survev.io because it
+declares them as class fields — present, initialized to null, before the
+constructor body starts. surviv.io's client predates that
+syntax and assigns fields in source order, with its binds landing partway
+through:
+
+```js
+this.teamMenu = new B(…, this.onTeamMenuJoinGame.bind(this), …),
+this.pixi = null, … this.game = null, …
+```
+
+so `game`, `pixi` and `teamMenu` genuinely don't exist yet at the moment we
+see the receiver, and the six-field check rejects the real app. inject.js
+therefore also recognizes a *mid-construction* signature — `config`,
+`localization`, `audioManager`, `account`, `pingTest`, `siteInfo`, all assigned
+before the first bind on every build, and a set nothing else on the page owns
+(the Game instance has the first three but none of the last three). A match on
+that signature is held provisionally and the wrapper stays installed, in case a
+later bind offers a complete app. The first sample tick that sees `game` appear
+on the provisional app promotes it and drops the wrapper, so the hot builtin is
+only wrapped for the few milliseconds the constructor is still running.
 
 **Fallback path — `Object.prototype` setter traps.** The original approach:
 trap the property names that the Game constructor body assigns from
@@ -179,8 +268,12 @@ their fields. Same for the runtime script-scan that adds extra trap names
 (it already skips names it sees declared as class fields).
 
 If the console reports `App singleton not captured`, that's the real
-breakage signal: the app's field shape changed. Check
-`window.__enemyLocationLogger.getDiagnostics()` for the capture state.
+breakage signal: the app's field shape changed. Call `window.__captureDiag()`
+in the page console for the capture state — `appCaptured`, `appHasGame`,
+`gameCaptured`, and the bind hook's install/uninstall reason. If nothing at
+all is on `window`, inject.js never ran: check that the host matches an entry
+in `manifest.json` and that the extension has been reloaded since the manifest
+last changed.
 
 ## Bullet-blocking geometry
 

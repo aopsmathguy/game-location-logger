@@ -1,15 +1,17 @@
 {
   "manifest_version": 3,
   "minimum_chrome_version": "111",
-  "name": "survev.io game-state toolkit",
-  "version": "0.3.0",
-  "description": "Reads survev.io's live in-memory game state: enemy ESP overlay, aim helper, auto-quickswap, netcode smoothing, ping readout, and a JSON position log.",
+  "name": "survev / surviv game-state toolkit",
+  "version": "0.4.0",
+  "description": "Reads the live in-memory game state of survev.io and surviv.io: enemy ESP overlay, aim helper, auto-quickswap, netcode smoothing, ping readout, and a JSON position log.",
   "permissions": [
     "downloads"
   ],
   "host_permissions": [
     "*://survev.io/*",
-    "*://*.survev.io/*"
+    "*://*.survev.io/*",
+    "*://surviv.io/*",
+    "*://*.surviv.io/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -21,7 +23,9 @@
     {
       "matches": [
         "*://survev.io/*",
-        "*://*.survev.io/*"
+        "*://*.survev.io/*",
+        "*://surviv.io/*",
+        "*://*.surviv.io/*"
       ],
       "js": [
         "mangled.js",
@@ -34,7 +38,9 @@
     {
       "matches": [
         "*://survev.io/*",
-        "*://*.survev.io/*"
+        "*://*.survev.io/*",
+        "*://surviv.io/*",
+        "*://*.surviv.io/*"
       ],
       "js": [
         "content.js"

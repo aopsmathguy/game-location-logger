@@ -23,7 +23,6 @@
       "Bash(perl -ne 'while \\(/bullet_\\(\\\\w+\\):\\\\s*\\\\{[^}]*?speed:\\\\s*\\(\\\\d+\\)/g\\) { print \"$1: $2\\\\n\" }' /Users/min/MIT/enemy-location-logger/2/D7Ckz5tP_formatted.js)",
       "Bash(python3 -c \"import jsbeautifier\")",
       "Bash(pip3 install *)",
-      "Bash(python3 fetch_survev_js.py)",
       "Bash(awk '/^    [A-Za-z_$][A-Za-z0-9_$]*\\\\s*=\\\\s*class\\\\s*\\\\{/{cur=NR; cls=$0} /init\\\\\\(\\\\\\)\\\\s*\\\\{/{ if \\(NR-cur<200\\) {print cur\": \"cls; print NR\": init\\(\\)\"} }' /Users/min/MIT/enemy-location-logger/js_dump/CizGBfZ6_formatted.js)",
       "Bash(grep -n \"^    [a-zA-Z_$][a-zA-Z0-9_$]* = class\\\\b\" /Users/min/MIT/enemy-location-logger/js_dump/CizGBfZ6_formatted.js)",
       "Bash(awk -F: '$1 < 14718 && $1 > 14000')",
@@ -33,7 +32,9 @@
       "Bash(awk '/fireDelay:/ {match\\($0, /fireDelay: ?\\([0-9.e]+\\)/, m\\); print NR, m[1]}' /Users/min/MIT/enemy-location-logger/js_dump/CjGi1tJP_formatted.js)",
       "Bash(node -c /Users/min/MIT/enemy-location-logger/inject.js)",
       "Bash(node -c /Users/min/MIT/enemy-location-logger/mangled.js)",
-      "Bash(python3 derive_mangled.py)"
+      "Bash(python3 update_mangled.py)",
+      "Bash(python3 update_mangled.py --derive-only)",
+      "Bash(python3 update_mangled.py --fetch-only)"
     ]
   }
 }

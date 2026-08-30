@@ -1,16 +1,293 @@
 (() => {
   const SOURCE = 'enemy-location-logger';
+
+  // ---- TEMP DEBUG: server update interval, measured at the socket ----------
+  // Logs the wall-clock gap between consecutive Update packets, in ms.
+  //
+  // This measures at the WebSocket rather than at the camera hook further
+  // down, and that is the point: it needs no mangled name, no captured Game
+  // and no camera, so it reports from the first packet of the match and keeps
+  // reporting even if every other hook in this file fails to attach. It is
+  // also closer to the truth — arrival at the socket, before the client has
+  // done anything with the packet.
+  //
+  // Both builds do `this.ws = new WebSocket(url)` and then assign `onmessage`,
+  // so wrapping the constructor and adding our own listener on the instance
+  // sees every message without displacing the game's handler. `prototype` is
+  // shared with the native constructor so `instanceof WebSocket` still holds.
+  //
+  // Filtering to type 6: the first byte of every message is the MsgType, and
+  // `Update` is 6 in both bundles' enums. Without the filter this would also
+  // count the ping-test socket (`/ptc`) and the team-menu socket, neither of
+  // which ticks at the server rate.
+  //
+  // Toggle at runtime with `window.__SURVEV_LOG_TICK__ = false`. Remove this
+  // block when done.
+  window.__SURVEV_LOG_TICK__ = true;
+  const WS_TICK_UPDATE_TYPE = 6;      // MsgType.Update, both builds
+  const WS_TICK_ALPHA = 0.1;          // ~10-packet EWMA horizon
+  const wsTick = { sockets: 0, n: 0, lastMs: 0, meanMs: 0, devMs: 0 };
+  window.__wsTickDiag = () => ({ ...wsTick });
+
+  function wsTickOnMessage(data) {
+    if (!window.__SURVEV_LOG_TICK__) return;
+    // Both clients set binaryType='arraybuffer' right after construction, so
+    // this is the only shape we expect; anything else is a text control
+    // message and is not an update.
+    if (!(data instanceof ArrayBuffer) || data.byteLength < 1) return;
+    if (new Uint8Array(data, 0, 1)[0] !== WS_TICK_UPDATE_TYPE) return;
+
+    const now = performance.now();
+    // The first update of a socket has nothing to difference against — the
+    // interval before it is menu time, not a server tick.
+    const gap = wsTick.lastMs ? now - wsTick.lastMs : NaN;
+    wsTick.lastMs = now;
+    const n = wsTick.n++;
+    if (Number.isFinite(gap)) {
+      if (!wsTick.meanMs) {
+        wsTick.meanMs = gap;          // seed, rather than ramp from zero
+      } else {
+        // Deviation folded against the pre-update mean, so a step change in
+        // the link shows as jitter before the mean finishes chasing it.
+        wsTick.devMs = WS_TICK_ALPHA * Math.abs(gap - wsTick.meanMs)
+          + (1 - WS_TICK_ALPHA) * wsTick.devMs;
+        wsTick.meanMs = WS_TICK_ALPHA * gap + (1 - WS_TICK_ALPHA) * wsTick.meanMs;
+      }
+    }
+    console.log(
+      `[${SOURCE}] ws-tick n=${n} ` +
+      `gap=${Number.isFinite(gap) ? gap.toFixed(1) + 'ms' : 'first'} ` +
+      `mean=${wsTick.meanMs.toFixed(1)}ms ` +
+      `jitter=${wsTick.devMs.toFixed(1)}ms ` +
+      `bytes=${data.byteLength}`
+    );
+  }
+
+  try {
+    const NativeWebSocket = window.WebSocket;
+    if (typeof NativeWebSocket === 'function') {
+      function HookedWebSocket(...args) {
+        const ws = new NativeWebSocket(...args);
+        wsTick.sockets++;
+        try {
+          ws.addEventListener('message', (e) => {
+            try { wsTickOnMessage(e.data); } catch {}
+          });
+        } catch {}
+        return ws;
+      }
+      HookedWebSocket.prototype = NativeWebSocket.prototype;
+      for (const k of ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED']) {
+        HookedWebSocket[k] = NativeWebSocket[k];
+      }
+      // Keep `WebSocket.toString()` reading as native code — cheap, and it is
+      // the one thing about this hook that is trivially visible from the page.
+      HookedWebSocket.toString = () => NativeWebSocket.toString();
+      Object.defineProperty(HookedWebSocket, 'name', { value: 'WebSocket' });
+      window.WebSocket = HookedWebSocket;
+    }
+  } catch {}
+  // ---- end TEMP DEBUG ------------------------------------------------------
+
+
+    // ---------------------------------------------------------------------
+  // Anti-detection. surviv.io's client ships a sprite-transparency check that
+  // closes its own WebSocket ~0.8s after JoinedMsg; see
+  // DISCONNECT_PREVENTION_PLAN.md §1 for the decoded predicate and both call
+  // sites. This block neutralises it before the bundle evaluates.
+  //
+  // Mechanism: surviv.io is a webpack build whose runtime picks up an
+  // existing `self.webpackChunk` if one is there. We are a MAIN-world
+  // document_start content script, so we get there first: we plant the array
+  // with an accessor `push`, capture the runtime's own push handler when it
+  // assigns over ours, and from then on see every chunk's module map before
+  // webpack registers it. Factories get wrapped; after each one runs we look
+  // at its exports and patch the two modules we care about.
+  //
+  // Every anchor is a READABLE export name, never a mangled one, so a
+  // re-mangle does not silently disarm this. `detectState` records what
+  // actually matched — read it with `__netDiag().detector`.
+  // ---------------------------------------------------------------------
+  const ANTI = window.__SURVEV_MANGLED__?.antiDetect || null;
+
+  const detectState = {
+    installed: false,
+    
+    chunks: 0,
+    patched: [],        // ['predicate', 'selfClose', 'envScans']
+    trips: 0,           // times the real predicate WOULD have fired
+    samples: [],        // what tripped it — see §7
+  };
+
+  function patchPredicateModule(exp) {
+    // Module 33177 in the current build: { getBoundingCollider, getBridgeDims,
+    // getBridgeOverlapCollider, o: .8, m: .9, p(e,t) }. The three `get*`
+    // functions are real names and are what we anchor on; `p` is the only
+    // other function on the object and the only one of arity 2.
+    if (typeof exp.getBoundingCollider !== 'function') return false;
+    if (typeof exp.getBridgeDims !== 'function') return false;
+    for (const k of Object.keys(exp)) {
+      const fn = exp[k];
+      if (typeof fn !== 'function' || fn.length !== 2 || k.startsWith('get')) continue;
+      const src = Function.prototype.toString.call(fn);
+      if (!/alpha/.test(src) || !/visible/.test(src)) continue;
+      exp[k] = function (e, t) {
+        // Run the original so we learn what tripped it (§7), then refuse.
+        // Returning false is the whole fix: `r` in Game.we never leaves 0, so
+        // neither the close NOR the soft `Oe` flag from this scan can happen.
+        let hit = false;
+        try { hit = !!fn(e, t); } catch {}
+        if (hit) recordTrip(e, t);
+        return false;
+      };
+      detectState.patched.push('predicate');
+      return true;
+    }
+    return false;
+  }
+
+  function patchUtilModule(exp) {
+    // Module 60313: the char-code-obfuscated helper bag. Its ordinary members
+    // keep their real names, which is what makes it identifiable at all.
+    if (typeof exp.sanitizeNameInput !== 'function') return false;
+    if (typeof exp.getCookie !== 'function' || typeof exp.htmlEscape !== 'function') return false;
+    let did = false;
+    for (const k of Object.keys(exp)) {
+      const fn = exp[k];
+      if (typeof fn !== 'function') continue;
+      const src = Function.prototype.toString.call(fn);
+      // `Oe(game)`: `if (e && e.pixi && e.ws) { var t = e; e = null, t.ws.close() }`
+      if (/\.pixi\b/.test(src) && /\.ws\b/.test(src) && /\.close\s*\(/.test(src)) {
+        exp[k] = function () {};
+        detectState.patched.push('selfClose');
+        did = true;
+        continue;
+      }
+      // `ki()`: Object.keys(window) scanned for 'cheat'/'hack'.
+      // `Mi()`: <script src> scanned for 'cheat'/'hack'/'aimbot'.
+      // Both only feed the soft `Game.Oe` flag that AdStatusMsg reports; on a
+      // clean machine they already return false, so pinning them to false
+      // changes nothing the server has not already been told.
+      if (fn.length === 0 &&
+          (/Object\.keys/.test(src) || /getElementsByTagName/.test(src))) {
+        exp[k] = function () { return false; };
+        if (!detectState.patched.includes('envScans')) detectState.patched.push('envScans');
+        did = true;
+      }
+    }
+    return did;
+  }
+
+  function recordTrip(obj, threshold) {
+    detectState.trips++;
+    if (detectState.samples.length >= 12) return;
+    try {
+      detectState.samples.push({
+        ctor: obj?.constructor?.name || null,
+        type: obj?.type ?? null,
+        alpha: obj?.sprite?.alpha ?? null,
+        imgAlpha: obj?.sprite?.imgAlpha ?? null,
+        visible: obj?.sprite?.visible ?? null,
+        dead: obj?.dead ?? null,
+        fade: obj?.fade ?? null,
+        threshold,
+        keys: Object.keys(obj || {}).slice(0, 12),
+      });
+    } catch {}
+  }
+
+  function installChunkHook() {
+    if (detectState.installed) return;
+    let handler = null;
+    const arr = (self.webpackChunk = self.webpackChunk || []);
+    const plainPush = Array.prototype.push;
+
+    function interceptor(...datas) {
+      for (const data of datas) {
+        detectState.chunks++;
+        const mods = data && data[1];
+        if (!mods || typeof mods !== 'object') continue;
+        for (const id of Object.keys(mods)) {
+          const orig = mods[id];
+          if (typeof orig !== 'function') continue;
+          mods[id] = function (module, exports, req) {
+            orig.call(this, module, exports, req);
+            try {
+              const exp = module && module.exports;
+              if (exp && typeof exp === 'object') {
+                patchPredicateModule(exp) || patchUtilModule(exp);
+              }
+            } catch {}
+          };
+        }
+      }
+      return handler.apply(arr, datas);
+    }
+
+    try {
+      Object.defineProperty(arr, 'push', {
+        configurable: true,
+        // The runtime reads `.push` once, to bind as its "previous push".
+        // Hand it the plain builtin then, or `handler` recurses into us.
+        get() { return handler ? interceptor : plainPush; },
+        set(v) { handler = v; },
+      });
+      detectState.installed = true;
+    } catch {}
+  }
+
+  if (ANTI?.webpackChunkHook) installChunkHook();
   // console.log(`[${SOURCE}] inject.js HEAD reached, url=${location.href}, isTop=${window.top === window}`);
 
   // Mangled-name dictionary loaded from mangled.js (which runs before us
-  // via the manifest's content_scripts ordering). Every survev bundle
-  // identifier we depend on flows through this object — when survev
-  // re-mangles, mangled.js is the only file that needs updating.
+  // via the manifest's content_scripts ordering). Every bundle identifier we
+  // depend on flows through this object — when a site re-mangles, mangled.js
+  // is the only file that needs updating.
+  //
+  // mangled.js holds one dictionary per supported site and selects the one
+  // matching this hostname, so everything below is written once and runs
+  // unchanged on survev.io and surviv.io.
   const M = window.__SURVEV_MANGLED__;
   if (!M) {
-    console.error(`[${SOURCE}] mangled.js did not run before inject.js — aborting`);
+    console.error(
+      window.__SURVEV_MANGLED_SITES__
+        ? `[${SOURCE}] no mangled-name dictionary for ${location.hostname} — ` +
+          `add it to SITES in update_mangled.py and re-run it — aborting`
+        : `[${SOURCE}] mangled.js did not run before inject.js — aborting`
+    );
     return;
   }
+  // Everything below reads `M.<group>.<key>` unguarded, so a dictionary that
+  // is missing a group throws on the very first alias and the whole IIFE
+  // aborts before it defines a single global — which looks from the console
+  // exactly like the extension never loaded. Check the shape up front instead
+  // and say what is missing.
+  const REQUIRED = {
+    player:    ['netData', 'localData', 'pos', 'dir', 'posAlt', 'dirAlt'],
+    netData:   ['activeWeapon', 'dead', 'downed', 'scale'],
+    localData: ['zoom', 'curWeapIdx', 'weapons'],
+    game:      ['localPlayer', 'roster', 'inputBinds', 'camera'],
+    roster:    ['playerPool', 'getPlayerInfo'],
+    camera:    ['interpWindow', 'interpEnabled'],
+    pool:      ['getAll'],
+  };
+  const missing = [];
+  for (const group of Object.keys(REQUIRED)) {
+    const g = M[group];
+    if (!g || typeof g !== 'object') { missing.push(group); continue; }
+    for (const key of REQUIRED[group]) {
+      if (typeof g[key] !== 'string' || !g[key]) missing.push(`${group}.${key}`);
+    }
+  }
+  if (missing.length) {
+    console.error(
+      `[${SOURCE}] mangled.js dictionary for ${window.__SURVEV_MANGLED_SITE__ || location.hostname} ` +
+      `is missing ${missing.length} entr${missing.length === 1 ? 'y' : 'ies'}: ${missing.join(', ')}. ` +
+      `Re-run \`python update_mangled.py\` and reload the extension — aborting.`
+    );
+    return;
+  }
+
   // Local short aliases. The semantic name is on the left (kept stable
   // across bundle re-mangles); the value on the right is the current
   // mangled key we use for bracket-access. Don't add raw mangled string
@@ -35,6 +312,11 @@
   const CAM_INTERP_W = M.camera?.interpWindow;
   const CAM_INTERP_ON = M.camera?.interpEnabled;
   const POOL_GETALL  = M.pool.getAll;
+  // Roster members. Readable on survev.io, mangled on surviv.io
+  // (`Pe` / `Ze`), so they have to go through the dictionary like everything
+  // else rather than being reached by name.
+  const ROSTER_POOL    = M.roster.playerPool;
+  const ROSTER_GETINFO = M.roster.getPlayerInfo;
 
   const SAMPLE_MS = 20;
   const STATUS_MS = 3000;
@@ -614,17 +896,37 @@
   // own constructor at module-evaluation time. A thin wrapper around
   // Function.prototype.bind sees it, and from there we read `app.game` live
   // on every sample tick — `game` is a real readable field name, in the same
-  // stable-across-builds class as `playerInfo` / `bodySprite`, not a mangled
+  // stable-across-builds class as `playerIds` / `bodySprite`, not a mangled
   // one. The wrapper uninstalls itself as soon as it captures (and
   // unconditionally after BIND_HOOK_TTL_MS) so we don't sit on a hot builtin.
   // ---------------------------------------------------------------------
   let capturedApp = null;
+  let capturedAppConfirmed = false;
   const BIND_HOOK_TTL_MS = 120000;
-  const bindHookState = { installed: false, uninstalledReason: '', calls: 0 };
+  const bindHookState = { installed: false, uninstalledReason: '', calls: 0, provisional: false };
   let originalBindDescriptor = null;
 
   // Own fields the app singleton declares. All real readable names.
   const APP_FIELDS = ['game', 'pixi', 'config', 'localization', 'audioManager', 'teamMenu'];
+
+  // Fields the app singleton is guaranteed to own AT THE MOMENT it calls
+  // .bind(), which is not the same set.
+  //
+  // survev.io declares the whole list above as CLASS FIELDS, so all of
+  // them exist — initialized to null, but present — before the
+  // constructor body runs its first .bind(). surviv.io's client predates that
+  // syntax and builds the app with a plain constructor that assigns fields in
+  // source order, and its `.bind(this)` calls happen midway through:
+  //
+  //     this.teamMenu = new B(…, this.onTeamMenuJoinGame.bind(this), …),
+  //     this.pixi = null, … this.game = null, …
+  //
+  // so `game`, `pixi` and `teamMenu` genuinely do not exist yet when we see
+  // the receiver. Checking APP_FIELDS there rejects the real app singleton.
+  // These six are assigned before the bind on every build, and no other object
+  // on the page owns the set (the Game class has config/localization/
+  // audioManager but none of account/pingTest/siteInfo).
+  const APP_CANDIDATE_FIELDS = ['config', 'localization', 'audioManager', 'account', 'pingTest', 'siteInfo'];
 
   function hasOwnProp(obj, key) {
     try {
@@ -634,16 +936,27 @@
     }
   }
 
+  // Note we check OWN props rather than using `in`: the Object.prototype traps
+  // below can add inherited names.
+  function ownsAll(obj, fields) {
+    for (let i = 0; i < fields.length; i++) {
+      if (!hasOwnProp(obj, fields[i])) return false;
+    }
+    return true;
+  }
+
   function looksLikeApp(obj) {
     if (!obj || typeof obj !== 'object') return false;
     // Cheap gate first — .bind() is hot and almost nothing else on the page
-    // owns a `game` property. Note we check OWN props rather than using
-    // `in`: the Object.prototype traps below can add inherited names.
+    // owns a `game` property.
     if (!hasOwnProp(obj, 'game')) return false;
-    for (let i = 0; i < APP_FIELDS.length; i++) {
-      if (!hasOwnProp(obj, APP_FIELDS[i])) return false;
-    }
-    return true;
+    return ownsAll(obj, APP_FIELDS);
+  }
+
+  function looksLikeAppCandidate(obj) {
+    if (!obj || typeof obj !== 'object') return false;
+    if (!hasOwnProp(obj, 'config')) return false; // cheap gate, same idea
+    return ownsAll(obj, APP_CANDIDATE_FIELDS);
   }
 
   function uninstallBindHook(reason) {
@@ -659,10 +972,25 @@
 
   function noteBindThisArg(thisArg) {
     bindHookState.calls++;
-    if (capturedApp) return;
-    if (!looksLikeApp(thisArg)) return;
-    capturedApp = thisArg;
-    uninstallBindHook('captured');
+    if (capturedAppConfirmed) return;
+    // A fully-formed app is the end of the search: take it and get off the
+    // builtin immediately, even if we already had a provisional one.
+    if (looksLikeApp(thisArg)) {
+      capturedApp = thisArg;
+      capturedAppConfirmed = true;
+      bindHookState.provisional = false;
+      uninstallBindHook('captured');
+      return;
+    }
+    // Otherwise hold the first object that matches the mid-construction
+    // signature, and stay installed in case a later bind hands us the same
+    // object once `game` exists. Either way this IS the app — the fields it
+    // does own by now are enough to identify it, and `game` shows up on it a
+    // few statements later, well before we sample.
+    if (!capturedApp && looksLikeAppCandidate(thisArg)) {
+      capturedApp = thisArg;
+      bindHookState.provisional = true;
+    }
   }
 
   function installBindHook() {
@@ -688,7 +1016,7 @@
       });
       bindHookState.installed = true;
       setTimeout(
-        () => uninstallBindHook(capturedApp ? 'captured' : 'timeout'),
+        () => uninstallBindHook(capturedApp ? (capturedAppConfirmed ? 'captured' : 'captured-provisional') : 'timeout'),
         BIND_HOOK_TTL_MS
       );
     } catch {}
@@ -704,6 +1032,15 @@
   function gameFromApp() {
     const app = capturedApp;
     if (!app) return null;
+    // A provisional capture (see noteBindThisArg) is taken mid-constructor,
+    // before `game` has been assigned. The moment it shows up we know the
+    // object was the app, so promote it and drop the .bind() wrapper rather
+    // than sitting on a hot builtin until the TTL expires.
+    if (!capturedAppConfirmed && hasOwnProp(app, 'game')) {
+      capturedAppConfirmed = true;
+      bindHookState.provisional = false;
+      uninstallBindHook('captured');
+    }
     const direct = safeRead(app, 'game');
     if (isGameLike(direct)) return direct;
     // A truthy-but-not-game-like `app.game` is the normal pre-join state
@@ -813,13 +1150,21 @@
   }
 
   function looksLikeRoster(obj) {
-    // The roster class (`tr`) declares its fields with the *real* readable
-    // names — these are not minified in the bundle and are stable across
-    // builds. If an object has all of them, it's the roster.
+    // The roster class declares most of its fields with the *real* readable
+    // names, and those are stable across builds. If an object has all of
+    // them, it's the roster.
+    //
+    // `playerInfo` is deliberately NOT in this list even though it is readable
+    // on survev.io: surviv.io mangles that one field (to
+    // `ze`), so requiring it rejected surviv.io's roster outright — and since
+    // finding the roster is how we recognise the Game, that made every feature
+    // silently no-op there. `anonPlayerNames` takes its place; it is readable
+    // on both, and is the same field update_mangled.py anchors
+    // `game.roster` on.
     try {
       if (!obj || typeof obj !== 'object') return false;
       return (
-        'playerInfo' in obj &&
+        'anonPlayerNames' in obj &&
         'playerStatus' in obj &&
         'playerIds' in obj &&
         'teamInfo' in obj &&
@@ -907,6 +1252,10 @@
   function installGameCaptureTrap() {
     // Seed list lives in mangled.js (`seedNames`). If survev re-mangles,
     // the runtime discovery pass below will add more on top of these.
+    if (M.capture && M.capture.protoTrap === false) {
+      trapState.discoveryStatus = 'disabled';
+      return;
+    }
     for (const name of M.seedNames) installTrapName(name);
   }
 
@@ -1010,7 +1359,9 @@
   // Fire-and-forget. The seed traps cover the current bundle; this only
   // matters if survev re-mangles names in a future build.
   discoverAndInstallExtraTraps().catch(() => {});
-
+  if (!(M.capture && M.capture.protoTrap === false)) {
+    discoverAndInstallExtraTraps().catch(() => {});
+  }
   // function post(type, payload) {
   //   window.postMessage({ source: SOURCE, type, payload }, '*');
   // }
@@ -1051,7 +1402,7 @@
   // Same shape contract as `looksLikeGame`, but used post-capture by
   // `findRoot` and `safeReadGame`. We don't anchor on minified field names —
   // we walk the object's own props until we find the roster (recognizable
-  // by its stable readable field names: playerInfo, playerStatus, …).
+  // by its stable readable field names: playerIds, playerStatus, …).
   function isGameLike(game) {
     return looksLikeGame(game);
   }
@@ -1288,7 +1639,7 @@
 
     const getInfo = (id) => {
       try {
-        return roster.getPlayerInfo?.(id) ?? null;
+        return roster[ROSTER_GETINFO]?.(id) ?? null;
       } catch {
         return null;
       }
@@ -1298,13 +1649,13 @@
     const playerStatus = roster.playerStatus ?? {};
     const selfStatus = selfId != null ? playerStatus[selfId] || null : null;
 
-    // Enemies live in the Player entity pool (`roster.playerPool` — `playerPool`
-    // is a real readable name on `tr`), not in `playerStatus`. `playerStatus`
+    // Enemies live in the Player entity pool (`roster.playerPool`, mapped by
+    // mangled.js as `roster.playerPool`), not in `playerStatus`. `playerStatus`
     // only carries minimap state for players on the local team — it never
     // contains enemies in non-faction modes. The pool, on the other hand,
     // holds the actual Player objects that the server has streamed to us
     // (i.e. enemies currently within view radius).
-    const pool = roster.playerPool;
+    const pool = roster[ROSTER_POOL];
     const players = (pool && typeof pool[POOL_GETALL] === 'function' ? pool[POOL_GETALL]() : []) || [];
     const enemies = [];
     const seenIds = new Set();
@@ -1449,7 +1800,7 @@
         // the roster only exists once a match is joined).
         const appGame = capturedApp ? safeRead(capturedApp, 'game') : null;
         const message = !capturedApp
-          ? 'App singleton not captured. The bundle may have changed shape — re-run fetch_survev_js.py + derive_mangled.py, and reload the page (the capture hook must be installed before survev\'s bundle runs).'
+          ? 'App singleton not captured. The bundle may have changed shape — re-run update_mangled.py, and reload the page (the capture hook must be installed before the game bundle runs).'
           : appGame
             ? 'App captured and the Game object exists, but it has not been initialized yet. Click Play and join a match.'
             : 'App captured, but it has no Game object yet. The bundle is still loading.';
@@ -4701,7 +5052,7 @@
 
   function dodgePlayerInfo(roster, id) {
     try {
-      return roster?.getPlayerInfo?.(id) ?? null;
+      return roster?.[ROSTER_GETINFO]?.(id) ?? null;
     } catch {
       return null;
     }
@@ -6255,7 +6606,7 @@
     const idx = netClock.n - 1;
     if (idx < 0) return;
     const roster = findRosterOnGame(game) || game?.[GAME_ROSTER];
-    const pool = roster?.playerPool;
+    const pool = roster?.[ROSTER_POOL];
     if (!pool || typeof pool[POOL_GETALL] !== 'function') return;
     const players = pool[POOL_GETALL]() || [];
     for (const player of players) {
@@ -6338,6 +6689,46 @@
       `tick=${Number.isFinite(tickMs) ? tickMs.toFixed(1) + 'ms' : 'n/a'} ` +
       `v=${Number.isFinite(speed) ? speed.toFixed(2) + 'u/s' : 'n/a'} ` +
       `pos=(${p2.x.toFixed(2)}, ${p2.y.toFixed(2)})`
+    );
+  }
+  // ---- end TEMP DEBUG ------------------------------------------------------
+
+  // ---- TEMP DEBUG: server update interval ---------------------------------
+  // Logs the wall-clock gap between consecutive server updates, in ms. Driven
+  // from the camera setter, which the game writes exactly once per update
+  // packet, so one line per packet — on survev.io and surviv.io alike, since
+  // both builds go through the same hook.
+  //
+  // Two numbers, and they measure different things:
+  //   gap  — our own performance.now() delta between setter fires. This is
+  //          arrival time as this tab actually saw it, jitter and all, and it
+  //          is the thing "time between updates from the server" means.
+  //   raw  — the value the *client* computed and wrote into the field. It is
+  //          normally the same gap, but the client clamps and reuses it, so
+  //          when the two disagree the disagreement is the interesting part.
+  // Trailing mean/jitter/tick are the smoothed views already maintained for
+  // the netcode path: the EWMA gap, its mean absolute deviation, and the tick
+  // length recovered by the regression.
+  //
+  // Toggle at runtime with `window.__SURVEV_LOG_TICK__ = false`. Remove this
+  // block and its call in the camera setter when done.
+  window.__SURVEV_LOG_TICK__ = true;
+  let lastPacketMs = 0;
+  function debugLogUpdateInterval(nowMs) {
+    if (!window.__SURVEV_LOG_TICK__) return;
+    // First packet of the session (or of a fresh camera) has nothing to
+    // difference against; report it as the start of the series rather than as
+    // a gap of however long the tab had been open.
+    const gap = lastPacketMs ? nowMs - lastPacketMs : NaN;
+    lastPacketMs = nowMs;
+    const tickMs = netClock.ready ? netClock.slope : NaN;
+    console.log(
+      `[${SOURCE}] tick n=${netClock.n - 1} ` +
+      `gap=${Number.isFinite(gap) ? gap.toFixed(1) + 'ms' : 'first'} ` +
+      `raw=${netStats.rawMs.toFixed(1)}ms ` +
+      `mean=${netStats.meanMs.toFixed(1)}ms ` +
+      `jitter=${netStats.devMs.toFixed(1)}ms ` +
+      `fit=${Number.isFinite(tickMs) ? tickMs.toFixed(1) + 'ms' : 'n/a'}`
     );
   }
   // ---- end TEMP DEBUG ------------------------------------------------------
@@ -6447,7 +6838,9 @@
           raw = v;
           recordUpdateInterval(v);
           try {
-            clockOnPacket(performance.now());
+            const now = performance.now();
+            clockOnPacket(now);
+            debugLogUpdateInterval(now);
             snapshotPlayers(game);
             // Strictly after both: it reads the pair snapshotPlayers has just
             // pushed, against the tick length clockOnPacket has just refit.
@@ -6465,6 +6858,7 @@
     netStats.devMs = 0;
     netStats.windowMs = 0;
     netStats.updates = 0;
+    lastPacketMs = 0;   // TEMP DEBUG: don't bill the new round for menu time
     resetNetClock();
     return camera;
   }
@@ -6784,7 +7178,7 @@
         camera[CAM_INTERP_ON] = true;
       }
       const roster = findRosterOnGame(game) || game?.[GAME_ROSTER];
-      const pool = roster?.playerPool;
+      const pool = roster?.[ROSTER_POOL];
       const players = (pool && typeof pool[POOL_GETALL] === 'function' ? pool[POOL_GETALL]() : []) || [];
       for (const player of players) installPlayerSmoothing(player);
     } catch {}
@@ -6807,7 +7201,7 @@
   // own is what makes the enemy tag pixel-identical to the teammate one, and
   // it costs one property read per player per frame.
   //
-  // `nameText` is one of the names survev leaves readable (like `playerPool`
+  // `nameText` is one of the names every build leaves readable (like `pos`
   // and `pings`), so none of this needs a mangled.js entry.
   //
   // The hook is an accessor on the Text instance, not a write from our own
@@ -6914,7 +7308,7 @@
     if (NAME_TAGS.enabled !== 1 && nameTagsHooked === 0) return;
     try {
       const roster = findRosterOnGame(game) || game?.[GAME_ROSTER];
-      const pool = roster?.playerPool;
+      const pool = roster?.[ROSTER_POOL];
       if (!pool || typeof pool[POOL_GETALL] !== 'function') return;
       // Who we are. Without a local player at all there is no side to be on,
       // and "everyone is an enemy" — the sampler's reading of that state —
@@ -6926,7 +7320,7 @@
       if (!me) return;
       const selfId = Number(me.__id ?? me.playerId ?? 0) || null;
       let selfInfo = null;
-      try { selfInfo = selfId != null ? roster.getPlayerInfo?.(selfId) ?? null : null; } catch {}
+      try { selfInfo = selfId != null ? roster[ROSTER_GETINFO]?.(selfId) ?? null : null; } catch {}
 
       for (const player of pool[POOL_GETALL]() || []) {
         const text = player?.nameText;
@@ -6938,7 +7332,7 @@
         // can hold a squadmate in the next one.
         let info = null;
         const id = Number(player.__id ?? 0) || null;
-        if (id != null) { try { info = roster.getPlayerInfo?.(id) ?? null; } catch {} }
+        if (id != null) { try { info = roster[ROSTER_GETINFO]?.(id) ?? null; } catch {} }
         // Identity first, id second: `player !== me` is the half that cannot
         // be defeated by a missing or late `__id`, and the id comparison only
         // has to catch a local player the walk found under a different object.
@@ -6968,12 +7362,12 @@
   window.__nameTagDiag = () => {
     const game = capturedGame;
     const roster = game ? (findRosterOnGame(game) || game[GAME_ROSTER]) : null;
-    const pool = roster?.playerPool;
+    const pool = roster?.[ROSTER_POOL];
     const players = (pool && typeof pool[POOL_GETALL] === 'function' ? pool[POOL_GETALL]() : []) || [];
     const me = game ? (findLocalPlayerOnGame(game) || game[GAME_LOCAL]) : null;
     const selfId = Number(me?.__id ?? me?.playerId ?? 0) || null;
     const live = players.filter((p) => p && p.active);
-    const infoOf = (id) => { try { return roster?.getPlayerInfo?.(id) ?? null; } catch { return null; } };
+    const infoOf = (id) => { try { return roster?.[ROSTER_GETINFO]?.(id) ?? null; } catch { return null; } };
     return {
       enabled: NAME_TAGS.enabled === 1,
       gameCaptured: !!game,
@@ -7274,7 +7668,7 @@
   function drawDebugPlayers(g) {
     g.clear();
     const roster = capturedGame ? findRosterOnGame(capturedGame) : null;
-    const pool = roster && roster.playerPool;
+    const pool = roster && roster[ROSTER_POOL];
     const players = (pool && typeof pool[POOL_GETALL] === 'function')
       ? pool[POOL_GETALL]() : null;
     if (!Array.isArray(players)) return;
@@ -7814,7 +8208,7 @@
   // rather than generating traffic of our own.
   //
   // `pings` is one of the field names survev leaves readable (like
-  // `posInterpTicker` and `playerPool`), so it needs no mangled.js entry.
+  // `posInterpTicker`), so it needs no mangled.js entry.
   //
   // The element is inserted as the first child of `#ui-top-left`, which is the
   // container holding `#ui-team` — so it sits directly above the team panel,
@@ -8490,6 +8884,41 @@
       } : null,
     };
   };
+  Object.defineProperty(window, '__netDiag', {
+   configurable: true, enumerable: false, writable: true,
+   value: () => ({
+    site: window.__SURVEV_MANGLED_SITE__ || null,
+    detector: {
+      hookInstalled: detectState.installed,
+      chunksSeen: detectState.chunks,
+      patched: detectState.patched,
+      trips: detectState.trips,
+      samples: detectState.samples,
+    },
+    appCaptured: !!capturedApp,
+    gameCaptured: !!(lastFound?.game),
+    rootName: lastFound?.rootName || null,
+    bindHook: {
+      installed: bindHookState.installed,
+      calls: bindHookState.calls,
+      uninstalledReason: bindHookState.uninstalledReason,
+    },
+    enabled: NETCODE.enabled === 1,
+    cameraHooked: !!netStats.hookedCamera,
+    playersHooked: netStats.playersHooked,
+    updates: netStats.updates,
+    rawMs: Number(netStats.rawMs.toFixed(2)),
+    meanMs: Number(netStats.meanMs.toFixed(2)),
+    devMs: Number(netStats.devMs.toFixed(2)),
+    windowMs: Number(netStats.windowMs.toFixed(2)),
+    clock: {
+      ready: netClock.ready,
+      packets: netClock.count,
+      tickMs: Number(netClock.slope.toFixed(2)),
+      jitterMs: (() => { const j = clockJitterMs(); return j == null ? null : Number(j.toFixed(2)); })(),
+    },
+    }),
+ });
 
   post('status', { ok: true, message: 'Injector loaded.', url: location.href, isTop: window.top === window });
   // console.log(`[${SOURCE}] inject.js TAIL reached, starting sampleLoop @ ${SAMPLE_MS}ms`);
