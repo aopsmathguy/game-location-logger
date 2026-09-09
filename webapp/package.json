@@ -1,0 +1,13 @@
+{
+  "name": "survev-mirror",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Reverse proxy that mirrors survev.io with the enemy-location-logger toolkit injected.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
