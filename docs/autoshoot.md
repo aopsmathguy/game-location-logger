@@ -9,6 +9,12 @@ decides whether to pull. So it does nothing unless the aimbot is enabled **and
 its key is held** — without that the crosshair isn't on anyone and "can the
 enemy be hit" has no meaning.
 
+None of what follows has a mobile variant. Everything here presses through
+survev's own bind layer, and the mobile input path reads that same layer for
+`shootStart`/`shootHold`, so it arrives on a phone unchanged — the activation
+is the only thing that differs, and there the trigger *is* the activation. See
+[On a phone](mobile.md#on-a-phone).
+
 Four conditions, all of which have to hold:
 
 1. **A gun at all** — not a melee or a throwable. This is also what keeps the

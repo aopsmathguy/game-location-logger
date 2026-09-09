@@ -32,7 +32,8 @@ none of them touches input or gameplay state.
   default, as is "Prefer banks", which hunts for a bounce even when the direct
   line is open; see [Bank shots](docs/bank-shots.md#bank-shots).
 - **Aim helper** — once enabled by the "Aimbot" button in the MOD tab, holding
-  the aimbot key (Shift by default, rebindable on the row below it) suppresses
+  the aimbot key (Shift by default, rebindable on the row below it; on a phone
+  it is the trigger itself — see [On a phone](docs/mobile.md#on-a-phone)) suppresses
   real mouse events and dispatches aim points each frame, onto whichever enemy
   is nearest the user's cursor — recomputed every frame, with no commitment,
   and counting a just-killed one as alive until its linger timer is up. If that
@@ -100,6 +101,14 @@ none of them touches input or gameplay state.
 - **Position log** — periodic snapshots of self + enemy positions are sent
   to the service worker; click the toolbar icon to export as JSON
   (see `docs/sample.json` for the schema).
+- **Mobile** — the aim helper, autoshoot, frag aim and the dodge bot all work
+  on a touch device, where survev builds its input message from two virtual
+  pads instead of from a mouse and four keys. There is no key to hold, so the
+  **shot is the switch**: pulling the right pad far enough to fire turns the
+  aim helper and autoshoot on together. The dodge bot writes the movement
+  vector the left pad would have produced, and frag aim encodes its solved
+  throw strength as a pad deflection. See
+  [On a phone](docs/mobile.md#on-a-phone).
 
 ## Install
 
@@ -129,7 +138,7 @@ extension/       manifest, content script, service worker
 extension/core/  inject.js + mangled.js — the toolkit, shared by both consumers
 webapp/          reverse-proxy mirror that serves survev with core/ injected
 tools/           fetch_survev_js.py, derive_mangled.py
-tests/           netcode_sim.js
+tests/           netcode_sim.js, blast_sim.js, touch_sim.js
 docs/            design notes, sample log schema
 js_dump/         bundle cache (gitignored) — repopulated by tools/fetch_survev_js.py
 ```
@@ -208,6 +217,7 @@ Each feature's design notes, and why it works the way it does:
 | [docs/aiming.md](docs/aiming.md) | Aiming on the recovered clock, target selection, the whitelist |
 | [docs/autoshoot.md](docs/autoshoot.md) | When the trigger pulls itself |
 | [docs/dodge-bot.md](docs/dodge-bot.md) | Solving incoming bullets and planning a way out of them |
+| [docs/mobile.md](docs/mobile.md) | The touch input path: pads instead of a mouse and keys |
 | [docs/netcode.md](docs/netcode.md) | Clock recovery and smoothing, and the trade it makes |
 | [docs/name-tags.md](docs/name-tags.md) | Enemy name tags |
 | [docs/debug-render.md](docs/debug-render.md) | The debug overlay |

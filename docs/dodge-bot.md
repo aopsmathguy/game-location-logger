@@ -408,6 +408,10 @@ The bot drives whenever a round is in the air that could reach us inside the
 horizon, and hands the keys back when there are none. That is the whole of it:
 there is no takeover threshold and no handback timer.
 
+On a touch device there are no keys: movement is one analog vector off the left
+pad and the planner's chosen heading is written straight into it. See
+[Dodge: one vector instead of four keys](mobile.md#dodge-one-vector-instead-of-four-keys).
+
 There used to be both. A plan was pressed only once the user's own course was
 proven to be hit inside `trigger` seconds, and the keys went back after
 `releaseMs` of that question answering no. Both were answers to something the
@@ -1259,6 +1263,12 @@ strength that reaches a given distance is one division away. The seed is usually
 the answer; the three-pass sweep around it is what copes with bounces, with the
 thrower's own motion folded into the velocity, and with a fuse too short to let
 the grenade finish sliding.
+
+On a touch device that cursor distance is encoded as a pad deflection rather
+than measured, which is an inverse to solve and a ceiling to respect — the pad
+cannot ask for more than `throwableMaxMouseDist`, so `amped_explosives`' longer
+reach is simply unavailable there and the search is capped to match. See
+[Frag: the throttle is an inverse](mobile.md#frag-the-throttle-is-an-inverse).
 
 ### What it costs, and what it cost before
 

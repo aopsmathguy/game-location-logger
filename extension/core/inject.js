@@ -932,6 +932,8 @@
     prevSample.clear();
     lastDeepSearchAt = 0;
     cachedZoomKey = null;
+    cachedTouchKey = null;
+    touchState.target = null;
     cachedCameraKey = null;
     cachedCameraScaleFn = null;
     cachedCameraPpuKey = null;
@@ -1699,6 +1701,295 @@
       post('status', { ok: true, message: 'Cleared in-page sample cache.' });
     }
   });
+
+  // ---------------------------------------------------------------------
+  // Touch input
+  // ---------------------------------------------------------------------
+  //
+  // A touch device does not build its input message the way a desktop does,
+  // and almost nothing in the aim, frag or dodge paths below would reach the
+  // wire unchanged. The relevant half of the bundle's input build is:
+  //
+  //     if (device.touch) {
+  //       const move = touch.getTouchMovement(camera);
+  //       const aim  = touch.getAimMovement(player, camera);
+  //       if (touch.moveDetected) {
+  //         msg.touchMoveDir = normalizeSafe(move.toMoveDir);
+  //         msg.touchMoveLen = round(clamp(move.toMoveLen, 0, 1) * 255);
+  //       } else msg.touchMoveLen = 0;
+  //       msg.toMouseDir = aim.aimMovement.toAimDir;
+  //       msg.toMouseLen = clamp(aim.aimMovement.toAimLen / touch.padPosRange, 0, 1)
+  //                        * GameConfig.player.throwableMaxMouseDist;
+  //     } else { /* moveLeft..moveDown off the binds, aim off the mouse */ }
+  //     msg.shootStart = binds.isBindPressed(Fire) || touch.shotDetected;
+  //     msg.shootHold  = binds.isBindDown(Fire)    || touch.shotDetected;
+  //
+  // Three consequences, and they are the whole reason this section exists:
+  //
+  //   * Aim is not the mouse. The synthetic `mousemove` the aim helper
+  //     dispatches every frame is read by nothing here — `toMouseDir` comes
+  //     off the right pad, so the aim has to be written where that pad's
+  //     reading is instead.
+  //   * Movement is not the keys. `moveLeft`..`moveDown` are not on the
+  //     message at all, so the dodge bot's four held binds go nowhere.
+  //     Movement is one analog vector off the left pad.
+  //   * The trigger *is* still the bind layer, `|| shotDetected`. Autoshoot
+  //     therefore needs no mobile path of its own — it already presses through
+  //     the same isBindPressed/isBindDown pair this branch reads.
+  //
+  // So this wraps the two pad readers and rewrites what they return. Both are
+  // public methods on survev's TouchInput and survive the mangler with their
+  // names intact — the same thing the roster fingerprint relies on — which is
+  // also what lets the instance be found by shape rather than by a pinned
+  // mangled name.
+
+  const touchState = {
+    target: null,          // the TouchInput instance we've wrapped
+    lastSeenAt: 0,         // performance.now() of the last getAimMovement call
+
+    // The user's own right pad, recorded every frame *before* we overwrite
+    // anything. Target selection reads the direction, and the activation reads
+    // the trigger — the same division the desktop path draws between the real
+    // mouse (who) and the solved aim (where).
+    aimDx: 1, aimDy: 0, aimLen: 0, aimTouched: false, shot: false,
+    // ...and the values to hand back on release, so letting go returns the aim
+    // to where the user's thumb actually is rather than freezing it on the
+    // last thing we sent.
+    restDx: 1, restDy: 0, restLen: 0,
+
+    // The user's own left pad, likewise read before the dodge bot replaces it.
+    moveTouched: false, userMoveDx: 0, userMoveDy: 0,
+
+    // What we want the pads to report this frame.
+    driveAim: false, owner: null, driveDx: 1, driveDy: 0,
+    // A throw's cursor distance in world units, or < 0 to leave the pull alone.
+    // Guns care about the bearing only; a grenade's whole throttle is here.
+    driveLen: -1,
+    driveMove: false, moveDx: 0, moveDy: 0,
+  };
+
+  // survev's TouchInput. Matched on its public method names rather than on a
+  // mangled field, and on `aimMovement` to rule out anything that merely
+  // forwards to it.
+  function looksLikeTouchInput(obj) {
+    try {
+      return !!obj && typeof obj === 'object'
+        && typeof obj.getAimMovement === 'function'
+        && typeof obj.getTouchMovement === 'function'
+        && typeof obj.setAimDir === 'function'
+        && !!obj.aimMovement;
+    } catch {
+      return false;
+    }
+  }
+
+  let cachedTouchKey = null;
+
+  function findTouchOnGame(game) {
+    if (!game || typeof game !== 'object') return null;
+    try {
+      if (cachedTouchKey) {
+        const t = game[cachedTouchKey];
+        if (looksLikeTouchInput(t)) return t;
+        cachedTouchKey = null;
+      }
+      const names = Object.getOwnPropertyNames(game);
+      for (let i = 0; i < names.length; i++) {
+        const v = game[names[i]];
+        if (looksLikeTouchInput(v)) {
+          cachedTouchKey = names[i];
+          return v;
+        }
+      }
+    } catch {}
+    return null;
+  }
+
+  // Wrap the two pad readers, once per instance. The marker is on the object
+  // rather than in a variable because a new round hands us a new Game while
+  // reusing the same TouchInput, and wrapping a wrapper would make the second
+  // copy record our own driven values as if they were the user's.
+  function ensureTouchHook(game) {
+    const t = findTouchOnGame(game);
+    if (!t) return null;
+    if (t === touchState.target) return t;
+    if (t.__elgTouchHooked) { touchState.target = t; return t; }
+
+    const origAim = t.getAimMovement;
+    const origMove = t.getTouchMovement;
+    t.getAimMovement = function(player, camera) {
+      const res = origAim.call(this, player, camera);
+      // Proof of touch mode, and the only proof that can't be wrong: this
+      // method is called from inside the `device.touch` branch and nowhere
+      // else, so it firing *is* the branch being taken.
+      touchState.lastSeenAt = performance.now();
+      try { return touchAimOverride(this, res); } catch { return res; }
+    };
+    t.getTouchMovement = function(camera) {
+      const res = origMove.call(this, camera);
+      try { return touchMoveOverride(this, res); } catch { return res; }
+    };
+    try {
+      Object.defineProperty(t, '__elgTouchHooked', { value: true });
+    } catch {}
+    touchState.target = t;
+    return t;
+  }
+
+  // True while the game is actually building its input from the pads. Read off
+  // our own hook firing rather than off a user-agent string, and allowed to go
+  // stale so a desktop that never enters the branch never looks like a phone.
+  const TOUCH_STALE_MS = 500;
+  function touchActive() {
+    return touchState.lastSeenAt > 0 &&
+      (performance.now() - touchState.lastSeenAt) < TOUCH_STALE_MS;
+  }
+
+  // The pad's full-deflection radius in pixels, which is the denominator the
+  // throw throttle is expressed against. It is zero until the first layout, and
+  // a zero there would divide the throttle into an unconditional full-strength
+  // throw, so fall back to the class's own base value.
+  function touchPadRange(touch) {
+    const r = Number(touch?.padPosRange);
+    return r > 0 ? r : 48;
+  }
+
+  const touchAimOut = { aimMovement: null, touched: true };
+  const touchMoveOut = { toMoveDir: { x: 1, y: 0 }, toMoveLen: 0 };
+
+  function touchAimOverride(touch, res) {
+    const am = res?.aimMovement || touch?.aimMovement;
+    if (!am) return res;
+
+    // The user, first. `shotDetected` was computed by the original off the real
+    // pull a moment ago and we never write it, so it stays their own trigger no
+    // matter what happens to the vector below.
+    const dx = Number(am.toAimDir?.x);
+    const dy = Number(am.toAimDir?.y);
+    if (Number.isFinite(dx) && Number.isFinite(dy) && (dx || dy)) {
+      touchState.aimDx = dx;
+      touchState.aimDy = dy;
+    }
+    touchState.aimLen = Number(am.toAimLen) || 0;
+    touchState.aimTouched = !!res?.touched;
+    touchState.shot = !!touch?.shotDetected;
+
+    if (!touchState.driveAim) {
+      touchState.restDx = touchState.aimDx;
+      touchState.restDy = touchState.aimDy;
+      touchState.restLen = touchState.aimLen;
+      return res;
+    }
+
+    touchWriteAimDir(am, touchState.driveDx, touchState.driveDy);
+    if (touchState.driveLen >= 0) {
+      // Invert the throttle: the message carries
+      // `clamp(toAimLen / padPosRange, 0, 1) * throwableMaxMouseDist`, so a
+      // cursor distance of `driveLen` world units is that fraction of the pad.
+      const f = Math.min(Math.max(touchState.driveLen / PROJ_MAX_MOUSE_DIST, 0), 1);
+      am.toAimLen = touchPadRange(touch) * f;
+    }
+    // `touched: false` would let the caller hand the aim to the *movement*
+    // stick's bearing two lines later, so a driven frame always claims the pad.
+    touchAimOut.aimMovement = am;
+    return touchAimOut;
+  }
+
+  // Write a bearing into a pad reading in place. The game builds a fresh
+  // `aimMovement` every frame the pad is touched and only ever `copy`s the
+  // vector out of it, so mutating is safe and is one less object per frame on
+  // a device that has the least room for them.
+  function touchWriteAimDir(am, x, y) {
+    const dir = am.toAimDir;
+    if (dir && typeof dir === 'object') { dir.x = x; dir.y = y; }
+    else am.toAimDir = { x, y };
+  }
+
+  function touchMoveOverride(touch, res) {
+    // The user's own heading, snapped later by whoever needs it. Recorded
+    // before the override for the same reason realBindDown exists: the dodge
+    // bot's trigger reads it, and it must not see the bot's own course.
+    touchState.moveTouched = !!touch?.moveDetected;
+    const mdx = Number(res?.toMoveDir?.x);
+    const mdy = Number(res?.toMoveDir?.y);
+    if (Number.isFinite(mdx) && Number.isFinite(mdy)) {
+      touchState.userMoveDx = mdx;
+      touchState.userMoveDy = mdy;
+    }
+
+    if (!touchState.driveMove) return res;
+
+    if (!touchState.moveDx && !touchState.moveDy) {
+      // Standing still is not a direction. The message gates its whole movement
+      // half on `moveDetected`, so putting that down is the only way to ask for
+      // nothing — a zero vector would be normalized back to due east and walk
+      // us out of cover at full speed.
+      if (touch) touch.moveDetected = false;
+      touchMoveOut.toMoveLen = 0;
+      return touchMoveOut;
+    }
+    // The pad reports "no touch" by leaving `moveDetected` down, and that field
+    // — not the vector we return — is what the message is gated on, so driving
+    // means claiming both.
+    if (touch) touch.moveDetected = true;
+    touchMoveOut.toMoveDir.x = touchState.moveDx;
+    touchMoveOut.toMoveDir.y = touchState.moveDy;
+    touchMoveOut.toMoveLen = 1;
+    return touchMoveOut;
+  }
+
+  // Two things drive the aim pad — the gun aim helper and the frag solver — and
+  // they must not take it back out from under each other, so a release only
+  // lands if it comes from whoever last claimed it.
+  function touchDriveAim(owner, dx, dy, len) {
+    touchState.driveAim = true;
+    touchState.owner = owner;
+    touchState.driveDx = dx;
+    touchState.driveDy = dy;
+    touchState.driveLen = Number.isFinite(len) ? len : -1;
+  }
+
+  function touchReleaseAim(owner) {
+    if (!touchState.driveAim || touchState.owner !== owner) return;
+    touchState.driveAim = false;
+    touchState.owner = null;
+    touchState.driveLen = -1;
+    // Put the pad back where the user's thumb left it. Same reason the desktop
+    // path replays the real cursor once on release: without it the game keeps
+    // aiming at whatever we last solved for.
+    const am = touchState.target?.aimMovement;
+    if (!am) return;
+    touchWriteAimDir(am, touchState.restDx, touchState.restDy);
+    am.toAimLen = touchState.restLen;
+  }
+
+  function touchDriveMove(dx, dy) {
+    touchState.driveMove = true;
+    touchState.moveDx = dx;
+    touchState.moveDy = dy;
+  }
+
+  function touchReleaseMove() {
+    touchState.driveMove = false;
+    touchState.moveDx = 0;
+    touchState.moveDy = 0;
+  }
+
+  // The user's own trigger on a touch device. There are no keybinds to hold, so
+  // the activation *is* the shot: pulling the right pad past survev's own
+  // `shotDetected` threshold turns the aim helper and autoshoot on together.
+  // The bind is still consulted because a paired controller or keyboard goes
+  // through it, and it is read past our synthetic layer so autoshoot's own
+  // presses can't latch the aim on forever.
+  function touchFireHeld() {
+    return touchState.shot || realBindDown(capturedGame?.[GAME_BINDS], AUTO_SWAP_INPUT_FIRE);
+  }
+
+  function touchFrameTick() {
+    try { ensureTouchHook(capturedGame); } catch {}
+    requestAnimationFrame(touchFrameTick);
+  }
+  requestAnimationFrame(touchFrameTick);
 
   // Hold-to-aim. While the aimbot key is held, real mousemove events are
   // swallowed at the capture phase and a solved screen-space aim point
@@ -2754,13 +3045,74 @@
     return window.innerWidth / (sample?.self?.viewportWorldUnits || 56);
   }
 
-  // Pick the enemy whose world position is closest (in Euclidean distance)
-  // to the world point under the user's real mouse cursor. Survev keeps the
-  // local player viewport-centered, so the mouse offset from screen center
-  // — divided by the world-to-screen pixel scale — is the world offset
-  // from the player. Adding it to the player's world position gives us
-  // a "where the user is pointing in the world" point that we score every
-  // visible enemy against.
+  // Where the user is pointing, in whichever currency the device deals in.
+  //
+  // With a mouse that is a *point* in the world. Survev keeps the local player
+  // viewport-centered, so the cursor's offset from screen center — divided by
+  // the world-to-screen pixel scale — is its world offset from the player, and
+  // adding that to the player's position gives a point every enemy can be
+  // scored against.
+  //
+  // On a pad there is no such point. The right stick gives a bearing and a
+  // pull, and the pull is the throw throttle rather than a range, so the same
+  // question can only be scored as an angle. Projecting the bearing out to some
+  // invented radius instead would pick whichever enemy happened to be standing
+  // at that radius.
+  const userAimOut = { angular: false, x: 0, y: 0, dx: 1, dy: 0, theta: 0 };
+  function userAim(player) {
+    const o = userAimOut;
+    if (touchActive()) {
+      o.angular = true;
+      const len = Math.hypot(touchState.aimDx, touchState.aimDy);
+      o.dx = len > 1e-6 ? touchState.aimDx / len : 1;
+      o.dy = len > 1e-6 ? touchState.aimDy / len : 0;
+      o.theta = Math.atan2(o.dy, o.dx);
+      o.x = player.x + o.dx;
+      o.y = player.y + o.dy;
+      return o;
+    }
+    o.angular = false;
+    const scale = getLivePxPerWorldUnit(pageSamples[pageSamples.length - 1]);
+    if (realMouse.hasMoved && scale > 0) {
+      o.x = player.x + (realMouse.x - window.innerWidth / 2) / scale;
+      o.y = player.y - (realMouse.y - window.innerHeight / 2) / scale;
+    } else {
+      // Before the mouse has ever moved there is nothing to point with, and our
+      // own feet are what every path here has always fallen back to.
+      o.x = player.x;
+      o.y = player.y;
+    }
+    const dx = o.x - player.x;
+    const dy = o.y - player.y;
+    const len = Math.hypot(dx, dy);
+    o.dx = len > 1e-6 ? dx / len : 1;
+    o.dy = len > 1e-6 ? dy / len : 0;
+    o.theta = Math.atan2(o.dy, o.dx);
+    return o;
+  }
+
+  // How badly a world point misses where the user is pointing: squared world
+  // distance from the cursor, or radians off the pad's bearing. The two are
+  // never compared with each other, only ever used to rank points against each
+  // other on the one device in front of us.
+  function userAimScore(aim, player, p) {
+    if (!aim.angular) {
+      const dx = p.x - aim.x;
+      const dy = p.y - aim.y;
+      return dx * dx + dy * dy;
+    }
+    const dx = p.x - player.x;
+    const dy = p.y - player.y;
+    const d = Math.hypot(dx, dy);
+    if (!(d > 1e-6)) return 0;
+    // Distance is in here only to break ties between two enemies on the same
+    // bearing, at a millionth of a radian per unit — far too small to outweigh
+    // one.
+    return Math.abs(angleDelta(aim.theta, Math.atan2(dy, dx))) + d * 1e-6;
+  }
+
+  // Pick the enemy the user is pointing at: the best-scoring live, reachable,
+  // non-whitelisted one, by whichever of the two scores this device uses.
   function pickTarget(player, enemies, now) {
     const candidates = [];
     for (const e of enemies) {
@@ -2771,25 +3123,12 @@
     }
     if (!candidates.length) return [null, 0];
 
-    const scale = getLivePxPerWorldUnit(pageSamples[pageSamples.length - 1]);
-    let mouseWorldX, mouseWorldY;
-    if (realMouse.hasMoved) {
-      mouseWorldX = player.x + (realMouse.x - window.innerWidth / 2) / scale;
-      mouseWorldY = player.y - (realMouse.y - window.innerHeight / 2) / scale;
-    } else {
-      mouseWorldX = player.x;
-      mouseWorldY = player.y;
-    }
+    const aim = userAim(player);
 
     // Score against where each enemy is on the clock, not where the last
     // sample caught them: the user aims at the sprite, and the sprite is drawn
     // from the clock.
-    const scoreOf = (e) => {
-      const p = livePos(e.id, e);
-      const dx = p.x - mouseWorldX;
-      const dy = p.y - mouseWorldY;
-      return dx * dx + dy * dy;
-    };
+    const scoreOf = (e) => userAimScore(aim, player, livePos(e.id, e));
 
     let best = candidates[0];
     let bestScore = scoreOf(best);
@@ -3059,16 +3398,20 @@
 
     if (engage) {
       aimState.targetId = enemy.id;
-      // First frame of an engagement: start the glide from where the user's
-      // real cursor is pointing in the world, not from a stale/zero point.
+      // First frame of an engagement: start the glide from where the user is
+      // already pointing, not from a stale/zero point.
       if (aimState.aimX == null) {
-        const scale = getLivePxPerWorldUnit(last_sample);
-        if (realMouse.hasMoved) {
-          aimState.aimX = player.x + (realMouse.x - window.innerWidth / 2) / scale;
-          aimState.aimY = player.y - (realMouse.y - window.innerHeight / 2) / scale;
+        const a = userAim(player);
+        if (a.angular) {
+          // A bearing and not a point: start the glide at the target's own
+          // range along it, so the crosshair sweeps sideways onto them rather
+          // than out from under our own feet.
+          const d = Math.hypot(tgt.x - player.x, tgt.y - player.y);
+          aimState.aimX = player.x + a.dx * d;
+          aimState.aimY = player.y + a.dy * d;
         } else {
-          aimState.aimX = player.x;
-          aimState.aimY = player.y;
+          aimState.aimX = a.x;
+          aimState.aimY = a.y;
         }
       }
       // Close a frame-rate-independent fraction of the remaining world-space
@@ -3089,6 +3432,17 @@
       aimState.targetId = null;
       aimState.aimX = null;
       aimState.aimY = null;
+    }
+
+    if (touchActive()) {
+      // No cursor to move: the aim goes onto the pad reading the input message
+      // is actually built from. Frag aim owns that pad while a grenade is
+      // cooking — it is solving for a throw, and the pull that encodes the
+      // throw's strength is the same number a gun bearing would overwrite.
+      if (fragActive()) return;
+      if (engage) touchDriveAim('aim', Math.cos(aimState.theta), Math.sin(aimState.theta));
+      else touchReleaseAim('aim');
+      return;
     }
 
     let x;
@@ -3123,7 +3477,7 @@
   function aimFrame() {
     // Switching the aimbot off mid-hold drops the hold here rather than
     // leaving the loop spinning until the key comes up.
-    if (!aimHeld || !AIMBOT.enabled) { releaseAim(); return; }
+    if (!aimEngaged() || !AIMBOT.enabled) { releaseAim(); return; }
     dispatchAim();
     aimRafId = requestAnimationFrame(aimFrame);
   }
@@ -3133,12 +3487,35 @@
   // ever going to arrive.
   function releaseAim() {
     aimHeld = false;
+    touchReleaseAim('aim');
     if (aimRafId) { cancelAnimationFrame(aimRafId); aimRafId = 0; }
     aimState.targetId = null;
     aimState.aimX = null;
     aimState.aimY = null;
     aimState.lastFrameAt = 0;
   }
+
+  // Whether the aim helper is on this frame. On a desktop that is the bind
+  // being held. A touch device has no bind to hold, so the trigger itself is
+  // the activation: pulling the right pad far enough to shoot turns the aim
+  // helper and autoshoot on together, which is the only spare gesture a phone
+  // has. See touchFireHeld.
+  function aimEngaged() {
+    return touchActive() ? touchFireHeld() : aimHeld;
+  }
+
+  // The desktop loop is started by the keydown that begins the hold; a pad has
+  // no such edge to hang it off, so poll for one. Restarting is always a fresh
+  // engagement because releaseAim has already dropped the glide seed.
+  function aimTouchTick() {
+    try {
+      if (AIMBOT.enabled && !aimRafId && touchActive() && touchFireHeld()) {
+        aimRafId = requestAnimationFrame(aimFrame);
+      }
+    } catch {}
+    requestAnimationFrame(aimTouchTick);
+  }
+  requestAnimationFrame(aimTouchTick);
 
   // True while the caret is in one of our own multi-line boxes. This listener
   // is capture-phase on window, so it runs *before* the event reaches the box
@@ -3184,7 +3561,7 @@
       realMouse.y = e.clientY;
       realMouse.hasMoved = true;
     }
-    if ((!aimHeld && !fragActive()) || !e.isTrusted) return;
+    if ((!aimEngaged() && !fragActive()) || !e.isTrusted) return;
     e.stopImmediatePropagation();
     e.preventDefault();
   }, true);
@@ -3766,6 +4143,9 @@
       // game, and `bindCapture` keeps the aimbot's own listener — registered
       // first, at load, so it runs first — from engaging on the press.
       if (spec.kind === 'keybind') {
+        // A phone has no key to hold: the trigger is the activation there, so
+        // the row would be a dead control. See aimEngaged.
+        if (IS_MOBILE_DEVICE || touchActive()) continue;
         const row = document.createElement('div');
         row.className = 'ui-keybind-container';
         const desc = document.createElement('a');
@@ -4389,7 +4769,7 @@
   }
 
   function autoShootPlan(obs) {
-    if (!AUTOSHOOT.enabled || !AIMBOT.enabled || !aimHeld || !obs) return null;
+    if (!AUTOSHOOT.enabled || !AIMBOT.enabled || !aimEngaged() || !obs) return null;
     const { game, me, weapon, ammo } = obs;
 
     // Has to be a gun at all. This is also what keeps the single-gun swap from
@@ -6228,6 +6608,11 @@
     c.x = pos.x; c.y = pos.y; c.layer = layer;
     c.mvx = mv.x * 0.6; c.mvy = mv.y * 0.6;
     c.maxDist = PROJ_MAX_MOUSE_DIST * (amped ? PROJ_AMPED_RANGE : 1);
+    // A pad builds toMouseLen as a fraction of its own range times
+    // throwableMaxMouseDist, so 18 units is the whole of the throttle there and
+    // amped_explosives' longer one simply cannot be asked for. Solving against
+    // a reach we can't request would land every throw short of where it aimed.
+    if (touchActive()) c.maxDist = Math.min(c.maxDist, PROJ_MAX_MOUSE_DIST);
     c.speed = phys.speed * (amped ? PROJ_AMPED_SPEED : 1);
     c.left = left; c.phys = phys;
     // Furthest anything thrown from here can get: the strongest throw's flight
@@ -6267,6 +6652,19 @@
   function dodgeCursorAim(me) {
     const o = dodgeCursorOut;
     o.ok = false;
+    if (touchActive()) {
+      // The pad is the cursor: its bearing is the throw's direction and its
+      // pull is the throttle, read back out the same way the input message
+      // puts it in.
+      const len = Math.hypot(touchState.aimDx, touchState.aimDy);
+      if (!(len > 1e-6)) return o;
+      o.dx = touchState.aimDx / len;
+      o.dy = touchState.aimDy / len;
+      const f = Math.min(Math.max(touchState.aimLen / touchPadRange(touchState.target), 0), 1);
+      o.len = f * PROJ_MAX_MOUSE_DIST;
+      o.ok = true;
+      return o;
+    }
     const scale = getLivePxPerWorldUnit(pageSamples[pageSamples.length - 1]);
     if (realMouse.hasMoved && scale > 0) {
       let dx = (realMouse.x - window.innerWidth / 2) / scale;
@@ -8051,6 +8449,19 @@
   // layer. This has to go through realBindDown or the trigger would see the
   // bot's own held keys and latch itself on forever.
   function dodgeUserDirIdx(binds) {
+    if (touchActive()) {
+      // Their pad, recorded before we replaced it, snapped to the eight
+      // headings the planner searches. Snapped by bearing rather than through
+      // dodgeDirIndex, whose sign test reads a hair off due east as a diagonal
+      // — and an analog stick is almost always a hair off something.
+      if (!touchState.moveTouched) return 0;
+      const dx = touchState.userMoveDx;
+      const dy = touchState.userMoveDy;
+      if (!(Math.hypot(dx, dy) > 1e-6)) return 0;
+      // DODGE_DIRS runs E, NE, N, ... from index 1, which is exactly the
+      // octants of atan2 counterclockwise from due east.
+      return 1 + (((Math.round(Math.atan2(dy, dx) / (Math.PI / 4)) % 8) + 8) % 8);
+    }
     const left = realBindDown(binds, DODGE_INPUT_LEFT) || dodgeArrowDown.get(37);
     const right = realBindDown(binds, DODGE_INPUT_RIGHT) || dodgeArrowDown.get(39);
     const up = realBindDown(binds, DODGE_INPUT_UP) || dodgeArrowDown.get(38);
@@ -8060,6 +8471,14 @@
 
   function dodgeApply(binds, dirIdx) {
     const d = DODGE_DIRS[dirIdx];
+    if (touchActive()) {
+      // The pads never reach the bind layer: on a touch device the movement
+      // half of the message is one analog vector off the left pad, so driving
+      // it means replacing that reading rather than holding four keys.
+      // Suppressing the user comes free — the reading being replaced is theirs.
+      touchDriveMove(d.x, d.y);
+      return;
+    }
     setInputHeld(binds, DODGE_INPUT_RIGHT, d.x > 0);
     setInputHeld(binds, DODGE_INPUT_LEFT, d.x < 0);
     setInputHeld(binds, DODGE_INPUT_UP, d.y > 0);
@@ -8071,6 +8490,7 @@
   }
 
   function dodgeRelease() {
+    touchReleaseMove();
     for (const inp of DODGE_MOVE_INPUTS) {
       heldInputs.delete(inp);
       setInputSuppressed(inp, false);
@@ -8511,6 +8931,8 @@
     fragState.targetId = null;
     fragState.haveLand = false;
     fragState.bearing = NaN; fragState.len = NaN;
+    touchReleaseAim('frag');
+    if (touchActive()) return;
     if (!realMouse.hasMoved) return;
     fragDispatch(Math.round(realMouse.x), Math.round(realMouse.y));
   }
@@ -8579,18 +9001,27 @@
       Number.isFinite(fragState.bearing) ? fragState : null;
     const sol = fragSolve(c, at.x, at.y, warm);
 
-    const scale = getLivePxPerWorldUnit(sample);
+    // A pad carries the throw as a bearing and a pull, so there is no screen
+    // point to put it at and no scale needed to get there. A mouse needs both,
+    // and a scale of zero means the camera isn't readable yet.
+    const touch = touchActive();
+    const scale = touch ? 1 : getLivePxPerWorldUnit(sample);
     if (!(scale > 0)) { fragRelease(); return; }
 
-    fragState.x = Math.round(window.innerWidth / 2 + sol.dx * sol.len * scale);
-    fragState.y = Math.round(window.innerHeight / 2 - sol.dy * sol.len * scale);
+    if (!touch) {
+      fragState.x = Math.round(window.innerWidth / 2 + sol.dx * sol.len * scale);
+      fragState.y = Math.round(window.innerHeight / 2 - sol.dy * sol.len * scale);
+    }
     fragState.targetId = enemy.id;
     fragState.err = sol.err;
     fragState.landX = sol.x; fragState.landY = sol.y; fragState.haveLand = true;
     fragState.bearing = Math.atan2(sol.dy, sol.dx);
     fragState.len = sol.len;
     fragState.driving = true;
-    fragDispatch(fragState.x, fragState.y);
+    // The solved cursor distance goes out as the pad's own pull. It is the
+    // whole of the throw's strength, and on a pad it is the only way to say it.
+    if (touch) touchDriveAim('frag', sol.dx, sol.dy, sol.len);
+    else fragDispatch(fragState.x, fragState.y);
   }
 
   function fragFrameTick() {
@@ -11074,15 +11505,7 @@
     // uses, so the green ring marks whoever the aim helper would engage. It
     // says nothing about whether there is a shot on them; that is what the
     // ring's fade is for.
-    const scale = getLivePxPerWorldUnit(sample);
-    let mwx, mwy;
-    if (realMouse.hasMoved) {
-      mwx = player.x + (realMouse.x - window.innerWidth / 2) / scale;
-      mwy = player.y - (realMouse.y - window.innerHeight / 2) / scale;
-    } else {
-      mwx = player.x;
-      mwy = player.y;
-    }
+    const aim = userAim(player);
     const now = Date.now();
     let best = null;
     let bestScore = Infinity;
@@ -11091,9 +11514,7 @@
       if (isSpoofedEnemy(e.id, pageSamples)) continue;
       if (!canInteract(player.layer, e.layer)) continue;
       const p = livePos(e.id, e);
-      const dx = p.x - mwx;
-      const dy = p.y - mwy;
-      const s = dx * dx + dy * dy;
+      const s = userAimScore(aim, player, p);
       if (s < bestScore) {
         bestScore = s;
         best = e;
