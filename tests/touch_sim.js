@@ -79,6 +79,7 @@ const PROJ_MAX_MOUSE_DIST = grabConst('PROJ_MAX_MOUSE_DIST');
 const PROJ_MOUSE_CLAMP = grabConst('PROJ_MOUSE_CLAMP');
 const TOUCH_STALE_MS = grabConst('TOUCH_STALE_MS');
 const AUTO_SWAP_INPUT_FIRE = grabConst('AUTO_SWAP_INPUT_FIRE');
+const AUTO_SWAP_INPUT_EQUIP_OTHER = grabConst('AUTO_SWAP_INPUT_EQUIP_OTHER');
 
 // ---- The shipped touch layer -------------------------------------------
 //
@@ -125,6 +126,16 @@ const elg = eval(`(function () {
   ${extract('touchReleaseAim')}
   ${extract('touchDriveMove')}
   ${extract('touchReleaseMove')}
+  const PLAYER_NET = 'netData';
+  const NET_WEAPON = 'activeWeapon';
+  const PLAYER_LOC = 'localData';
+  const LOC_SLOTS = 'weapons';
+  const LOC_CURIDX = 'curWeapIdx';
+  const AIMBOT = { enabled: 1 };
+  const AUTOSHOOT = { enabled: 1 };
+  ${grabBlock('GUN_FIRE_DELAY', '};')}
+  ${extract('getCurrentWeapon')}
+  ${extract('touchShotSuppressed')}
   ${extract('userFireDown')}
   ${extract('userAim')}
   ${extract('userAimScore')}
@@ -138,6 +149,8 @@ const elg = eval(`(function () {
   ${extract('autoSwapFrameTick')}
   return {
     autoSwapFrameTick,
+    setAimbotEnabled: (v) => { AIMBOT.enabled = v; },
+    setAutoshootEnabled: (v) => { AUTOSHOOT.enabled = v; },
     swaps: () => swapsQueued,
     resetSwaps: () => { swapsQueued = 0; autoSwapFireWasDown = false; },
     setAutoSwapEnabled: (v) => { AUTO_SWAP.enabled = v; },
@@ -282,6 +295,11 @@ function buildInputMsg(touch, binds, player, dt) {
   msg.toMouseLen = clamp(msg.toMouseLen, 0, MOUSE_MAX_DIST);
   msg.shootStart = binds.isBindPressed(AUTO_SWAP_INPUT_FIRE) || touch.shotDetected;
   msg.shootHold = binds.isBindDown(AUTO_SWAP_INPUT_FIRE) || touch.shotDetected;
+  // The equip-input loop that follows in the same build, outside the touch
+  // branch. Only the three auto-quickswap presses are listed; the other
+  // thirteen behave identically and nothing here presses them.
+  msg.inputs = [13 /* EquipMelee */, 19 /* EquipLastWeap */, 20 /* EquipOtherGun */]
+    .filter((i) => binds.isBindPressed(i));
   return msg;
 }
 
@@ -487,7 +505,108 @@ function angDiff(a, b) {
      'a paired controller counts as the trigger');
 }
 
-// ---- 6. Auto-quickswap's fire edge --------------------------------------
+// ---- 6. The pull is an activation, not a trigger ------------------------
+//
+// A pad has one gesture where a desktop has two fingers, so leaving the pull
+// wired to the trigger as well as to the activation means the gun fires
+// whenever the user is aiming — into walls, at nobody, and straight through
+// the slow-gun swap cycle, which depends on every shot being one autoshoot
+// took a magazine reading before.
+
+const GUN = { netData: { activeWeapon: 'mosin' } };        // slow, single-shot
+const MELEE = { netData: { activeWeapon: 'machete' } };
+const NADE = { netData: { activeWeapon: 'frag' }, throwableEquipped: true };
+
+{
+  const scene = newScene();
+  const range = scene.touch.padPosRange / scene.touch.shotPadDetectMult;
+  const hold = () => {
+    scene.touch.touches = [finger(scene.touch.rightLockedPadCenter, 0.4, range + 5)];
+  };
+
+  hold();
+  const msg = frame(scene, GUN);
+  ok('activation: holding the pad out does not fire the gun by itself',
+     msg.shootStart === false && msg.shootHold === false,
+     'shotDetected is recorded, then taken off the message');
+  ok('activation: ...but it is still the activation',
+     elg.userFireDown() === true && scene.touch.shotDetected === false,
+     'the aim helper engages off a trigger the game never sees');
+
+  // Autoshoot is now the only thing that can fire, which is the whole point.
+  scene.binds.synthetic.add(AUTO_SWAP_INPUT_FIRE);
+  const shot = frame(scene, GUN);
+  ok('activation: autoshoot still fires through the same message',
+     shot.shootStart === true && shot.shootHold === true, '');
+  scene.binds.synthetic.delete(AUTO_SWAP_INPUT_FIRE);
+
+  // The bug this fixes: a held pad trigger rides the same message as the swap,
+  // so the swapped-to gun's shot is spent before autoshoot ever reads its
+  // magazine, and a pair of slow guns trades places once and then stops.
+  scene.binds.synthetic.add(AUTO_SWAP_INPUT_EQUIP_OTHER);
+  const swap = frame(scene, GUN);
+  ok('activation: the tick that carries a swap carries no shot',
+     swap.inputs.includes(AUTO_SWAP_INPUT_EQUIP_OTHER) && swap.shootHold === false,
+     'the swapped-to gun is not fired before autoshoot has read its magazine');
+  scene.binds.synthetic.delete(AUTO_SWAP_INPUT_EQUIP_OTHER);
+
+  // Either switch hands the trigger straight back: with one off nothing else
+  // is going to fire, and the user would be left unarmed.
+  elg.setAutoshootEnabled(0);
+  ok('activation: turning autoshoot off hands the trigger back',
+     frame(scene, GUN).shootHold === true, '');
+  elg.setAutoshootEnabled(1);
+
+  elg.setAimbotEnabled(0);
+  ok('activation: turning the aimbot off hands the trigger back',
+     frame(scene, GUN).shootHold === true, '');
+  elg.setAimbotEnabled(1);
+
+  // A melee is not autoshoot's to swing.
+  ok('activation: a melee still swings on the user\'s own pull',
+     frame(scene, MELEE).shootHold === true, '');
+}
+
+// ---- 7. A cooking grenade keeps its trigger -----------------------------
+//
+// For a throwable `shotDetected` is not a trigger at all — it *is* the cook,
+// held up by a stickiness rule for as long as a finger is down. Dropping it
+// would throw the grenade on the spot.
+
+{
+  const scene = newScene();
+  const range = scene.touch.padPosRange / scene.touch.shotPadDetectMult;
+  const at = (px) => {
+    scene.touch.touches = px == null ? []
+      : [finger(scene.touch.rightLockedPadCenter, 0.4, px)];
+    return frame(scene, NADE);
+  };
+
+  at(range + 5);
+  ok('cook: pulling past the threshold starts the cook',
+     scene.touch.shotDetected === true, '');
+
+  // Frag aim drives the pull down to whatever the solved throw needs. That must
+  // not read back as letting go: the stickiness is computed from the real
+  // touch, and the toAimLen we write is discarded by the next real read.
+  elg.touchDriveAim('frag', 1, 0, 3);
+  const lobbing = at(range + 5);
+  ok('cook: a solver-driven short throw does not end the cook',
+     scene.touch.shotDetected === true && near(lobbing.toMouseLen, 3, 1e-9),
+     `wire carried a ${lobbing.toMouseLen.toFixed(1)}u throw with the cook still up`);
+
+  // Easing the thumb back mid-cook is also not letting go.
+  ok('cook: easing the thumb back mid-cook does not end it',
+     at(range - 20).shootHold === true && scene.touch.shotDetected === true,
+     `pulled ${(range - 20).toFixed(1)}px, well under the ${range.toFixed(1)}px threshold`);
+
+  // Lifting it is.
+  at(null);
+  ok('cook: lifting the thumb throws', scene.touch.shotDetected === false, '');
+  elg.touchReleaseAim('frag');
+}
+
+// ---- 8. Auto-quickswap's fire edge --------------------------------------
 //
 // The swap itself already reaches the wire on a pad: the loop that copies
 // pressed equip inputs onto the message runs outside the touch branch, off the
@@ -550,7 +669,7 @@ function angDiff(a, b) {
      `${elg.swaps()} queued`);
 }
 
-// ---- 7. Dodge movement drives all eight headings ------------------------
+// ---- 9. Dodge movement drives all eight headings ------------------------
 
 {
   const scene = newScene();
@@ -586,7 +705,7 @@ function angDiff(a, b) {
      `walking ${(bearingOf(back) * 180 / Math.PI).toFixed(1)}° at ${vlen(back).toFixed(2)}u/s`);
 }
 
-// ---- 8. The bot reads the user's heading, not its own -------------------
+// ---- 10. The bot reads the user's heading, not its own -------------------
 
 {
   const scene = newScene();
@@ -620,7 +739,7 @@ function angDiff(a, b) {
   elg.touchReleaseMove();
 }
 
-// ---- 9. Target selection without a cursor -------------------------------
+// ---- 11. Target selection without a cursor -------------------------------
 
 {
   const scene = newScene();
@@ -655,7 +774,7 @@ function angDiff(a, b) {
      elg.userAimScore(aim, player, { x: 1, y: 1 }), '');
 }
 
-// ---- 10. A desktop is untouched -----------------------------------------
+// ---- 12. A desktop is untouched -----------------------------------------
 
 {
   const scene = newScene();

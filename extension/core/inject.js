@@ -1823,7 +1823,7 @@
       // method is called from inside the `device.touch` branch and nowhere
       // else, so it firing *is* the branch being taken.
       touchState.lastSeenAt = performance.now();
-      try { return touchAimOverride(this, res); } catch { return res; }
+      try { return touchAimOverride(this, res, player); } catch { return res; }
     };
     t.getTouchMovement = function(camera) {
       const res = origMove.call(this, camera);
@@ -1857,7 +1857,7 @@
   const touchAimOut = { aimMovement: null, touched: true };
   const touchMoveOut = { toMoveDir: { x: 1, y: 0 }, toMoveLen: 0 };
 
-  function touchAimOverride(touch, res) {
+  function touchAimOverride(touch, res, player) {
     const am = res?.aimMovement || touch?.aimMovement;
     if (!am) return res;
 
@@ -1873,6 +1873,12 @@
     touchState.aimLen = Number(am.toAimLen) || 0;
     touchState.aimTouched = !!res?.touched;
     touchState.shot = !!touch?.shotDetected;
+    // Recorded above, then taken off the game: while autoshoot is the one
+    // pulling, the pad's pull is an activation and nothing else. See
+    // touchShotSuppressed.
+    if (touch && touchState.shot && touchShotSuppressed(player)) {
+      touch.shotDetected = false;
+    }
 
     if (!touchState.driveAim) {
       touchState.restDx = touchState.aimDx;
@@ -1987,6 +1993,55 @@
   // written to, and the bind goes through realBindDown. That is what keeps the
   // two things that watch this — the aim activation and auto-quickswap's fire
   // edge — from feeding back on autoshoot's own presses.
+  // Whether the user's own pad pull should still reach the wire as a shot.
+  //
+  // On a desktop the activation and the trigger are two different fingers:
+  // holding the bind aims, clicking fires, and autoshoot adds shots on top of
+  // whatever the user is doing. A pad has one gesture for both — the pull past
+  // `shotDetected` — and leaving that wired to the trigger as well as to the
+  // activation breaks the model in two visible ways:
+  //
+  //   * It fires with no shot on. The aim helper declining to aim at a blocked
+  //     or absent target is supposed to mean nothing goes out; a trigger the
+  //     user cannot release without also dropping the aim keeps firing anyway,
+  //     into walls and at nobody.
+  //   * It breaks the slow-gun swap. That cycle is driven by watching the
+  //     magazine fall below a reading taken just before *our* press. A held pad
+  //     trigger fires on the same server tick the swap input lands — both go
+  //     out on one message — so the new gun's shot is already spent by the time
+  //     the swap is observed and the gun is retired for a fresh one. The drop
+  //     is never seen against a pre-shot reading, no swap is queued off it, and
+  //     a pair of slow guns trades places exactly once and then sits there.
+  //
+  // So while autoshoot is in a position to do the firing, the pull becomes
+  // purely an activation and autoshoot owns the trigger outright — which is
+  // what holding the bind on a desktop already amounts to. `shotDetected` is
+  // read and recorded before it is dropped, so the activation, auto-quickswap's
+  // fire edge and everything else that watches the *user* still see it; only
+  // the outgoing message doesn't. It is read in exactly two places in the
+  // bundle — the sticky-cook line inside the pad reader itself, which has
+  // already run, and the message build, which hasn't — so this hook sits in the
+  // one gap where taking it away is total and costs nothing else. The aim line
+  // the pads draw reads `touchingAim`, not this, and still shows.
+  //
+  // Three cases are deliberately left alone, because in each the trigger is not
+  // autoshoot's to take:
+  //
+  //   * a throwable, whose `shotDetected` is not a trigger at all but the cook
+  //     itself — dropping it would throw the grenade on the spot;
+  //   * a melee, which autoshoot does not swing;
+  //   * autoshoot or the aimbot switched off, where nothing else is going to
+  //     fire and taking the trigger away would leave the user unarmed.
+  //
+  // The cost of the strict reading is that a gun cannot be fired at scenery —
+  // a crate, a door — while both are on. Turning Autoshoot off in the MOD tab
+  // hands the trigger straight back.
+  function touchShotSuppressed(player) {
+    if (!AIMBOT.enabled || !AUTOSHOOT.enabled) return false;
+    const weapon = getCurrentWeapon(player);
+    return !!weapon && GUN_FIRE_DELAY[weapon] !== undefined;
+  }
+
   function userFireDown(binds) {
     if (touchActive() && touchState.shot) return true;
     return realBindDown(binds || capturedGame?.[GAME_BINDS], AUTO_SWAP_INPUT_FIRE);

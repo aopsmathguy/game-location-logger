@@ -82,19 +82,68 @@ letting it back off hands the aim straight back.
 That threshold is survev's own. `shotDetected` goes up when the pad is pulled
 past `padPosRange / 1.075` — about 93% of full deflection — so the gesture the
 game already gives you for "aim without shooting" (a partial pull) is still
-exactly that, and the one it gives you for "shoot" now also aims. `shotDetected`
-is computed by the original reader before anything of ours runs and is never
-written to, so it stays the user's own trigger no matter what happens to the
-vector.
+exactly that, and the one it gives you for "shoot" now aims instead.
+`shotDetected` is computed by the original pad reader before anything of ours
+runs, so what we read is the user's own trigger no matter what happens to the
+vector afterwards.
 
 The bind is still consulted alongside it, because a paired controller or
 keyboard goes through it — and it is read past the synthetic-input layer via
 `realBindDown`, so autoshoot's own presses can't latch the aim on forever. That
-is the same precaution [auto-quickswap](../README.md#features) takes with its
+is the same precaution
+[auto-quickswap](#auto-quickswap-one-half-of-it-needed-moving) takes with its
 fire-edge detector, for the same reason.
 
 The "Aimbot key" row disappears from the MOD tab on a touch device, since it
 would be a dead control.
+
+## ...and only the aimbot
+
+Recording that trigger is not the same as letting it through, and it does not
+get to be both. Once it is the activation, **autoshoot owns the trigger
+outright**: `shotDetected` is read, stashed, and then cleared off the object
+before the message is built.
+
+Leaving it wired to both breaks the model in two ways you can see from the
+first firefight:
+
+- **It fires with no shot on.** The aim helper declining to aim at a blocked or
+  absent target is supposed to mean nothing goes out — see
+  [Selection, and declining to aim](aiming.md#selection-and-declining-to-aim).
+  A trigger you cannot release without also dropping the aim keeps firing
+  anyway, into walls and at nobody.
+- **It breaks the slow-gun swap.** That cycle watches the magazine fall below a
+  reading taken just before *autoshoot's* press — see
+  [How it pulls](autoshoot.md#how-it-pulls). A held pad trigger fires on the
+  same server tick the swap input lands, because both go out on one message. So
+  the swapped-to gun's shot is already spent by the time the new gun is
+  observed and its tracking reset, the drop is never seen against a pre-shot
+  reading, and a pair of slow guns trades places exactly once and then sits
+  there holding the trigger.
+
+With the pull reduced to an activation, both go away for the same reason: every
+shot that leaves the gun is one autoshoot decided on and took a reading before.
+That is what "the pull is the bind, not the click" actually has to mean.
+
+`shotDetected` is read in exactly two places in the bundle — the sticky-cook
+line inside the pad reader, which has already run by the time our hook does, and
+the message build, which hasn't — so this one write is total, and costs nothing
+else. The aim line the pads draw reads `touchingAim`, a separate field, and
+still shows.
+
+Three cases are left alone, because in none of them is the trigger autoshoot's
+to take:
+
+| | why |
+| --- | --- |
+| A throwable | `shotDetected` isn't a trigger there, it *is* the cook. Clearing it throws the grenade on the spot. |
+| A melee | Autoshoot doesn't swing. |
+| Autoshoot or the aimbot switched off | Nothing else is going to fire, and taking the trigger away would leave you unarmed. |
+
+The cost of the strict reading is real and worth knowing: **you cannot shoot
+scenery** — a crate, a door — while both switches are on, because there is no
+gesture left that means "fire at that". Turning Autoshoot off in the MOD tab
+hands the trigger straight back.
 
 # Driving the aim
 
@@ -179,8 +228,10 @@ two terms the input message itself takes the union of. Both halves of it are
 read past our synthetic layer, which is what keeps autoshoot's own presses from
 queueing a swap on every burst it fires.
 
-Autoshoot's *own* use of the swap was never affected: it queues off its presses
-and the magazine drop, not off this edge.
+Autoshoot's *own* use of the swap was never affected by the edge — it queues off
+its presses and the magazine drop, not off this. It was, separately, broken by
+the pad trigger riding the same message as the swap; see
+[...and only the aimbot](#and-only-the-aimbot).
 
 # Dodge: one vector instead of four keys
 

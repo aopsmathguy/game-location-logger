@@ -106,9 +106,11 @@ none of them touches input or gameplay state.
   from two virtual pads instead of from a mouse and four keys. There is no key
   to hold, so the **shot is the switch**: pulling the right pad far enough to
   fire turns the aim helper and autoshoot on together, and is also what
-  auto-quickswap takes as the trigger pull. The dodge bot writes the movement
-  vector the left pad would have produced, and frag aim encodes its solved
-  throw strength as a pad deflection. See
+  auto-quickswap takes as the trigger pull. The pull is *only* an activation —
+  autoshoot owns the trigger from there, so the gun stays silent when there is
+  no shot on, exactly as holding the bind does on a desktop. The dodge bot
+  writes the movement vector the left pad would have produced, and frag aim
+  encodes its solved throw strength as a pad deflection. See
   [On a phone](docs/mobile.md#on-a-phone).
 
 ## Install
