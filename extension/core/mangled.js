@@ -32,6 +32,8 @@ window.__SURVEV_MANGLED__ = {
     dead:         'ZvC',
     downed:       'GxpD',
     scale:        'MQCs',
+    animType:     'gPDsSd',
+    animSeq:      'qCu',
   },
 
   // ---- Player.localData (the sub-object named by player.localData above) ----

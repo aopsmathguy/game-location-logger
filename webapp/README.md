@@ -1,7 +1,7 @@
 # webapp — survev.io mirror with the toolkit preloaded
 
 A reverse proxy that serves survev.io from your own origin with
-`core/mangled.js` + `core/inject.js` already injected. Open it in any browser — no
+`extension/core/mangled.js` + `extension/core/inject.js` already injected. Open it in any browser — no
 extension install, no unpacked-extension reload, no Chrome-only requirement.
 Everything the extension does in the MOD tab works exactly the same, because
 it is the same two files, loaded at the same point in page startup.
@@ -26,7 +26,8 @@ No dependencies — Node 18+ and the standard library.
 
 **Script injection.** HTML responses get four `<script>` tags spliced in
 immediately after `<head>`: a generated config, `public/ws-shim.js`, and the
-toolkit's own `core/mangled.js` and `core/inject.js` read straight off disk.
+toolkit's own `extension/core/mangled.js` and `extension/core/inject.js`
+read straight off disk.
 The manifest loads those last two as `world: "MAIN"`, `run_at:
 "document_start"` content scripts; a classic blocking script at the top of
 `<head>` reproduces that timing exactly, because survev ships its bundles as
@@ -125,8 +126,8 @@ carried no reason at all.
 | `public/ws-shim.js`  | Page-world `WebSocket` constructor patch                          |
 | `package.json`       | `npm start`; no dependencies                                      |
 
-`core/mangled.js` and `core/inject.js` are **not** copied here — they are read
-live from `core/`, the same files the extension loads through its `core`
-symlink, so the mirror and the extension can never drift apart. After a survev
+`extension/core/mangled.js` and `extension/core/inject.js` are **not** copied
+here — they are read live from `extension/core/`, the same files the extension
+itself loads, so the mirror and the extension can never drift apart. After a survev
 deploy re-mangles the bundle, re-run `tools/fetch_survev_js.py` and
 `tools/derive_mangled.py` and just reload the page.

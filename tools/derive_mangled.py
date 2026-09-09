@@ -27,12 +27,12 @@ from collections.abc import Callable
 from pathlib import Path
 
 # Anchored at the repo root: this script lives in tools/, reads the bundle
-# cache at the root, and writes the dictionary that core/ shares between the
+# cache at the root, and writes the dictionary that extension/core/ shares between
 # extension and the webapp.
 REPO_ROOT = Path(__file__).resolve().parent.parent
 JS_DUMP = REPO_ROOT / "js_dump"
-MANGLED_JS = REPO_ROOT / "core" / "mangled.js"
-BACKUP_JS = REPO_ROOT / "core" / "mangled.js.bak"
+MANGLED_JS = REPO_ROOT / "extension" / "core" / "mangled.js"
+BACKUP_JS = REPO_ROOT / "extension" / "core" / "mangled.js.bak"
 
 # Mangled-identifier shape. survev mangles to 2–8 char mixed-case identifiers,
 # but we don't bound length — capture any plausible JS ident.
@@ -493,6 +493,8 @@ window.__SURVEV_MANGLED__ = {{
     dead:         {q("netData.dead")},
     downed:       {q("netData.downed")},
     scale:        {q("netData.scale")},
+    animType:     {q("netData.animType")},
+    animSeq:      {q("netData.animSeq")},
   }},
 
   // ---- Player.localData (the sub-object named by player.localData above) ----
@@ -632,6 +634,19 @@ def main() -> None:
         # <cfg>.player.radius`), so the dodge bot's hitbox is wrong without it.
         # Written in the same assignment run as activeWeapon/dead/downed.
         ("netData.scale",         lambda: derive_field_on(text, values["player.netData"], "scale",        "netData.scale",        start=p_start)),
+        # The animation the server last told this player to play, and its
+        # sequence number. Written in the same assignment run as the four
+        # above, off `e.animType` / `e.animSeq`.
+        #
+        # The dodge bot reads these to time a grenade cook: the server plays
+        # Anim.Cook the instant a pin comes out and Anim.Throw in the same call
+        # that creates the projectile, so the pair brackets a throw exactly.
+        # The client also keeps a render-side `player.anim` under readable
+        # names, but it resets `anim.type` locally without touching `anim.seq`,
+        # so a transition can be hidden there. netData is the verbatim wire
+        # copy and nothing local writes to it.
+        ("netData.animType",      lambda: derive_field_on(text, values["player.netData"], "animType",     "netData.animType",     start=p_start)),
+        ("netData.animSeq",       lambda: derive_field_on(text, values["player.netData"], "animSeq",      "netData.animSeq",      start=p_start)),
         ("localData.zoom",        lambda: derive_field_on(text, values["player.localData"], "zoom",       "localData.zoom",       start=p_start)),
         ("localData.curWeapIdx",  lambda: derive_field_on(text, values["player.localData"], "curWeapIdx", "localData.curWeapIdx", start=p_start)),
         ("localData.weapons",     lambda: derive_local_weapons(text, values["player.localData"], p_start)),

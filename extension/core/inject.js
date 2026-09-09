@@ -22,6 +22,11 @@
   const PLAYER_POS2  = M.player.posAlt;
   const PLAYER_DIR2  = M.player?.dirAlt;
   const NET_WEAPON   = M.netData.activeWeapon;
+  // The animation the server last told a player to play, and its sequence
+  // number, straight off the wire. The dodge bot brackets a grenade cook with
+  // them — see trackCookAnims.
+  const NET_ANIM     = M.netData?.animType;
+  const NET_ANIMSEQ  = M.netData?.animSeq;
   const NET_DEAD     = M.netData.dead;
   const NET_DOWNED   = M.netData.downed;
   const NET_SCALE    = M.netData?.scale;
@@ -209,6 +214,82 @@
     bullet_colt45: 110, bullet_m1911: 88, bullet_m1a1: 88, bullet_deagle: 120,
     bullet_sw500: 160, bullet_flare: 16, bullet_invis: 1,
   };
+
+  // ---- Throwables -------------------------------------------------------
+  //
+  // throwable type (the projectile's own `type`, which IS on the wire) -> the
+  // physics constants the server integrates it with, transcribed from survev's
+  // `shared/defs/gameObjects/throwableDefs.ts`. Same standing as the bullet
+  // tables above: static, and re-derived if survev ships new throwables.
+  //
+  // Only what the blast prediction needs is here. `velZ` and `fuse` are the two
+  // that cannot be recovered any other way — neither is on the wire — and they
+  // are what make the arc solvable and the detonation datable at all. See
+  // dodgeProjFuse and dodgeSimBlast.
+  //
+  // `impact` types explode on contact rather than on a fuse (the potato-mode
+  // guns, snowballs, coconuts), and their `fuse` is survev's own 9999 sentinel.
+  // They are listed for completeness and rejected in dodgeAddBlasts: their
+  // detonation is a collision, not a clock, and predicting it means predicting
+  // whose body they hit.
+  //
+  // `variance` is added to the fuse at spawn from a uniform draw the wire never
+  // carries, so it is genuinely unknowable — it is carried here so the estimate
+  // can be biased *early* by it rather than pretending it is zero.
+  const THROWABLE_PHYS = {
+    frag:        { fuse: 4,   variance: 0,   velZ: 5, speed: 20,    rad: 1,    cookable: 1, impact: 0, blast: 'explosion_frag' },
+    mirv:        { fuse: 4,   variance: 0,   velZ: 5, speed: 20,    rad: 1,    cookable: 1, impact: 0, blast: 'explosion_mirv' },
+    mirv_mini:   { fuse: 1.8, variance: 0.3, velZ: 5, speed: 20,    rad: 1,    cookable: 1, impact: 0, blast: 'explosion_mirv_mini' },
+    martyr_nade: { fuse: 3,   variance: 0.3, velZ: 5, speed: 20,    rad: 1,    cookable: 1, impact: 0, blast: 'explosion_martyr_nade' },
+    smoke:       { fuse: 2.5, variance: 0,   velZ: 5, speed: 15,    rad: 1,    cookable: 0, impact: 0, blast: 'explosion_smoke' },
+    strobe:      { fuse: 13.5,variance: 0,   velZ: 5, speed: 25,    rad: 1,    cookable: 0, impact: 0, blast: 'explosion_strobe' },
+    bomb_iron:   { fuse: 4,   variance: 0,   velZ: 0, speed: 20,    rad: 1,    cookable: 1, impact: 1, blast: 'explosion_bomb_iron' },
+    snowball:        { fuse: 9999, variance: 0, velZ: 3.35, speed: 52, rad: 1,    cookable: 1, impact: 1, blast: 'explosion_snowball' },
+    snowball_heavy:  { fuse: 9999, variance: 0, velZ: 3.35, speed: 45, rad: 1.25, cookable: 1, impact: 1, blast: 'explosion_snowball_heavy' },
+    potato:          { fuse: 9999, variance: 0, velZ: 3.35, speed: 40, rad: 1,    cookable: 1, impact: 1, blast: 'explosion_potato' },
+    potato_heavy:    { fuse: 9999, variance: 0, velZ: 3.35, speed: 45, rad: 1.25, cookable: 1, impact: 1, blast: 'explosion_potato_heavy' },
+    coconut:         { fuse: 9999, variance: 0, velZ: 3.35, speed: 45, rad: 1.15, cookable: 0, impact: 1, blast: 'explosion_coconut' },
+    tomato:          { fuse: 9999, variance: 0, velZ: 3.35, speed: 55, rad: 1,    cookable: 1, impact: 1, blast: 'explosion_tomato' },
+  };
+
+  // explosion type -> [damage at the centre, rad.min, rad.max], from
+  // `shared/defs/gameObjects/explosionsDefs.ts`. The blast is flat at `damage`
+  // out to rad.min and then ramps to zero at rad.max — see dodgeBlastDamage,
+  // which is where the ramp's slightly surprising shape is written down.
+  //
+  // Shrapnel is deliberately not here. Every fuse throwable also throws 8-12
+  // pellets at `v2.randomUnit()` directions, which is not a thing a planner can
+  // be given an opinion about: the draw happens on the server at detonation and
+  // there is no version of it we could be right about. Modelling it would put
+  // noise into the loss and nothing else. So this prices the core blast alone,
+  // which is the part that is deterministic given a position and a time.
+  const BLAST_DEFS = {
+    explosion_frag:        [125, 5,    12],
+    explosion_mirv:        [125, 5,    12],
+    explosion_mirv_mini:   [75,  4,    8],
+    explosion_martyr_nade: [80,  4.5,  9],
+    explosion_bomb_iron:   [40,  5,    14],
+    explosion_smoke:       [0,   5,    12],
+    explosion_strobe:      [1,   1.5,  2.5],
+  };
+
+  // GameConfig.projectile gravity, from survev's own projectile.ts, where the
+  // number is documented as fitted to recorded packets rather than chosen.
+  const PROJ_GRAVITY = 10.5;
+  // The height a throw leaves the hand at (`spawnHeight` in throwThrowable) and
+  // the offset from the thrower's centre it leaves at: `rotate({0.5,-1.0}, aim)`,
+  // whose length is what matters to us and not its direction.
+  const PROJ_SPAWN_Z = 0.5;
+  const PROJ_SPAWN_OFFSET = Math.hypot(0.5, 1.0);
+  // Ground drag, applied as `vel /= 1 + dt*drag` and only while the projectile
+  // is resting on the floor (or on whatever obstacle is below it) — never in
+  // the air, which is what makes the airborne leg a straight line at constant
+  // speed. Water is the same law with a harder constant.
+  const PROJ_DRAG = 2.3;
+  const PROJ_DRAG_WATER = 5;
+  // survev's Anim enum, and the two values that bracket a throw.
+  const ANIM_COOK = 2;
+  const ANIM_THROW = 3;
 
   function looksLikePlayer(obj) {
     // The Player class (`er`) declares many of its sprite fields with real
@@ -3100,7 +3181,7 @@
       realMouse.y = e.clientY;
       realMouse.hasMoved = true;
     }
-    if (!aimHeld || !e.isTrusted) return;
+    if ((!aimHeld && !fragActive()) || !e.isTrusted) return;
     e.stopImmediatePropagation();
     e.preventDefault();
   }, true);
@@ -3190,6 +3271,17 @@
     // and worth having off: a line redrawn every 16ms over the middle of a
     // firefight is a lot of ink.
     path: 0,
+    // Draw, for every grenade in the air, the blast it is going to make: two
+    // red rings at the detonation point — the full-damage plateau and the outer
+    // edge of any damage at all — and the seconds left on its fuse over the
+    // grenade itself.
+    //
+    // Display only, and independent of whether the bot is on. It is drawn from
+    // the same per-packet flight records the planner is scored against, so what
+    // is on screen is what the loss is using and not a second opinion about it.
+    // Off by default: a 12u circle is a lot of ink for something that is only
+    // interesting for a few seconds a match.
+    rings: 0,
     // How far ahead a plan is scored. Long enough to see the second bullet
     // of a burst, short enough that the enemy's own aim hasn't gone stale.
     horizon: 0.8,
@@ -3273,6 +3365,19 @@
     // as fire and the bot will not stand in a line it could leave. At 0 none of
     // it runs, and the bot is exactly what it was before: rounds only.
     phantom: 0.35,
+    // What a grenade's blast is worth, as a multiplier on the damage it would
+    // actually do. Unlike `phantom` this is not a probability of anything — a
+    // fuse that runs out is not a guess — so 1 is the honest setting and the
+    // default. It is a knob at all because a blast is the one threat here whose
+    // *timing* is partly inferred, and because a 12u radius is wide enough that
+    // a bot answering one moves a long way: turn it down to make the planner
+    // weigh a nade against the rounds in the air more cheaply, or to 0 to go
+    // back to rounds and firing lines only.
+    //
+    // Only the core blast is priced. Shrapnel is 12 pellets in directions drawn
+    // on the server at detonation, which is not something a plan can be right
+    // about — see BLAST_DEFS.
+    blast: 1,
     // Seconds one decision covers. horizon/stepS is how many decisions the
     // plan gets, and the search is a shortest path over (cell, time) — see
     // dodgeDpPlan.
@@ -3281,6 +3386,18 @@
     // faithful and squarely more expensive; 0.2 measured a fifth of a point
     // better than 0.35 for nearly twice the time.
     cell: 0.35,
+  };
+
+  // Aim the throw at the instant it is released. Declared up here rather than
+  // beside the code that uses it, for the same reason AUTO_SWAP is:
+  // SETTINGS_SPECS binds a row to it below and would hit the temporal dead zone
+  // otherwise.
+  const FRAGBOT = {
+    // Off by default. This is the one thing in the mod that changes where a
+    // throw *goes* rather than what is known about it — everything else here
+    // reads the world or drives our own feet, and a grenade that lands
+    // somewhere the user did not point is a different kind of thing.
+    enabled: 0,
   };
 
   // ---------------------------------------------------------------------
@@ -3332,12 +3449,15 @@
     { id: 'dodge.enabled',  store: DODGE, key: 'enabled',   label: 'Dodge bot', kind: 'toggle',
       section: 'Dodge bot' },
     { id: 'dodge.path',     store: DODGE, key: 'path',      label: 'Show plan', kind: 'toggle' },
+    { id: 'dodge.rings',    store: DODGE, key: 'rings',     label: 'Grenade rings', kind: 'toggle' },
+    { id: 'frag.enabled',   store: FRAGBOT, key: 'enabled',  label: 'Frag aim', kind: 'toggle' },
     { id: 'dodge.horizon',  store: DODGE, key: 'horizon',   label: 'Horizon',      unit: 's',  min: 0.2,  max: 2,    step: 0.05, decimals: 2 },
     { id: 'dodge.clearance', store: DODGE, key: 'clearance', label: 'Clearance',               min: 0.05, max: 1.5,  step: 0.05, decimals: 2 },
     { id: 'dodge.halfLife', store: DODGE, key: 'halfLife',  label: 'Hit half-life', unit: 's', min: 0.1,  max: 5,    step: 0.05, decimals: 2 },
     { id: 'dodge.leadK',    store: DODGE, key: 'leadK',     label: 'Ping lead',                min: 0,    max: 2,    step: 0.05, decimals: 2 },
     { id: 'dodge.follow',   store: DODGE, key: 'follow',    label: 'Follow input',             min: 0,    max: 5,    step: 0.1,  decimals: 1 },
     { id: 'dodge.phantom',  store: DODGE, key: 'phantom',   label: 'Firing lines',             min: 0,    max: 1,    step: 0.05, decimals: 2 },
+    { id: 'dodge.blast',    store: DODGE, key: 'blast',     label: 'Grenades',                 min: 0,    max: 1,    step: 0.05, decimals: 2 },
     { id: 'dodge.stepS',    store: DODGE, key: 'stepS',     label: 'Step',         unit: 's',  min: 0.03, max: 0.3,  step: 0.01, decimals: 2 },
     { id: 'dodge.cell',     store: DODGE, key: 'cell',      label: 'Grid',         unit: 'u',  min: 0.05, max: 0.5,  step: 0.05, decimals: 2 },
     { id: 'aim.reactionMs',     store: AIM_HUMAN, key: 'reactionMs',     label: 'Reaction',  unit: 'ms', min: 0,    max: 400,  step: 5,    decimals: 0,
@@ -4676,6 +4796,12 @@
     // slot leaving the set changes this; a slot handed straight back out to a
     // new round inside one gap would not, which is what dodgeBulletAdds is for.
     liveKey: 0,
+    // The same identity, for the grenades in the air. Their own detonation is
+    // an event the packet counter does not carry either: a fuse runs out on the
+    // server's clock, and the projectile is simply gone from the next update —
+    // which is a change of set, and a plan written against it has to be dropped
+    // rather than played out against a blast that has already happened.
+    blastKey: 0,
     speed: DODGE_SPEED_FALLBACK,
     selfR: PLAYER_RADIUS,
     // The last DODGE_SPEED_WINDOW packet deltas that showed movement, as a
@@ -4769,6 +4895,575 @@
       }
     } catch {}
     return null;
+  }
+
+  // ---- Finding the grenades ---------------------------------------------
+  //
+  // Same argument, one field shorter. The projectile barn is the only object
+  // the Game owns with a `projectilePool`, and that name is a real readable
+  // class field in the bundle — as are `pos`, `posZ`, `dir`, `type`, `layer`
+  // and `rad` on the entries it pools, because every one of them is copied
+  // straight off the wire. The pool's own accessor is the same mangled
+  // `m_getPool` every other pool uses, which mangled.js already names.
+  let cachedProjBarnKey = null;
+
+  function looksLikeProjBarn(v) {
+    return !!v && typeof v === 'object' && !!v.projectilePool &&
+      typeof v.projectilePool[POOL_GETALL] === 'function';
+  }
+
+  function findProjBarn(game) {
+    if (!game || typeof game !== 'object') return null;
+    try {
+      if (cachedProjBarnKey) {
+        const v = game[cachedProjBarnKey];
+        if (looksLikeProjBarn(v)) return v;
+        cachedProjBarnKey = null;
+      }
+      const names = Object.getOwnPropertyNames(game);
+      for (let i = 0; i < names.length; i++) {
+        if (looksLikeProjBarn(game[names[i]])) {
+          cachedProjBarnKey = names[i];
+          return game[names[i]];
+        }
+      }
+    } catch {}
+    return null;
+  }
+
+  function getProjectiles() {
+    const barn = findProjBarn(capturedGame);
+    if (!barn) return [];
+    const all = barn.projectilePool[POOL_GETALL]();
+    return Array.isArray(all) ? all : [];
+  }
+
+  // ---- Dating a throw ----------------------------------------------------
+  //
+  // A grenade's fuse is the one number the blast prediction cannot do without
+  // and the wire does not carry. What it does carry is the *animation*: the
+  // server calls playAnim(Anim.Cook, fuseTime) the instant the pin comes out
+  // and playAnim(Anim.Throw, ...) the instant it leaves the hand, and both ride
+  // the player's full update as animType/animSeq. The client copies them into
+  // `player.anim.type` and `player.anim.seq` — a plain object under a readable
+  // field name, so no mangled.js entry — and those two transitions bracket the
+  // cook exactly.
+  //
+  // That is worth the bookkeeping because cooking is the whole difficulty. An
+  // uncooked frag detonates 4s after it is thrown and is at rest for the last
+  // second and a half of that; a nade cooked for three detonates about where it
+  // lands, and treating the two the same is the difference between a threat the
+  // planner has time to answer and one it never sees coming.
+  //
+  // Sampled per packet rather than per frame, on the same hook and for the same
+  // reason as snapshotPlayers: a TCP burst of eight updates has to read as eight
+  // ticks of cooking, not as one frame of it.
+  const dodgeCook = new Map();     // player __id -> cook state
+  // How stale the last sight of a player may be and still count as having
+  // watched their cook begin. One tick of slack, because a player standing
+  // still sends nothing new to be dirty about and can skip an update.
+  const DODGE_COOK_GAP_TICKS = 2;
+
+  // How long a cook has been running, in seconds.
+  //
+  // Measured in pseudotime — the clock the netcode block recovers — because
+  // that is what the tick indices mean, and it is jitter-free by construction.
+  // Wall time is the fallback rather than a fabricated tick length: survev's
+  // netSyncTps is 33, so a made-up 50ms would inflate every cook by two thirds
+  // and read a 2s cook as 3.3s, which is a fifth of a frag's fuse invented out
+  // of nothing.
+  // Is this player cooking right now, and if so what are they holding?
+  //
+  // Three ways a cook ends and all three have to be caught, because a cook that
+  // does not end is a ring expanding forever on somebody who is holding
+  // nothing. Two are transitions — the animation leaves Cook, or the player
+  // stops sending updates at all — and the third is the clock: a cook cannot
+  // outlive its own fuse, because the server force-throws at `cookTicker >
+  // fuseTime` and the Cook animation is given exactly that long to run. If we
+  // ever get past it, the grenade left their hand while we were not looking.
+  function dodgeCookPhys(st, n) {
+    if (!st || st.startN < 0) return null;
+    if (n - st.lastN > DODGE_COOK_GAP_TICKS) return null;
+    const phys = THROWABLE_PHYS[st.weap];
+    if (!phys || phys.impact) return null;
+    if (dodgeCookElapsed(st, n) >= phys.fuse) return null;
+    return phys;
+  }
+
+  function dodgeCookElapsed(st, n) {
+    if (netClock.ready && netClock.slope > 0) {
+      return Math.max(0, (n - st.startN) * netClock.slope / 1000);
+    }
+    return Math.max(0, (Date.now() - st.startAt) / 1000);
+  }
+
+  function trackCookAnims(game) {
+    const n = netClock.n - 1;
+    if (n < 0) return;
+    const roster = findRosterOnGame(game) || game?.[GAME_ROSTER];
+    const pool = roster?.playerPool;
+    if (!pool || typeof pool[POOL_GETALL] !== 'function') return;
+    const players = pool[POOL_GETALL]() || [];
+    for (const p of players) {
+      if (!p || !p.active) continue;
+      const id = Number(p.__id ?? 0);
+      if (!id) continue;
+      // netData first, and the render-side `player.anim` only as a fallback.
+      //
+      // Both carry the same two numbers, but only one of them carries only what
+      // the server said. `player.anim` is the animation the client is *playing*:
+      // it resets `anim.type` to None locally, without touching `anim.seq`,
+      // when the selected animation has no data and when the active weapon
+      // stops being a throwable. Neither fires during a real cook, so reading
+      // it worked — but a transition detected by a sequence change and then
+      // classified by a type that something local may have rewritten is a
+      // fragile pair, and the whole fuse estimate hangs off it. netData is the
+      // verbatim wire copy and nothing but the packet writes to it.
+      const nd = p[PLAYER_NET];
+      const anim = p.anim;
+      const wireType = NET_ANIM ? nd?.[NET_ANIM] : undefined;
+      const wireSeq = NET_ANIMSEQ ? nd?.[NET_ANIMSEQ] : undefined;
+      const type = Number(wireType ?? anim?.type);
+      const seq = Number(wireSeq ?? anim?.seq);
+      if (!Number.isFinite(type) || !Number.isFinite(seq)) continue;
+      let st = dodgeCook.get(id);
+      if (!st) {
+        st = { seq: NaN, startN: -1, startAt: 0, seen: false, lastN: n,
+               throwN: -1, cooked: 0, exact: false, weap: '',
+               losN: -1, los: true };
+        dodgeCook.set(id, st);
+      }
+      // How long since we last had an update about this player, captured before
+      // lastN is moved on. A player only sends updates while we can see them,
+      // so a gap here is a gap in the record and not a quiet tick.
+      const gap = n - st.lastN;
+      st.lastN = n;
+      if (seq === st.seq) { st.seen = true; continue; }
+      const watched = st.seen && gap <= DODGE_COOK_GAP_TICKS;
+      st.seq = seq;
+      st.seen = true;
+      if (type === ANIM_COOK) {
+        st.startN = n;
+        st.startAt = Date.now();
+        // What they had in hand when the pin came out. Recorded here rather
+        // than read at the throw, because the throw removes the grenade from
+        // the inventory and a player throwing their last one has already
+        // switched weapons by the time the packet is built.
+        st.weap = String(nd?.[NET_WEAPON] ?? '');
+        // Only a cook we were *already watching* when it began is a cook we can
+        // time, and "already watching" means the tick before this one — not
+        // merely having seen this player at some point in the round.
+        //
+        // A player cooking out of our view sends no updates at all. When they
+        // walk back in, their animSeq has moved and their animType is Cook, and
+        // nothing about that packet distinguishes a pin pulled just now from
+        // one pulled three seconds ago behind a wall. Dating it from the moment
+        // they reappeared silently drops however long they had been holding it,
+        // which is the whole of the fuse that matters — and calling that exact
+        // is worse than not having it, because the estimate then stops being
+        // treated as an upper bound anywhere downstream.
+        st.exact = watched;
+      } else {
+        // ANY animation that is not Cook ends the cook, and that has to be the
+        // rule rather than "Anim.Throw does".
+        //
+        // Throwing by switching back to a gun — which is how most grenades are
+        // actually thrown — runs `throwThrowable()` and `cancelAnim()` in the
+        // same server tick, and cancelAnim sets animType to None and bumps the
+        // sequence again. Only the last state of a tick reaches the wire, so
+        // what we see is Cook -> None and the Anim.Throw in between never
+        // existed as far as any packet is concerned. Watching for Throw alone
+        // left the cook running forever: a ring expanding on somebody who threw
+        // their grenade several seconds ago, and — quietly — no thrower and no
+        // cook time for the grenade that actually appeared.
+        //
+        // Leaving Cook is therefore treated as the throw. The two ways that can
+        // be a lie are both harmless: a cook cancelled inside cookTime never
+        // produced a grenade, and a cancelAnim from somewhere else entirely
+        // (a revive) did not either — and the only thing that reads `throwN`
+        // needs a projectile to appear in the same handful of ticks before it
+        // will name anyone.
+        if (st.startN >= 0) {
+          st.throwN = n;
+          st.cooked = dodgeCookElapsed(st, n);
+        } else if (type === ANIM_THROW) {
+          // A throw we never saw the start of: they were cooking before we were
+          // watching. Names them as the owner, claims no cook time.
+          st.throwN = n;
+          st.cooked = 0;
+          st.exact = false;
+        }
+        st.startN = -1;
+      }
+    }
+  }
+
+  // ---- Watching a grenade fly --------------------------------------------
+  //
+  // The wire gives a projectile `pos`, `posZ` and `dir` per tick and its `type`
+  // and `layer` on a full update. It does not give velocity, and it does not
+  // give the fuse. Both are recovered here, once per packet, and everything the
+  // blast prediction does afterwards is a function of what this holds.
+  //
+  //   velocity   is the tick-to-tick displacement. It is worth more than it
+  //              looks: the server applies drag *only* while the projectile is
+  //              resting on the floor, never in the air, so horizontal velocity
+  //              is exactly constant for the whole flight and one delta measures
+  //              it outright rather than sampling something that is changing.
+  //
+  //   velZ       is not measured at all. It is `throwPhysics.velZ - g*age`, and
+  //              `age` is tracked from the tick the projectile appeared. There
+  //              is no bounce in Z — posZ is clamped at the floor and velZ just
+  //              stays negative — so one arc covers the whole life.
+  //
+  //   age        is 0 for a grenade we watched spawn, and otherwise inverted out
+  //              of the arc: posZ(t) = z0 + velZ*t - g*t^2/2 solves for t in
+  //              closed form, and posZ is on the wire to 10 bits over [0,5].
+  //              Near the ground that dates it to under a millisecond; at the
+  //              apex, where velZ passes through zero, it is worthless, which is
+  //              why the descending root is taken until a second snapshot says
+  //              otherwise. Descending is also the larger root, so the
+  //              unresolved case reads as the older grenade — the one that goes
+  //              off sooner, which is the side to be wrong on.
+  //
+  //   thrower    is not on the wire either. A throw leaves the hand at
+  //              `player.pos + rotate({0.5,-1.0}, aim)` — 1.118u out — so the
+  //              nearest player to a fresh spawn names it. That decides friend
+  //              from foe, and it has to: a squadmate's frag cannot hurt us at
+  //              all (Player.damage returns early on a shared teamId) while our
+  //              own can hurt us in full (the same test is skipped when the
+  //              source is us), so getting this backwards either walks the bot
+  //              off a harmless nade or leaves it standing on our own.
+  const dodgeProj = new Map();     // projectile __id -> flight record
+  const DODGE_PROJ_SPAWN_TOL = 0.6;   // slack on the 1.118u hand offset
+  const DODGE_PROJ_THROW_TICKS = 3;   // how stale a Cook->Throw may be and still be this grenade's
+
+  function dodgeProjAge(z, velZ0, descending) {
+    // z = z0 + velZ0*t - g*t^2/2, solved for t. The discriminant goes negative
+    // only for a posZ above the arc's own apex, which is a projectile that was
+    // not thrown by a player — an airdropped bomb, say — and has no age we can
+    // claim to know.
+    const disc = velZ0 * velZ0 - 2 * PROJ_GRAVITY * (z - PROJ_SPAWN_Z);
+    if (!(disc >= 0)) return null;
+    const root = Math.sqrt(disc);
+    return ((descending ? velZ0 + root : velZ0 - root) / PROJ_GRAVITY);
+  }
+
+  // Water more than doubles the ground drag (5 against 2.3), which more than
+  // halves the slide, so a grenade that lands in a river stops about where it
+  // lands. The client's own map answers this under a readable method name — it
+  // is what the projectile barn calls for the ripple effect — and it is
+  // sampled per packet rather than per simulated step, so a grenade sliding out
+  // of a river is a tick late noticing. Worth what it costs: at the speeds a
+  // landing grenade still carries, the two drags disagree by several units.
+  function dodgeProjInWater(pos, layer) {
+    try {
+      const map = findMapOnGame(capturedGame);
+      const surf = map?.getGroundSurface?.(pos, layer);
+      return surf?.type === 'water';
+    } catch { return false; }
+  }
+
+  // How far a spawn at (sx, sy) is from where a player at (px, py) aiming
+  // (dx, dy) could have put one.
+  //
+  // Not a distance to the player: the throw leaves the hand, and the hand is a
+  // *known* place. `rotate({0.5,-1.0}, aim)` is 1.118u out at 63.4 degrees off
+  // the aim, so the expected point is fixed by two things both on the wire, and
+  // the answer is oriented rather than a circle around the body. Two players
+  // shoulder to shoulder throwing at once are told apart by which way they were
+  // looking, which a radius never could.
+  //
+  // Measured to the *segment* from the body to that point, not to the point,
+  // because the server clips the spawn back along exactly that segment when a
+  // wall is in the way — `intersectSegment(obj.collider, player.pos, pos)`. So
+  // the set of legal spawns is the segment, and anywhere on it is a perfect
+  // match rather than an error of up to a hand's length.
+  function dodgeThrowSpawnDist(px, py, dx, dy, sx, sy) {
+    const a = Math.atan2(dy, dx);
+    const cos = Math.cos(a), sin = Math.sin(a);
+    // v2.rotate({0.5, -1.0}, a)
+    const hx = px + 0.5 * cos + sin;
+    const hy = py + 0.5 * sin - cos;
+    const ex = hx - px, ey = hy - py;
+    const len2 = ex * ex + ey * ey;
+    let t = len2 > 1e-9 ? ((sx - px) * ex + (sy - py) * ey) / len2 : 0;
+    t = t < 0 ? 0 : (t > 1 ? 1 : t);
+    return Math.hypot(px + ex * t - sx, py + ey * t - sy);
+  }
+
+  // Who threw it.
+  //
+  // The wire never says, but it says two things that together very nearly do.
+  //
+  // The server calls playAnim(Anim.Throw, ...) in the same call that creates the
+  // projectile, so **the thrower is animating a throw in the very packet the
+  // grenade first appears in**. Anim.Throw is played nowhere else in the game.
+  // That is a hard gate and it usually leaves one candidate on its own.
+  //
+  // The type is the second gate. A cook records what was in hand when the pin
+  // came out, so a `frag` can only have come from someone who was cooking a
+  // frag — which separates the player who threw a smoke on the same tick.
+  //
+  // Geometry then ranks whatever is left, by where the hand was. A winner has
+  // to beat the runner-up by a clear margin; a tie is left unowned rather than
+  // guessed, because the three answers are genuinely different — a squadmate's
+  // frag cannot touch us, our own hurts us in full, and unowned is treated as
+  // hostile, which is the safe way to be wrong.
+  //
+  // The fallback for a grenade whose throw we did not see — we were not
+  // watching that player when the packet landed — is the old rule: nearest body
+  // to the spawn, which is right in the common case of one grenade at a time
+  // and is why `sure` exists to say the difference.
+  const DODGE_PROJ_SPAWN_FIT = 0.5;    // slack on the hand segment, in units
+  const DODGE_PROJ_SPAWN_EDGE = 0.35;  // how far the winner must beat the runner-up
+  // GameConfig.player.moveSpeed * throwPhysics.playerVelMult: the most of their
+  // own motion a thrower can put into a grenade.
+  const PROJ_VEL_CARRY = 12 * 0.6;
+  // PerkProperties.amped_explosives.throwableSpeedMult.
+  const PROJ_SPEED_MULT_MAX = 2;
+
+  function dodgeProjThrower(game, x, y, layer, type, n, age, phys, out) {
+    out.id = 0; out.sure = false; out.throwN = -1;
+    const roster = findRosterOnGame(game) || game?.[GAME_ROSTER];
+    const pool = roster?.playerPool;
+    if (!pool || typeof pool[POOL_GETALL] !== 'function') return 0;
+    const players = pool[POOL_GETALL]() || [];
+
+    // How far the grenade can have travelled since it left the hand. We do not
+    // see it at the spawn — the server runs one to three 100Hz physics ticks
+    // between creating it and serialising the 33Hz update — so the observed
+    // position is the spawn plus a tick or so of flight, and the geometry has
+    // to be given room for exactly that much and no more.
+    const carry = age > 0 && phys
+      ? (phys.speed * PROJ_SPEED_MULT_MAX + PROJ_VEL_CARRY) * age
+      : 0;
+    const fit = DODGE_PROJ_SPAWN_FIT + carry;
+
+    let best = 0, bestD = Infinity, nextD = Infinity, bestN = -1, cands = 0;
+    let near = 0, nearD = PROJ_SPAWN_OFFSET + DODGE_PROJ_SPAWN_TOL + carry;
+
+    for (const p of players) {
+      if (!p || !p.active || p[PLAYER_NET]?.[NET_DEAD]) continue;
+      if (!sameLayerAs(layer, p.layer)) continue;
+      // Both read off the same object, netData first. The hand offset is the
+      // aim applied at the body, so a position from one source and an aim from
+      // another would put it somewhere neither of them means.
+      const nd = p[PLAYER_NET];
+      const pos = getXY(nd?.[PLAYER_POS] ?? p[PLAYER_POS] ?? p.pos);
+      if (!pos) continue;
+      const id = Number(p.__id ?? 0);
+      if (!id) continue;
+
+      // The fallback ranking, kept up alongside the real one so the loop is
+      // walked once either way.
+      const body = Math.hypot(pos.x - x, pos.y - y);
+      if (body < nearD) { nearD = body; near = id; }
+
+      const st = dodgeCook.get(id);
+      if (!st || st.throwN < 0 || n - st.throwN > DODGE_PROJ_THROW_TICKS) continue;
+      if (st.weap && st.weap !== type) continue;
+      cands++;
+      bestN = st.throwN;
+
+      const dir = getXY(nd?.[PLAYER_DIR] ?? p[PLAYER_DIR] ?? p.dir);
+      const d = dir && Math.hypot(dir.x, dir.y) > 1e-6
+        ? dodgeThrowSpawnDist(pos.x, pos.y, dir.x, dir.y, x, y)
+        : body;
+      if (d < bestD) { nextD = bestD; bestD = d; best = id; }
+      else if (d < nextD) { nextD = d; }
+    }
+
+    // One player threw a grenade of this type on this tick, so one player threw
+    // this grenade. No geometry can improve on that and none is asked for — the
+    // position test exists to break ties, not to second-guess the animation.
+    if (cands === 1 && best) {
+      out.id = best; out.sure = true; out.throwN = bestN;
+      return best;
+    }
+    // Two at once: the hand geometry decides, and only by a clear margin.
+    if (cands > 1 && best && bestD <= fit && nextD - bestD >= DODGE_PROJ_SPAWN_EDGE) {
+      out.id = best; out.sure = true; out.throwN = bestN;
+      return best;
+    }
+    out.id = near;
+    return near;
+  }
+  const dodgeThrowerOut = { id: 0, sure: false, throwN: -1 };
+
+  // Where and when this grenade detonates, from the state the packet just
+  // delivered. Run once per packet per grenade rather than on demand: it is
+  // wanted by the overlay every frame and by the planner every step, and both
+  // want the same answer, so computing it here is the cheapest place it can
+  // live and the only one where the two cannot disagree.
+  //
+  // Deliberately unclamped and unled — this is what the grenade is going to do,
+  // not what the planner can see of it. dodgeAddBlasts applies its own horizon
+  // and its own ping lead on top.
+  function dodgeProjBoom(rec, phys, layer) {
+    if (!phys) { rec.boomT = 0; rec.boomX = rec.x; rec.boomY = rec.y; return; }
+    // The clock is cheap and has to stay current: it is just what is left of
+    // the fuse, and it ticks down whether anything is simulated or not.
+    rec.boomT = Math.max(0, phys.fuse - rec.cooked - rec.age);
+    if (rec.boomSolved) return;
+    // Nothing to solve from yet. Velocity takes two snapshots to measure and
+    // the whole trajectory is a function of it, so until then the honest answer
+    // is where the grenade is — one packet of a ring in the wrong place, rather
+    // than a whole flight predicted from a velocity of zero.
+    if (!rec.haveVel) { rec.boomX = rec.x; rec.boomY = rec.y; return; }
+    dodgeSimBlast(rec, phys, rec.boomT, layer, dodgeSimOut);
+    rec.boomX = dodgeSimOut.x;
+    rec.boomY = dodgeSimOut.y;
+    rec.boomSolved = true;
+  }
+
+  function snapshotProjectiles(game) {
+    const n = netClock.n - 1;
+    if (n < 0) return;
+    const list = getProjectiles();
+    for (let i = 0; i < list.length; i++) {
+      const p = list[i];
+      if (!p || !p.active) continue;
+      const id = Number(p.__id ?? 0);
+      if (!id) continue;
+      const pos = p.pos;
+      if (!pos || !Number.isFinite(pos.x) || !Number.isFinite(pos.y)) continue;
+      const z = Number(p.posZ);
+      const phys = THROWABLE_PHYS[p.type];
+
+      let rec = dodgeProj.get(id);
+      if (!rec) {
+        const velZ0 = phys ? phys.velZ : 5;
+        // We never see a grenade at the height it was thrown from. The server
+        // creates it at posZ 0.5 on a 100Hz physics tick and serialises the
+        // world at 33Hz, so one to three ticks of flight have already happened
+        // by the time the first packet carrying it arrives and posZ is 0.55 to
+        // 0.65. Testing for spawn height is therefore not a test that can pass,
+        // and while it was the gate here nothing downstream of it ever ran: no
+        // grenade was ever attributed, no cook was ever carried onto one, and
+        // every fuse read as full.
+        //
+        // So the arc is asked instead, and it has two answers — the same posZ
+        // occurs once on the way up and once on the way down. The throw
+        // animation is what picks between them: a player who threw within the
+        // last few ticks means this grenade is at the start of its flight and
+        // the ascending root is the age. Nobody throwing means we have picked
+        // it up somewhere in the middle of a life we did not watch, and the
+        // descending root is the conservative reading — the older grenade, the
+        // one that goes off sooner.
+        const ageUp = dodgeProjAge(z, velZ0, false);
+        const thrower = dodgeProjThrower(game, pos.x, pos.y, p.layer, p.type, n,
+                                         ageUp ?? 0, phys, dodgeThrowerOut);
+        let age, cooked;
+        if (dodgeThrowerOut.sure) {
+          // The arc dates it to under a millisecond this close to the throw,
+          // where velZ is still near its full 5 and the inversion is at its
+          // best conditioned. The throw tick is the fallback if posZ is above
+          // the arc's own apex, which means it is not a thrown grenade at all.
+          age = ageUp !== null && ageUp >= 0
+            ? ageUp
+            : Math.max(0, (n - dodgeThrowerOut.throwN) * (netClock.slope || 30) / 1000);
+        } else {
+          age = dodgeProjAge(z, velZ0, true) ?? 0;
+        }
+        // Only a thrower we are *sure* of carries their cook. A fallback match
+        // is the nearest body to the spawn, which is a good guess about who
+        // threw it and no basis at all for reading their cook onto it: better
+        // an assumed full fuse than somebody else's measured one.
+        const ck = dodgeThrowerOut.sure && thrower ? dodgeCook.get(thrower) : null;
+        cooked = ck ? ck.cooked : 0;
+        rec = {
+          id, n, age, thrower,
+          // Whether that attribution is the throw animation naming them or the
+          // fallback guessing them. Only a sure one is trusted with the cook
+          // time, and only a sure one should be trusted to call a grenade
+          // harmless — see dodgeAddBlasts.
+          throwerSure: dodgeThrowerOut.sure,
+          // Wall time of the packet this record is as of. The fuse is counted
+          // forward from here rather than from "now", so a step landing between
+          // packets does not read the grenade as younger than it is.
+          at: Date.now(),
+          water: dodgeProjInWater(pos, p.layer),
+          cooked,
+          // Whether that cook time is a measurement or an assumption. False
+          // means "assume nobody cooked it", which is the longest fuse the
+          // grenade can have and so the latest it can go off — see
+          // dodgeAddBlasts for what the planner does with a fuse it does not
+          // trust.
+          cookExact: !!(ck && ck.exact && cooked > 0),
+          // Kept for the readout: what the grenade actually is, so a diagnostic
+          // does not have to go back to the pool to find out.
+          type: p.type,
+          x: pos.x, y: pos.y, z,
+          vx: 0, vy: 0, haveVel: false,
+          // Whether we know which branch of the arc it is on. A named thrower
+          // settles it; anything else waits for a posZ that moves.
+          resolved: dodgeThrowerOut.sure,
+          // Where and when this grenade goes off: `boomT` seconds from the
+          // packet this record is as of, at (boomX, boomY). A property of the
+          // grenade alone — no ping lead, no planning horizon — so the overlay
+          // and the planner read one answer and cannot disagree.
+          //
+          // Solved exactly once, on the first packet that can measure a
+          // velocity, and then never again. Not an optimisation: re-running it
+          // every packet is *redundant*, because simulating from a later state
+          // over a correspondingly shorter fuse lands in the same place, and
+          // the only thing re-running can add is the jitter of re-deriving the
+          // velocity from a fresh pair of quantised positions. Frozen, the
+          // blast point is a fixed spot on the ground, which is what it is.
+          boomT: 0, boomX: pos.x, boomY: pos.y, boomSolved: false,
+          // Whether the blast can see where we stand. Cached per packet rather
+          // than frozen with the rest: the blast point holds still, but we do
+          // not.
+          simN: -1, simClear: false,
+        };
+        dodgeProj.set(id, rec);
+        dodgeProjBoom(rec, phys, p.layer);
+        continue;
+      }
+
+      const dn = n - rec.n;
+      if (dn <= 0) continue;
+      const dt = dn * (netClock.slope || 50) / 1000;
+      if (dt > 0) {
+        rec.vx = (pos.x - rec.x) / dt;
+        rec.vy = (pos.y - rec.y) / dt;
+        rec.haveVel = true;
+      }
+      // The ascending branch, settled by the only thing that can settle it: a
+      // posZ that went up. Done once, on the first delta after the grenade was
+      // picked up mid-flight.
+      if (!rec.resolved) {
+        rec.resolved = true;
+        if (z > rec.z) {
+          const velZ0 = phys ? phys.velZ : 5;
+          const up = dodgeProjAge(rec.z, velZ0, false);
+          if (up !== null && up >= 0) rec.age = up;
+        }
+      }
+      rec.age += dt;
+      rec.n = n;
+      rec.at = Date.now();
+      rec.x = pos.x; rec.y = pos.y; rec.z = z;
+      rec.water = dodgeProjInWater(pos, p.layer);
+      dodgeProjBoom(rec, phys, p.layer);
+    }
+    // A projectile that has left the pool has detonated or expired, and its
+    // record must go with it: the pool hands the same object to the next
+    // grenade, and a stale age would date that one from this one's throw.
+    if (dodgeProj.size) {
+      for (const [id, rec] of dodgeProj) {
+        if (rec.n !== n) dodgeProj.delete(id);
+      }
+    }
+    // Cook states outlive their grenades on purpose — a throw has to still be
+    // readable on the tick after it happened — so they age out by tick index
+    // rather than by presence. `seen` is never cleared: it is what says we have
+    // watched this player's animation from before their cook began, which is
+    // the whole basis for calling a cook time exact.
+    if (dodgeCook.size > 32) {
+      for (const [id, st] of dodgeCook) { if (n - st.lastN > 200) dodgeCook.delete(id); }
+    }
   }
 
   // ---- Recovering the bullet type ---------------------------------------
@@ -4972,11 +5667,14 @@
       // in the innermost loop in the whole mod.
       const w = dmg / DODGE_DMG_REF;
 
-      // `phantom` is false rather than absent so that a live round and the
-      // hypothetical one dodgeAddPhantoms appends share a shape — every edge of
-      // the search reads this array and a second hidden class would deoptimise
-      // the hottest loop in the mod.
-      out.push({ x, y, wx, wy, tMax, R, due, dmg, w, type: btype, phantom: false });
+      // `phantom` is false rather than absent, and the four blast fields are
+      // present-and-zero rather than missing, so that a live round, the
+      // hypothetical one dodgeAddPhantoms appends and the grenade
+      // dodgeAddBlasts appends all share one shape — every edge of the search
+      // reads this array and a second hidden class would deoptimise the
+      // hottest loop in the mod.
+      out.push({ x, y, wx, wy, tMax, R, due, dmg, w, type: btype, phantom: false,
+                 blast: 0, tBoom: 0, rMin: 0, rMax: 0, layer: 0, clear: true, vis: -1 });
       // The slot, folded in — accepted rounds only, and in the order the barn
       // holds them, so this changes if any of them stops being a threat and not
       // if one merely moves. `i + 1` because slot 0 must not be a no-op.
@@ -5122,7 +5820,850 @@
       // BULLET_RANGE for why that number lives in its own table.
       const dmg = dodgeBulletDamage(type, flown + speed * due, total, 0);
       const w = k * dmg / DODGE_DMG_REF;
-      out.push({ x, y, wx, wy, tMax, R, due, dmg, w, type, phantom: true });
+      out.push({ x, y, wx, wy, tMax, R, due, dmg, w, type, phantom: true,
+                 blast: 0, tBoom: 0, rMin: 0, rMax: 0, layer: 0, clear: true, vis: -1 });
+    }
+    return out;
+  }
+
+  // ---- The grenade ------------------------------------------------------
+  //
+  // A round is a line and a blast is a moment. That difference decides the
+  // whole shape of what follows: there is nothing to sweep, no closest approach
+  // to find and no question of when contact begins, because a grenade does
+  // exactly one thing to us and it does it at one instant. What has to be right
+  // is *where* it is at that instant and *when* that instant is, and neither is
+  // on the wire.
+  //
+  // So the path is simulated rather than solved. The closed form is available —
+  // the airborne leg is a straight line at constant speed for
+  // (velZ + sqrt(velZ^2 + 2*g*z0))/g seconds, and the ground leg's whole
+  // remaining travel is exactly `speed/drag` however the tick length is
+  // chosen — but it stops being available the moment the grenade touches
+  // anything, and grenades are thrown at cover for a living. Stepping the
+  // server's own integrator handles bounces, tables it lands on and water it
+  // falls in without any of them being a special case, and it costs a few
+  // hundred multiplies for a threat that appears a handful of times a match.
+  //
+  // Damage is then charged once, on the leg of the plan that contains the
+  // detonation, from the distance between the blast and wherever that plan has
+  // us standing. See dodgeDpBlast.
+  //
+  // Shrapnel is not modelled — see BLAST_DEFS. Neither is armour, for the same
+  // reason no round in this planner is priced through armour: the loss is what
+  // the game's own damage formula would take off an unarmoured body, and it is
+  // that consistently.
+
+  // The explosion's own occlusion test. Not blocksBullets: the game breaks an
+  // explosion's raycast on `collidable && height > 0.5`, which is a higher bar
+  // than a bullet's 0.25 and — unlike a bullet — does not let it through a
+  // window. A blast reaching us through a pane of glass is survev's behaviour,
+  // not an oversight here.
+  const BLAST_HEIGHT = 0.5;
+
+  function blocksBlast(o, layer) {
+    return !!o && o.active && !o.dead && o.collidable &&
+      o.height > BLAST_HEIGHT && !!o.collider && sameLayerAs(layer, o.layer);
+  }
+
+  function blastLineClear(x0, y0, x1, y1, layer) {
+    const obstacles = getObstacles();
+    const loX = Math.min(x0, x1), hiX = Math.max(x0, x1);
+    const loY = Math.min(y0, y1), hiY = Math.max(y0, y1);
+    for (let i = 0; i < obstacles.length; i++) {
+      const o = obstacles[i];
+      if (!blocksBlast(o, layer)) continue;
+      if (!colliderNearSegment(o.collider, loX, loY, hiX, hiY)) continue;
+      if (segHitCollider(x0, y0, x1, y1, o.collider) !== null) return false;
+    }
+    return true;
+  }
+
+  // How much of its full damage a blast does at distance `dist`, as a fraction.
+  //
+  // survev's own falloff, and its one surprise: past rad.min the ramp is
+  // measured from the *centre*, not from rad.min, so it does not resume at full
+  // damage where the plateau ends. A frag is 125 out to 5u and about 73 just
+  // past it, decaying to nothing at 12.
+  //
+  //   d <= rad.min   1
+  //   otherwise      1 - d/rad.max
+  //
+  // `slack` is subtracted from the distance before any of that, which is the
+  // same doubt DODGE.clearance stands for everywhere else in the loss — the
+  // lead is an estimate, the plan's position is snapped to a cell, and the
+  // simulated blast point carries its own error on top. Assuming we are that
+  // much closer than we think can only raise the charge, which is the direction
+  // to be uncertain in.
+  //
+  // Unlike the round sweep's falloff this one is not a model of anything: it is
+  // the game's damage curve, so `f` here is a real fraction of real HP rather
+  // than a probability that a hit happens at all. Both end up multiplied by the
+  // same `w * DODGE_HIT_COST`, and both are expected HP when they do.
+  function dodgeBlastFactor(rMin, rMax, dist, slack) {
+    const d = Math.max(0, dist - slack);
+    if (d <= rMin) return 1;
+    if (d >= rMax) return 0;
+    return 1 - d / rMax;
+  }
+
+  // Seconds per simulated tick. The server integrates at gameTps 100 and the
+  // drag law is dt-dependent — `vel /= 1 + dt*drag` compounds — so matching its
+  // step is what makes the slide land in the same place rather than merely
+  // near it.
+  const DODGE_SIM_DT = 0.01;
+  const DODGE_SIM_MAX_STEPS = 400;
+
+  const dodgeSimOut = { x: 0, y: 0 };
+  const dodgeSimHit = { nx: 0, ny: 0, pen: 0 };
+  const dodgeSimObs = [];
+
+  // Port of coldet.intersectAabbCircle / intersectCircleCircle, which is what
+  // the server's projectile collision calls, kept to its arithmetic so a bounce
+  // here is the bounce there. `dir` in survev points from the obstacle out
+  // toward the projectile, and is both the push-out direction and the surface
+  // normal the reflection uses.
+  function dodgeSimPen(c, x, y, r) {
+    if (c.type === COLLIDER_CIRCLE) {
+      if (!c.pos) return false;
+      const R = c.rad + r;
+      const dx = x - c.pos.x, dy = y - c.pos.y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 >= R * R) return false;
+      const d = Math.sqrt(d2);
+      if (d > 1e-5) { dodgeSimHit.nx = dx / d; dodgeSimHit.ny = dy / d; }
+      else { dodgeSimHit.nx = 1; dodgeSimHit.ny = 0; }
+      dodgeSimHit.pen = R - d;
+      return true;
+    }
+    if (!c.min || !c.max) return false;
+    if (x >= c.min.x && x <= c.max.x && y >= c.min.y && y <= c.max.y) {
+      const ex = (c.max.x - c.min.x) * 0.5, ey = (c.max.y - c.min.y) * 0.5;
+      const px = x - (c.min.x + ex), py = y - (c.min.y + ey);
+      const xp = Math.abs(px) - ex - r, yp = Math.abs(py) - ey - r;
+      if (xp > yp) { dodgeSimHit.nx = px > 0 ? 1 : -1; dodgeSimHit.ny = 0; dodgeSimHit.pen = -xp; }
+      else { dodgeSimHit.nx = 0; dodgeSimHit.ny = py > 0 ? 1 : -1; dodgeSimHit.pen = -yp; }
+      return true;
+    }
+    const cx = Math.min(Math.max(x, c.min.x), c.max.x);
+    const cy = Math.min(Math.max(y, c.min.y), c.max.y);
+    const dx = x - cx, dy = y - cy;
+    const d2 = dx * dx + dy * dy;
+    if (d2 >= r * r) return false;
+    const d = Math.sqrt(d2);
+    if (d > 1e-4) { dodgeSimHit.nx = dx / d; dodgeSimHit.ny = dy / d; }
+    else { dodgeSimHit.nx = 1; dodgeSimHit.ny = 0; }
+    dodgeSimHit.pen = r - d;
+    return true;
+  }
+
+  // Everything the grenade could touch between here and the end of the
+  // simulation, gathered once so the step loop is a flat scan. `height` is kept
+  // because the test the server makes against it changes as the grenade falls:
+  // an obstacle taller than the grenade's current posZ is a wall to bounce off,
+  // and a shorter collidable one is a floor to land on.
+  function dodgeSimObstacles(x, y, reach, layer) {
+    const out = dodgeSimObs;
+    out.length = 0;
+    const obstacles = getObstacles();
+    for (let i = 0; i < obstacles.length; i++) {
+      const o = obstacles[i];
+      if (!o || !o.active || o.dead || !o.collider) continue;
+      if (!sameLayerAs(layer, o.layer)) continue;
+      if (!(o.height > 0)) continue;
+      const c = o.collider;
+      if (c.type === COLLIDER_AABB) {
+        if (!c.min || !c.max) continue;
+        if (c.max.x < x - reach || c.min.x > x + reach) continue;
+        if (c.max.y < y - reach || c.min.y > y + reach) continue;
+      } else {
+        if (!c.pos) continue;
+        if (Math.hypot(c.pos.x - x, c.pos.y - y) > reach + c.rad) continue;
+      }
+      out.push(o);
+    }
+    return out;
+  }
+
+  // Walk the server's Projectile.update forward `dur` seconds from where the
+  // last packet left this grenade, and report where it ends up.
+  //
+  // The three things that make it the server's loop and not an approximation
+  // of it:
+  //
+  //   Drag is applied only on the ground. `posZ <= obstacleBellowHeight` is the
+  //   server's test, and it means an airborne grenade holds its speed exactly —
+  //   which is also why one snapshot delta measures that speed outright.
+  //
+  //   There is no bounce in Z. posZ is clamped at the floor and velZ carries on
+  //   downward, so a grenade lands once and stays landed.
+  //
+  //   A bounce reflects and loses speed by `max(1 + d.n, 0.15)`, so a graze
+  //   keeps almost everything and a head-on hit keeps a sixth. Obstacles below
+  //   the grenade raise the floor instead of turning it, which is how a grenade
+  //   comes to rest on a table.
+  // `pre` is an obstacle list the caller has already filtered, for a caller that
+  // is going to run this many times over the same patch of world. Without it
+  // every call rebuilds the list by walking the entire obstacle pool — which is
+  // every obstacle on the map, thousands of them — and a solver sweeping a
+  // hundred candidate throws pays for that a hundred times over. That was worth
+  // about forty milliseconds a frame.
+  function dodgeSimBlast(rec, phys, dur, layer, out, pre, dt) {
+    let x = rec.x, y = rec.y, z = rec.z;
+    let vx = rec.haveVel ? rec.vx : 0, vy = rec.haveVel ? rec.vy : 0;
+    let vz = phys.velZ - PROJ_GRAVITY * rec.age;
+    // The projectile's collision radius, which is `def.rad * 0.5` stored and
+    // halved again at the collision site.
+    const r = phys.rad * 0.25;
+    const speed0 = Math.hypot(vx, vy);
+    const reach = speed0 * dur + speed0 / PROJ_DRAG + r + 1;
+    const obs = pre || dodgeSimObstacles(x, y, reach, layer);
+    // `dt` coarsens the integration for a caller that is ranking candidates
+    // rather than answering. The step is the whole cost of this loop — every
+    // obstacle in range is tested on every one of them — and a search that runs
+    // it a hundred times over cannot afford the server's own 100Hz. What a
+    // coarser step costs is only the moment of landing, to within half a step;
+    // the flight is a straight line at constant speed and the slide's total is
+    // `v/drag` whatever the step, so neither of the two things that decide
+    // where a grenade ends up is sensitive to it.
+    const step = dt || DODGE_SIM_DT;
+    const steps = Math.min(Math.ceil(dur / step), DODGE_SIM_MAX_STEPS);
+    const h = steps > 0 ? dur / steps : 0;
+    const drag = rec.water ? PROJ_DRAG_WATER : PROJ_DRAG;
+
+    // The floor under the grenade, carried across steps exactly as the server
+    // carries `obstacleBellowHeight`: it is what posZ is clamped to, and it is
+    // also what "on the ground" means for the drag test, so a grenade resting
+    // on a crate slows down and a grenade still in the air over one does not.
+    //
+    // Derived from the state we are handed rather than assumed to be zero. The
+    // server keeps it across ticks and we are starting mid-flight, so a grenade
+    // already sitting on a table has to be *on* the table from the first step —
+    // otherwise it starts the simulation believing it is airborne, skips the
+    // drag it should be under, and is dropped to the ground and put back.
+    let floor = 0;
+    for (let i = 0; i < obs.length; i++) {
+      const o = obs[i];
+      if (!o.collidable || o.height > z) continue;
+      if (o.height > floor && dodgeSimPen(o.collider, x, y, r)) floor = o.height;
+    }
+
+    for (let s = 0; s < steps; s++) {
+      if (z <= floor) { vx /= 1 + h * drag; vy /= 1 + h * drag; }
+      x += vx * h; y += vy * h;
+      vz -= PROJ_GRAVITY * h;
+      z = Math.min(Math.max(z + vz * h, floor), 5);
+
+      let nextFloor = 0;
+      for (let i = 0; i < obs.length; i++) {
+        const o = obs[i];
+        // A bounds reject before the real one. Everything in `obs` is within
+        // reach of the *path*, but on any given step the grenade is next to
+        // almost none of it, and this is the innermost loop in the mod — every
+        // obstacle in range, on every step, of every candidate a solver tries.
+        const col = o.collider;
+        if (col.type === COLLIDER_AABB) {
+          if (x + r < col.min.x || x - r > col.max.x ||
+              y + r < col.min.y || y - r > col.max.y) continue;
+        } else {
+          const ddx = x - col.pos.x, ddy = y - col.pos.y, rr = col.rad + r;
+          if (ddx * ddx + ddy * ddy >= rr * rr) continue;
+        }
+        if (!dodgeSimPen(col, x, y, r)) continue;
+        if (o.height > z) {
+          if (!o.collidable) continue;
+          const nx = dodgeSimHit.nx, ny = dodgeSimHit.ny;
+          const push = dodgeSimHit.pen + 0.1;
+          x += nx * push; y += ny * push;
+          const len = Math.hypot(vx, vy);
+          if (len > 1e-6) {
+            const dx = vx / len, dy = vy / len;
+            const dot = dx * nx + dy * ny;
+            const scale = Math.max(1 + dot, 0.15) * len;
+            vx = (dx - 2 * dot * nx) * scale;
+            vy = (dy - 2 * dot * ny) * scale;
+          }
+        } else if (o.collidable && o.height > nextFloor) {
+          nextFloor = o.height;
+        }
+      }
+      floor = nextFloor;
+      if (z < floor) z = floor;
+
+      // Come to rest and the rest of the fuse changes nothing. A frag lands at
+      // a second and is done sliding well before its four are up, so without
+      // this every candidate throw a solver tries spends more than half its
+      // steps re-confirming a grenade that has already stopped. The threshold is
+      // a thousandth of a unit per second, which has `v/drag` — four
+      // ten-thousandths of a unit — of travel left in it, so the exit is below
+      // the resolution of the position it is exiting from and the port stays
+      // exact against the server's own loop.
+      if (z <= floor && vx * vx + vy * vy < 1e-6) break;
+    }
+    out.x = x; out.y = y;
+  }
+
+  // ---- Throwing it from here ---------------------------------------------
+  //
+  // Where our own cooked grenade would land if we let go this instant.
+  //
+  // A port of the server's throwThrowable, which is worth doing exactly rather
+  // than approximately because the interesting part is the bit people get wrong
+  // by feel: **throw strength is the distance to the mouse cursor**, as a
+  // fraction of `throwableMaxMouseDist`, so the cursor is a throttle and not
+  // just an aim. Anything past 18 units is full strength and anything nearer is
+  // proportionally short. That is the whole reason to draw this — a ring on the
+  // ground answers "how hard am I about to throw" in the only terms that matter.
+  //
+  //   throwStr = clamp(mouseDist, 0, 18) / 18 * speed
+  //   spawn    = pos + rotate({0.5,-1.0}, aim), clipped to the first wall
+  //   vel      = moveVel * 0.6 + aim * throwStr
+  //
+  // The rest is the same simulation every other grenade goes through, from a
+  // state we construct instead of one the wire delivered.
+  const PROJ_MAX_MOUSE_DIST = 18;   // GameConfig.player.throwableMaxMouseDist
+  const PROJ_MOUSE_CLAMP = 64;      // net.Constants.MouseMaxDist
+  const PROJ_AMPED_RANGE = 1.75;    // PerkProperties.amped_explosives.throwableRangeMult
+  const PROJ_AMPED_SPEED = 2;       // ...throwableSpeedMult
+  const PROJ_SPAWN_HEIGHT = 0.5;
+
+  // Our own movement, as the server has it. Taken from the packet ring rather
+  // than from the movement keys, because it is the velocity the server actually
+  // applied and it already carries every reason it might not be 12 — water,
+  // being downed, a heavy weapon — none of which the keys know about.
+  const dodgeMoveVel = { x: 0, y: 0 };
+  function dodgeSelfMoveVel(me) {
+    dodgeMoveVel.x = 0; dodgeMoveVel.y = 0;
+    if (!netClock.ready) return dodgeMoveVel;
+    const tickMs = netClock.slope;
+    if (!(tickMs >= NET_MIN_UPDATE_MS && tickMs <= NET_MAX_UPDATE_MS)) return dodgeMoveVel;
+    const snaps = me ? netSmoothState.get(me)?.snaps : null;
+    if (!snaps || snaps.length < 2) return dodgeMoveVel;
+    const p2 = snaps[snaps.length - 1], p1 = snaps[snaps.length - 2];
+    const dn = p2.n - p1.n;
+    if (dn < 1) return dodgeMoveVel;
+    const dt = (tickMs * dn) / 1000;
+    const vx = (p2.x - p1.x) / dt, vy = (p2.y - p1.y) / dt;
+    if (Math.hypot(vx, vy) > DODGE_SPEED_MAX) return dodgeMoveVel;
+    dodgeMoveVel.x = vx; dodgeMoveVel.y = vy;
+    return dodgeMoveVel;
+  }
+
+  // The throw's own spawn point: a hand's length out along the aim, clipped
+  // back to the first wall on the way there, exactly as the server clips it.
+  // Standing behind cover and lobbing over it is the case this exists for —
+  // without the clip the grenade would be predicted to leave from inside the
+  // wall we are hugging.
+  const dodgeSpawnOut = { x: 0, y: 0 };
+
+  // The obstacles that can clip a spawn, whatever the aim: the hand is 1.118u
+  // out in *some* direction, so one disc around the thrower covers every
+  // bearing a solver might try. Built once and swept many times.
+  function dodgeSpawnObstacles(px, py, layer, out) {
+    out.length = 0;
+    const obstacles = getObstacles();
+    const reach = PROJ_SPAWN_OFFSET + 0.5;
+    for (let i = 0; i < obstacles.length; i++) {
+      const o = obstacles[i];
+      // The server's own reject list for the spawn clip: anything dead, passable,
+      // on another layer or shorter than the throw height is not in the way.
+      if (!o || !o.active || o.dead || !o.collidable || !o.collider) continue;
+      if (!sameLayerAs(layer, o.layer)) continue;
+      if (!(o.height >= PROJ_SPAWN_HEIGHT)) continue;
+      if (!colliderNearSegment(o.collider, px - reach, py - reach, px + reach, py + reach)) continue;
+      out.push(o);
+    }
+    return out;
+  }
+
+  function dodgeThrowSpawn(px, py, dx, dy, layer, pre) {
+    const a = Math.atan2(dy, dx);
+    const hx = px + 0.5 * Math.cos(a) + Math.sin(a);
+    const hy = py + 0.5 * Math.sin(a) - Math.cos(a);
+    let bestT = 1;
+    const obstacles = pre || dodgeSpawnObstacles(px, py, layer, dodgeSpawnScratch);
+    const len = Math.hypot(hx - px, hy - py) || 1;
+    for (let i = 0; i < obstacles.length; i++) {
+      const d = segHitCollider(px, py, hx, hy, obstacles[i].collider);
+      if (d === null) continue;
+      const t = d / len;
+      if (t < bestT) bestT = t;
+    }
+    dodgeSpawnOut.x = px + (hx - px) * bestT;
+    dodgeSpawnOut.y = py + (hy - py) * bestT;
+    return dodgeSpawnOut;
+  }
+  const dodgeSpawnScratch = [];
+
+  // The scratch flight record the preview simulates. Reused rather than
+  // allocated per frame, and shaped like the ones snapshotProjectiles builds so
+  // dodgeSimBlast cannot tell the difference.
+  const dodgeThrowRec = { x: 0, y: 0, z: 0, vx: 0, vy: 0, haveVel: true, age: 0, water: false };
+  const dodgeThrowOut = { x: 0, y: 0 };
+
+  // Everything about the thrower that does not change between candidate throws,
+  // gathered once so a solver can sweep hundreds of aims without re-reading the
+  // world for each of them.
+  const dodgeThrowCtx = {
+    ok: false, x: 0, y: 0, layer: 0, mvx: 0, mvy: 0,
+    maxDist: PROJ_MAX_MOUSE_DIST, speed: 0, left: 0, phys: null,
+    // Both obstacle sets, filtered once for the whole context. Every candidate
+    // throw starts from the same body and cannot travel further than the
+    // strongest one, so one disc covers all of them — which is the difference
+    // between one pass over the obstacle pool and one per candidate.
+    obs: [], spawnObs: [], water: false,
+  };
+
+  function dodgeThrowContext(phys, me, layer, left) {
+    const c = dodgeThrowCtx;
+    c.ok = false;
+    const nd = me?.[PLAYER_NET];
+    const pos = getXY(nd?.[PLAYER_POS] ?? me?.[PLAYER_POS] ?? me?.pos);
+    if (!pos || !phys) return c;
+    const amped = Array.isArray(me?.perkTypes) && me.perkTypes.includes('amped_explosives');
+    const mv = dodgeSelfMoveVel(me);
+    c.x = pos.x; c.y = pos.y; c.layer = layer;
+    c.mvx = mv.x * 0.6; c.mvy = mv.y * 0.6;
+    c.maxDist = PROJ_MAX_MOUSE_DIST * (amped ? PROJ_AMPED_RANGE : 1);
+    c.speed = phys.speed * (amped ? PROJ_AMPED_SPEED : 1);
+    c.left = left; c.phys = phys;
+    // Furthest anything thrown from here can get: the strongest throw's flight
+    // plus the whole of its slide, plus our own motion folded in.
+    const vMax = c.speed + Math.hypot(c.mvx, c.mvy);
+    const reach = vMax * Math.min(left, 1.1) + vMax / PROJ_DRAG + 2;
+    dodgeSimObstacles(pos.x, pos.y, reach, layer);
+    c.obs = dodgeSimObs.slice();
+    dodgeSpawnObstacles(pos.x, pos.y, layer, c.spawnObs);
+    // Sampled once too: the spawn moves by at most a hand's length between
+    // candidates, which is not far enough to leave a river.
+    c.water = dodgeProjInWater(pos, layer);
+    c.ok = true;
+    return c;
+  }
+
+  // Where a throw aimed (dx, dy) with the cursor `mouseLen` out would put the
+  // grenade at detonation. The server's arithmetic, and then the same
+  // simulation every other grenade goes through.
+  function dodgeThrowLand(c, dx, dy, mouseLen, out, dt) {
+    const mult = Math.min(Math.max(mouseLen, 0), c.maxDist) / c.maxDist;
+    const throwStr = mult * c.speed;
+    const spawn = dodgeThrowSpawn(c.x, c.y, dx, dy, c.layer, c.spawnObs);
+    const rec = dodgeThrowRec;
+    rec.x = spawn.x; rec.y = spawn.y; rec.z = PROJ_SPAWN_HEIGHT;
+    rec.vx = c.mvx + dx * throwStr;
+    rec.vy = c.mvy + dy * throwStr;
+    rec.age = 0;
+    rec.water = c.water;
+    dodgeSimBlast(rec, c.phys, c.left, c.layer, dodgeSimOut, c.obs, dt);
+    out.x = dodgeSimOut.x; out.y = dodgeSimOut.y;
+  }
+
+  // The cursor as it is right now, in world units from the player: a direction
+  // and a length, where the length is the throw's own throttle.
+  const dodgeCursorOut = { dx: 1, dy: 0, len: 0, ok: false };
+  function dodgeCursorAim(me) {
+    const o = dodgeCursorOut;
+    o.ok = false;
+    const scale = getLivePxPerWorldUnit(pageSamples[pageSamples.length - 1]);
+    if (realMouse.hasMoved && scale > 0) {
+      let dx = (realMouse.x - window.innerWidth / 2) / scale;
+      let dy = -(realMouse.y - window.innerHeight / 2) / scale;
+      const len = Math.hypot(dx, dy);
+      if (len > 1e-5) { dx /= len; dy /= len; } else { dx = 1; dy = 0; }
+      o.dx = dx; o.dy = dy; o.len = Math.min(len, PROJ_MOUSE_CLAMP); o.ok = true;
+      return o;
+    }
+    // No cursor yet: fall back to the aim the wire carries, at full strength.
+    const nd = me?.[PLAYER_NET];
+    const aim = getXY(nd?.[PLAYER_DIR] ?? me?.[PLAYER_DIR] ?? me?.dir);
+    if (!aim) return o;
+    const alen = Math.hypot(aim.x, aim.y);
+    if (!(alen > 1e-6)) return o;
+    o.dx = aim.x / alen; o.dy = aim.y / alen; o.len = PROJ_MAX_MOUSE_DIST; o.ok = true;
+    return o;
+  }
+
+  function dodgeThrowPreview(phys, me, layer, left, out) {
+    // Frag aim is driving: the ring has to show the throw that is actually
+    // going to happen, not the one the user's suppressed cursor points at. It
+    // has already solved this frame, so the answer is there for the taking and
+    // costs no second simulation.
+    if (fragState.driving && fragState.haveLand) {
+      out.x = fragState.landX; out.y = fragState.landY;
+      return true;
+    }
+    const c = dodgeThrowContext(phys, me, layer, left);
+    if (!c.ok) return false;
+    // The live cursor rather than the aim the last packet carried: the question
+    // is what happens if we let go *now*, and the cursor is ahead of the wire
+    // by a round trip.
+    const aim = dodgeCursorAim(me);
+    if (!aim.ok) return false;
+    dodgeThrowLand(c, aim.dx, aim.dy, aim.len, out);
+    return true;
+  }
+
+  // ---- Solving the throw --------------------------------------------------
+  //
+  // Which cursor lands the grenade nearest a given point.
+  //
+  // Two variables — the bearing and the cursor's distance from us — and the
+  // second one is the throw's strength, so this is genuinely a two-dimensional
+  // aim rather than a direction with a range that takes care of itself. It is
+  // solved by search rather than by inversion because the forward map is not
+  // invertible in closed form the moment a wall is involved: a throw that
+  // clears a crate and one that bounces off it differ by a degree and land
+  // twenty units apart.
+  //
+  // The search is seeded analytically so it stays small. With nothing in the
+  // way a standing throw covers `speed * (tAir + 1/drag)` — the flight plus the
+  // whole of the slide, which telescopes to exactly `v/drag` — so the strength
+  // that reaches a given distance is one division away. That seed is usually
+  // the answer; the sweep around it is what copes with the bounce, the
+  // thrower's own motion folded into the velocity, and a fuse too short to let
+  // the grenade finish sliding.
+  const FRAG_SOLVE_ANGLE = 0.28;    // radians swept either side of the bearing
+  const FRAG_SOLVE_ANGLES = 7;      // samples across that sweep, per pass
+  const FRAG_SOLVE_STEPS = 5;       // strength samples per pass
+  const FRAG_SOLVE_PASSES = 3;      // coarse, then two refinements
+  // A warm sweep already starts on the answer, so it needs neither the width
+  // nor the passes.
+  const FRAG_WARM_ANGLES = 5;
+  const FRAG_WARM_STEPS = 5;
+  const FRAG_WARM_PASSES = 2;
+  // Integration step while ranking candidates, against DODGE_SIM_DT for the
+  // one that wins. Ranking only has to order throws, and half a coarse step of
+  // slop in the landing moment does not reorder anything; the answer that comes
+  // back is then re-simulated at the server's own resolution, so what the
+  // caller is handed is exact even though what got it there was not.
+  const FRAG_COARSE_DT = 0.03;
+  // The warm sweep, for a target we already solved against last frame. Wide
+  // enough to track a strafing player across a frame and to walk out of a seed
+  // the geometry has since invalidated, narrow enough that the same three
+  // passes land an order of magnitude finer.
+  const FRAG_SOLVE_WARM_ANGLE = 0.05;
+  const FRAG_SOLVE_WARM_LEN = 0.06;
+  // How near a warm solve has to land before it is trusted without a cold
+  // second opinion. Well above the search's own resolution (hundredths) and
+  // well below anything that would change which side of a target a grenade
+  // lands on.
+  const FRAG_SOLVE_WARM_OK = 0.5;
+  const fragSolveOut = { dx: 1, dy: 0, len: 0, x: 0, y: 0, err: Infinity };
+  const fragLandOut = { x: 0, y: 0 };
+  const fragKeep = { dx: 1, dy: 0, len: 0, x: 0, y: 0, err: Infinity };
+
+  // How far a standing throw at `throwStr` gets before the fuse runs out. The
+  // closed form from the simulation's own two phases: constant speed while
+  // airborne, then an exponential slide whose total is `v/drag`.
+  function fragReachFor(c, throwStr) {
+    const g = PROJ_GRAVITY;
+    const vz = c.phys.velZ;
+    const tAir = (vz + Math.sqrt(vz * vz + 2 * g * PROJ_SPAWN_HEIGHT)) / g;
+    if (c.left <= tAir) return throwStr * c.left;
+    const k = Math.log(1 + DODGE_SIM_DT * PROJ_DRAG) / DODGE_SIM_DT;
+    return throwStr * tAir + (throwStr / k) * (1 - Math.exp(-k * (c.left - tAir)));
+  }
+
+  // `warm` is last frame's answer for the same target, when there was one.
+  // Driving the cursor every frame means the previous solve is nearly this one,
+  // so the sweep can open an order of magnitude narrower and still converge —
+  // and the cold path is kept intact underneath it for the frame a target first
+  // appears, changes, or the last solve failed to land anywhere near.
+  function fragSolve(c, tx, ty, warm) {
+    if (!warm) return fragSweep(c, tx, ty, null);
+    const w = fragSweep(c, tx, ty, warm);
+    if (w.err <= FRAG_SOLVE_WARM_OK) return w;
+    // The warm sweep is narrow enough to be outrun. A target three units away
+    // while we strafe past it moves the bearing further in one frame than the
+    // window is wide, and a seed that cannot see the answer any more will sit
+    // where it is and report a large error rather than go looking. So a warm
+    // solve that did not converge is redone cold, and the better of the two
+    // kept — which also covers the case where neither converges because the
+    // target is simply out of reach, and the warm answer was the good one.
+    fragKeep.dx = w.dx; fragKeep.dy = w.dy; fragKeep.len = w.len;
+    fragKeep.x = w.x; fragKeep.y = w.y; fragKeep.err = w.err;
+    const cold = fragSweep(c, tx, ty, null);
+    if (fragKeep.err < cold.err) {
+      cold.dx = fragKeep.dx; cold.dy = fragKeep.dy; cold.len = fragKeep.len;
+      cold.x = fragKeep.x; cold.y = fragKeep.y; cold.err = fragKeep.err;
+    }
+    return cold;
+  }
+
+  function fragSweep(c, tx, ty, warm) {
+    const out = fragSolveOut;
+    out.err = Infinity;
+
+    const dist = Math.hypot(tx - c.x, ty - c.y);
+    let bearing, seedLen, halfLen, halfAng;
+    if (warm) {
+      bearing = warm.bearing;
+      seedLen = warm.len;
+      halfAng = FRAG_SOLVE_WARM_ANGLE;
+      halfLen = c.maxDist * FRAG_SOLVE_WARM_LEN;
+    } else {
+      bearing = Math.atan2(ty - c.y, tx - c.x);
+      // Invert the closed form for the seed strength, then turn it back into a
+      // cursor distance — `mouseLen / maxDist` is the multiplier the server
+      // scales the throw by, so the two are the same number in different units.
+      const unit = Math.max(fragReachFor(c, 1), 1e-6);
+      seedLen = Math.min((dist / unit) / c.speed * c.maxDist, c.maxDist);
+      halfLen = c.maxDist * 0.5;
+      halfAng = FRAG_SOLVE_ANGLE;
+    }
+
+    const nA = warm ? FRAG_WARM_ANGLES : FRAG_SOLVE_ANGLES;
+    const nL = warm ? FRAG_WARM_STEPS : FRAG_SOLVE_STEPS;
+    const passes = warm ? FRAG_WARM_PASSES : FRAG_SOLVE_PASSES;
+
+    for (let pass = 0; pass < passes; pass++) {
+      let bestA = bearing, bestL = seedLen, bestErr = Infinity;
+      for (let i = 0; i < nA; i++) {
+        const a = bearing + (nA === 1 ? 0 : halfAng * (2 * i / (nA - 1) - 1));
+        const dx = Math.cos(a), dy = Math.sin(a);
+        for (let j = 0; j < nL; j++) {
+          const len = Math.min(Math.max(seedLen + halfLen *
+            (2 * j / (nL - 1) - 1), 0), c.maxDist);
+          dodgeThrowLand(c, dx, dy, len, fragLandOut, FRAG_COARSE_DT);
+          const err = Math.hypot(fragLandOut.x - tx, fragLandOut.y - ty);
+          if (err < bestErr) { bestErr = err; bestA = a; bestL = len; }
+        }
+      }
+      bearing = bestA; seedLen = bestL;
+      // Narrow around the winner. Not a bisection — the space has bounces in it
+      // and is not unimodal — just a smaller net cast where the coarse one
+      // found something.
+      halfAng /= nA - 1;
+      halfLen /= nL - 1;
+    }
+
+    // The winner, re-thrown at the server's own resolution. Everything above
+    // was ranking; this is the answer, and it is the only landing point that
+    // leaves this function.
+    out.dx = Math.cos(bearing); out.dy = Math.sin(bearing); out.len = seedLen;
+    dodgeThrowLand(c, out.dx, out.dy, seedLen, fragLandOut);
+    out.x = fragLandOut.x; out.y = fragLandOut.y;
+    out.err = Math.hypot(out.x - tx, out.y - ty);
+    return out;
+  }
+
+  // Every grenade whose blast could reach anywhere we might stand, as one
+  // threat apiece.
+  //
+  // The detonation time is the fuse the flight record carries, less the ping
+  // lead, because plan-time zero is the moment our input reaches the server and
+  // not the frame we are looking at — the same anchor every other threat is
+  // placed against.
+  //
+  // A fuse that outlasts the horizon is not a reason to ignore the grenade. The
+  // planner cannot see past its own horizon, so a frag with three seconds left
+  // would be invisible until the last 0.8s of it — by which point the blast is
+  // 12u across and a player covers 9.6u, and there is no escape left to plan.
+  // So it detonates at the end of the horizon instead, wherever the simulation
+  // has it by then, and the plan is scored against that. It is the right shape
+  // of wrong: the grenade really is going to go off there, the time discount
+  // already prices the far end of the horizon at a quarter of its face value,
+  // and every step re-runs this with a fuse that is one tick shorter.
+  function dodgeAddBlasts(out, selfId, selfInfo, roster, layer, leadS,
+                          px, py, speed, horizon) {
+    // Cleared before the knob is read, not after: turning the term off has to
+    // leave the key empty rather than frozen at whatever the last grenade
+    // hashed to, or the freshness test would keep rejecting plans over a set
+    // that is no longer being built.
+    dodgeState.blastKey = 0;
+    const k = dodgeClamp(DODGE.blast, 0, 1, 1);
+    if (!(k > 0)) return out;
+    const list = getProjectiles();
+    const slack = dodgeClamp(DODGE.clearance, 0.05, 1.5, 0.35);
+
+    for (let i = 0; i < list.length; i++) {
+      const p = list[i];
+      if (!p || !p.active) continue;
+      const phys = THROWABLE_PHYS[p.type];
+      if (!phys || phys.impact) continue;      // no fuse to date, or none we can
+      const def = BLAST_DEFS[phys.blast];
+      if (!def || !(def[0] > 0)) continue;     // smoke, and anything harmless
+      const rec = dodgeProj.get(Number(p.__id ?? 0));
+      if (!rec) continue;                      // seen this frame but not yet on a packet
+
+      // The blast only touches what shares its layer, exactly as the game's own
+      // explosion does. A grenade one floor away is not our problem.
+      if (!sameLayerAs(layer, p.layer)) continue;
+
+      // A squadmate's grenade cannot damage us at all. Our own can, in full —
+      // the game skips the friendly-fire test when the source is the victim —
+      // so `thrower === selfId` is deliberately not an exclusion here, unlike
+      // the bullet path where our own rounds are dropped.
+      //
+      // `throwerSure` gates the drop and nothing else, because the two ways of
+      // being wrong are not the same size. Calling an enemy frag a squadmate's
+      // and ignoring it costs 125HP; calling a squadmate's an enemy's costs a
+      // few hundred milliseconds of walking somewhere we did not need to go. So
+      // only the throw animation naming someone is allowed to make a grenade
+      // harmless — a guess from proximity is not, and reads as hostile like any
+      // other unowned grenade.
+      if (rec.thrower && rec.throwerSure && rec.thrower !== selfId && roster &&
+          !isHostileTo(selfInfo, dodgePlayerInfo(roster, rec.thrower))) continue;
+
+      // Where the fuse stands at plan-time zero. A cook we measured is exact; an
+      // unmeasured one reads as "nobody cooked it", which is the longest fuse
+      // the grenade can have — and the horizon clamp below is what stops that
+      // assumption turning into a grenade the planner ignores.
+      //
+      // Three clocks meet here and all three are needed. The flight record is
+      // as of the last packet; our press lands one ping lead past now; and the
+      // plan is scored from there. So the fuse is measured forward from the
+      // packet, and the simulation is run over the whole of it.
+      const sinceSnap = Math.max(0, (Date.now() - rec.at) / 1000);
+      let tBoom = rec.boomT - sinceSnap - leadS;
+      if (!(tBoom > 0)) tBoom = 0;
+
+      // One place, whatever the horizon does to the clock.
+      //
+      // A fuse the plan cannot see the end of is still charged — at the end of
+      // the plan — but it is charged *where the grenade actually goes off*, not
+      // where it happens to be when the horizon runs out. That is the better of
+      // the two fictions, and it used to be the worse one: a grenade sailing
+      // over our heads on its way to landing twenty units away was scored as
+      // detonating overhead, which is the one thing it is certainly not going
+      // to do. The time is a guess the horizon forces on us; the place is not,
+      // so it should not be guessed as well.
+      //
+      // Which also means the second simulation this used to run is gone. The
+      // blast point is solved once for the whole life of the grenade — see
+      // dodgeProjBoom — and only the line of sight is still per packet, because
+      // our own position moves and the blast's does not.
+      const bx = rec.boomX, by = rec.boomY;
+      if (tBoom > horizon) tBoom = horizon - 1e-4;
+      const pkt = netStats.updates;
+      if (rec.simN !== pkt) {
+        rec.simN = pkt;
+        rec.simClear = blastLineClear(bx, by, px, py, layer);
+      }
+
+      // Nothing we could reach is inside the blast, so no plan can be touched
+      // by it. The same filter the rounds get, with one difference that matters:
+      // a round is solved against everywhere we could stand before the *plan*
+      // ends, but a grenade only gives us until it goes off. A frag detonating
+      // in 0.2s is answered from a 2.4u circle, not a 9.6u one, and using the
+      // horizon there would have the bot take the keys for every grenade
+      // within 22u of it — which in a building is most of them.
+      const reachable = speed * Math.min(tBoom, horizon);
+      if (Math.hypot(bx - px, by - py) > def[2] + reachable + slack) continue;
+
+      const dmg = def[0];
+      out.push({
+        x: bx, y: by, wx: 0, wy: 0, tMax: horizon, R: 0,
+        due: tBoom, dmg, w: k * dmg / DODGE_DMG_REF, type: p.type, phantom: false,
+        // What separates a blast from a round, and the only branch the sweeps
+        // take on it. `rMin`/`rMax` are the falloff's own two radii, and
+        // `tBoom` the single instant any of it applies at.
+        blast: 1, tBoom, rMin: def[1], rMax: def[2],
+        // Cover. `layer` is the layer the occlusion rays are cast on, `clear`
+        // is whether the blast can see where we stand right now, and `vis` is
+        // the slot dodgeDpVisible memoizes per-cell answers in — assigned by
+        // dodgeDpPlan, since it is the search's grid the cells belong to.
+        //
+        // A blast the wall already blocks is deliberately still a threat. It
+        // costs nothing anywhere the wall covers, which is the point: the wall
+        // is a gradient the planner can climb rather than a reason to stop
+        // looking. Dropping it here — which is what this did before per-cell
+        // visibility existed — meant the bot could not be pulled out of cover
+        // but could not be held in it either.
+        layer: p.layer, clear: rec.simClear, vis: -1,
+      });
+      dodgeState.blastKey = (Math.imul(dodgeState.blastKey, 31) + rec.id) | 0;
+    }
+    return out;
+  }
+
+  // ---- The grenade nobody has thrown -------------------------------------
+  //
+  // Everything above starts at the moment a projectile exists, and for a
+  // grenade that is late in a way it is not for a bullet. A frag spends up to
+  // four seconds in a hand before it spends any time in the air, and that is
+  // the part of its life we can see coming: the pin is out, the fuse is
+  // running, and the clock is on the wire as an animation.
+  //
+  // Not counting it does not merely lose the warning. It makes the fuse we do
+  // eventually report *wrong in the dangerous direction* for the throw that
+  // matters most — the one cooked to detonate on arrival. Held for three
+  // seconds and thrown, that grenade goes off about where it lands, and the
+  // planner meets it with under a second of fuse left on a threat it has never
+  // seen before.
+  //
+  // So a player currently cooking contributes one blast at their own feet, at
+  // the moment their fuse runs out. That is the assumption to make: if they
+  // never throw it, that is exactly what happens, and if they do throw it, they
+  // throw it somewhere we cannot know — towards us, which is worse, or away,
+  // which is better. Their own position is the neutral reading and the only one
+  // that does not require guessing at intent.
+  //
+  // Which is why it is priced as a phantom. Like the round nobody has fired, it
+  // is a real cost in the loss and deliberately not an event in the readouts,
+  // and DODGE.phantom is the probability half of the expectation — what the
+  // planner thinks the chance is that this becomes a blast we are near. At 0 it
+  // does not run at all, which is the same switch that turns firing lines off.
+  function dodgeAddCookedNades(out, game, selfId, selfInfo, roster, layer, leadS,
+                               px, py, speed, horizon) {
+    const k = dodgeClamp(DODGE.blast, 0, 1, 1) * dodgeClamp(DODGE.phantom, 0, 1, 0.35);
+    if (!(k > 0)) return out;
+    const pool = (findRosterOnGame(game) || game?.[GAME_ROSTER])?.playerPool;
+    if (!pool || typeof pool[POOL_GETALL] !== 'function') return out;
+    const players = pool[POOL_GETALL]() || [];
+    const n = netClock.n - 1;
+    const slack = dodgeClamp(DODGE.clearance, 0.05, 1.5, 0.35);
+
+    for (const p of players) {
+      if (!p || !p.active || p[PLAYER_NET]?.[NET_DEAD]) continue;
+      const id = Number(p.__id ?? 0);
+      if (!id) continue;
+      const st = dodgeCook.get(id);
+      const phys = dodgeCookPhys(st, n);
+      if (!phys) continue;
+      const def = BLAST_DEFS[phys.blast];
+      if (!def || !(def[0] > 0)) continue;
+      if (!sameLayerAs(layer, p.layer)) continue;
+      // Our own cook is not a threat to plan against: we decide when it leaves
+      // our hand, and the projectile it becomes is picked up by dodgeAddBlasts
+      // like anyone else's. Squadmates cannot hurt us at all.
+      if (id === selfId) continue;
+      if (roster && !isHostileTo(selfInfo, dodgePlayerInfo(roster, id))) continue;
+
+      const pos = getXY(p[PLAYER_NET]?.[PLAYER_POS] ?? p[PLAYER_POS] ?? p.pos);
+      if (!pos) continue;
+
+      // The one number this term exists for. An unwatched cook is not counted
+      // at all rather than counted from when we noticed — see trackCookAnims —
+      // so this is either a measurement or the player is not here.
+      let tBoom = phys.fuse - dodgeCookElapsed(st, n) - leadS;
+      if (!(tBoom > 0)) tBoom = 0;
+      if (tBoom > horizon) tBoom = horizon - 1e-4;
+
+      const reachable = speed * Math.min(tBoom, horizon);
+      if (Math.hypot(pos.x - px, pos.y - py) > def[2] + reachable + slack) continue;
+
+      // Cover, cached per packet like the thrown grenades' is. Neither end of
+      // this ray moves between packets and the sweep walks every obstacle on
+      // the map, so recomputing it on every step — up to 60Hz against packets
+      // arriving at 20 — was two thirds waste.
+      const pkt = netStats.updates;
+      if (st.losN !== pkt) {
+        st.losN = pkt;
+        st.los = blastLineClear(pos.x, pos.y, px, py, layer);
+      }
+
+      const dmg = def[0];
+      out.push({
+        x: pos.x, y: pos.y, wx: 0, wy: 0, tMax: horizon, R: 0,
+        due: tBoom, dmg, w: k * dmg / DODGE_DMG_REF, type: st.weap, phantom: true,
+        blast: 1, tBoom, rMin: def[1], rMax: def[2],
+        layer: p.layer, clear: st.los, vis: -1,
+      });
+      // Folded into the same key as the thrown ones: a cook starting or ending
+      // changes what the planner is solving against just as much as a grenade
+      // appearing does.
+      dodgeState.blastKey = (Math.imul(dodgeState.blastKey, 31) + id) | 0;
     }
     return out;
   }
@@ -5159,6 +6700,22 @@
   // computed once instead of once per rollout. A clean miss writes nothing:
   // near misses are not graded, so the closest approach is not worth finding.
   function dodgeSweep(i, px, py, vx, vy, th, t0, dur, hitAt) {
+    // A blast is an instant, not an interval: the leg containing it either has
+    // us inside the radius at that moment or it does not. `hitAt` is the
+    // readout's question — when are we hit — so the bar is the game's own
+    // hitbox, which for an explosion is rad.max and nothing graded.
+    if (th.blast) {
+      const t = th.tBoom;
+      if (t < t0 || t >= t0 + dur) return;
+      const dt = t - t0;
+      const dx = px + vx * dt - th.x, dy = py + vy * dt - th.y;
+      // `clear` rather than dodgeDpVisible: this rollout runs before the search
+      // does, so the grid the per-cell answers are indexed against has not been
+      // published for this plan yet. It only feeds `userHitIn`, which is a HUD
+      // readout, and the single-point answer is what that readout wants anyway.
+      if (th.clear && Math.hypot(dx, dy) < th.rMax && t < hitAt[i]) hitAt[i] = t;
+      return;
+    }
     const span = Math.min(dur, th.tMax - t0);
     if (!(span > 0)) return;
     const qx = th.x + th.wx * t0 - px;
@@ -5624,6 +7181,7 @@
     packet: -1,                 // netStats.updates
     adds: -1,                   // dodgeBulletAdds
     live: 0,                    // dodgeState.liveKey
+    blasts: 0,                  // dodgeState.blastKey
     count: -1,                  // threat count, phantoms included
     userDir: -1,                // the heading the user was holding
   };
@@ -5977,7 +7535,93 @@
     dodgeDpDir = new Int8Array(n); dodgeDpDirB = new Int8Array(n);
     dodgeDpMoveX = new Float32Array(n * 9); dodgeDpMoveY = new Float32Array(n * 9);
     dodgeDpBent = new Uint8Array(n * 9); dodgeDpStamp = new Int32Array(n * 9);
+    dodgeVisStamp = new Int32Array(n * DODGE_VIS_SLOTS);
+    dodgeVisVal = new Uint8Array(n * DODGE_VIS_SLOTS);
     dodgeDpEpoch = 0; dodgeDpVisit = 0;
+  }
+
+  // ---- Per-cell visibility ----------------------------------------------
+  //
+  // Whether a blast can see a given cell of the search grid, memoized per
+  // (cell, blast) for one plan, on exactly the pattern dodgeDpMoveFor uses for
+  // movement and for the same reason: the answer cannot depend on when we
+  // arrive, because walls do not move within a plan, so the several states that
+  // reach a cell pay for the raycast once between them.
+  //
+  // This is what replaces testing cover once from the blast to where we already
+  // stand. That test could only ever drop a threat wholesale, which meant a
+  // plan that would walk us *out* of cover into the blast was not charged for
+  // it — the bot would not be pulled out of cover, but neither would it be held
+  // in it. Per cell, the wall becomes a gradient the search can climb: the cost
+  // is zero behind it and full in front of it, so staying put and stepping back
+  // into cover are things the planner now has an opinion about.
+  //
+  // Cost is bounded by the frontier rather than by the grid. A blast is billed
+  // on the one layer its instant falls in, so only the cells reached on that
+  // layer are ever asked — at most the beam width times nine headings, and far
+  // fewer in practice because the headings out of neighbouring cells land in
+  // the same cells. The blockers are prefiltered per plan to those that could
+  // stand between the blast and anywhere reachable, so each ray scans a handful
+  // of obstacles rather than the map.
+  //
+  // Slots rather than a map, because the arrays have to be typed and indexed
+  // without allocating: four blasts get per-cell visibility and any beyond that
+  // fall back to `clear`, the single-point answer. Four simultaneous live
+  // grenades close enough to matter is already an unusual frame.
+  const DODGE_VIS_SLOTS = 4;
+  let dodgeVisStamp = new Int32Array(0);
+  let dodgeVisVal = new Uint8Array(0);
+  const dodgeVisObs = [[], [], [], []];
+  // The grid the cell indices are against, republished every plan. A cell index
+  // and a position are the same thing only with respect to one of these.
+  let dodgeDpOx = 0, dodgeDpOy = 0, dodgeDpHalf = 0, dodgeDpCell = 0.35;
+
+  // The blockers that could stand between one blast and anywhere the plan can
+  // reach: the explosion's own occlusion predicate, over the union of the blast
+  // point and the grid's own box. Built once per plan per blast.
+  function dodgeVisBuild(slot, bx, by, layer) {
+    const out = dodgeVisObs[slot];
+    out.length = 0;
+    const span = dodgeDpHalf * dodgeDpCell;
+    const loX = Math.min(bx, dodgeDpOx - span), hiX = Math.max(bx, dodgeDpOx + span);
+    const loY = Math.min(by, dodgeDpOy - span), hiY = Math.max(by, dodgeDpOy + span);
+    const obstacles = getObstacles();
+    for (let i = 0; i < obstacles.length; i++) {
+      const o = obstacles[i];
+      if (!blocksBlast(o, layer)) continue;
+      if (!colliderNearSegment(o.collider, loX, loY, hiX, hiY)) continue;
+      out.push(o);
+    }
+  }
+
+  // Is the blast's own ray to (x, y) clear? Snapped to the cell containing that
+  // point and answered for the cell centre, which is not an approximation the
+  // search has to be told about: every node's position is already reconstructed
+  // from its cell index, so the cell centre *is* where the planner thinks we
+  // are. Anything off the grid falls back to the single-point answer.
+  function dodgeDpVisible(th, x, y) {
+    const slot = th.vis;
+    if (slot < 0) return th.clear;
+    const w = dodgeDpW;
+    const ix = dodgeDpHalf + Math.round((x - dodgeDpOx) / dodgeDpCell);
+    const iy = dodgeDpHalf + Math.round((y - dodgeDpOy) / dodgeDpCell);
+    if (ix < 0 || iy < 0 || ix >= w || iy >= w) return th.clear;
+    const key = (iy * w + ix) * DODGE_VIS_SLOTS + slot;
+    if (dodgeVisStamp[key] === dodgeDpEpoch) return dodgeVisVal[key] === 1;
+    const cx = dodgeDpOx + (ix - dodgeDpHalf) * dodgeDpCell;
+    const cy = dodgeDpOy + (iy - dodgeDpHalf) * dodgeDpCell;
+    const obs = dodgeVisObs[slot];
+    let ok = true;
+    const loX = Math.min(th.x, cx), hiX = Math.max(th.x, cx);
+    const loY = Math.min(th.y, cy), hiY = Math.max(th.y, cy);
+    for (let i = 0; i < obs.length; i++) {
+      const c = obs[i].collider;
+      if (!colliderNearSegment(c, loX, loY, hiX, hiY)) continue;
+      if (segHitCollider(th.x, th.y, cx, cy, c) !== null) { ok = false; break; }
+    }
+    dodgeVisStamp[key] = dodgeDpEpoch;
+    dodgeVisVal[key] = ok ? 1 : 0;
+    return ok;
   }
 
   // dodgeSweep, but per edge instead of per rollout, graded by dodgeDpClearance,
@@ -6009,7 +7653,44 @@
   // — where it was measured at ~0.4% of threat-edge pairs in a 48-round
   // firefight — but the two rejections ahead of it are unchanged and still take
   // the bulk.
+  // A blast, billed on the one leg of the plan that contains it.
+  //
+  // Everything the round sweep is careful about — when contact opens, which leg
+  // owns the charge, how close the closest approach was — has no meaning here.
+  // A grenade goes off once. The leg containing that instant carries us to some
+  // position, that position is some distance from the blast, and the distance
+  // decides the damage. No other leg is charged, because on no other leg does
+  // the explosion exist.
+  //
+  // That also makes the billing rule automatic rather than enforced: `tBoom`
+  // falls inside exactly one half-open leg, so `billOpen`, dodgeDpSkip and the
+  // already-inside test never come into it.
+  function dodgeDpBlast(i, px, py, vx, vy, th, t0, dur) {
+    const t = th.tBoom;
+    if (t < t0 || t >= t0 + dur) return;
+    const dt = t - t0;
+    const dx = px + vx * dt - th.x;
+    const dy = py + vy * dt - th.y;
+    const d = Math.hypot(dx, dy);
+    if (d - dodgeDpClearance >= th.rMax) return;
+    // `f` is the fraction of the blast's own maximum this pass takes, so that
+    // `th.w * bill` stays what it is everywhere else: expected HP over
+    // DODGE_DMG_REF. th.w already carries the full-damage figure.
+    const f = dodgeBlastFactor(th.rMin, th.rMax, d, dodgeDpClearance);
+    if (!(f > 0)) return;
+    // Asked last, because it is the only expensive thing here and the distance
+    // test above rejects most of the grid before it is reached.
+    if (!dodgeDpVisible(th, px + vx * dt, py + vy * dt)) return;
+    const bill = f * Math.exp(dodgeDpTimeDecay * t);
+    if (bill > dodgeDpBill[i]) {
+      dodgeDpBill[i] = bill;
+      dodgeDpFactor[i] = f;
+      dodgeDpTouch[i] = t;
+    }
+  }
+
   function dodgeDpSweep(i, px, py, vx, vy, th, t0, dur, billOpen) {
+    if (th.blast) return dodgeDpBlast(i, px, py, vx, vy, th, t0, dur);
     const span = Math.min(dur, th.tMax - t0);
     if (!(span > 0)) return;
     const qx = th.x + th.wx * t0 - px;
@@ -6082,6 +7763,9 @@
   // dodgeDpSweep for it — every sub-step after the first opens inside whatever
   // the one before it was inside, which would silence the charge entirely.
   function dodgeDpInBand(th, t0, px, py) {
+    // A blast has no band to already be inside — it bills on the leg its own
+    // instant falls in and nowhere else, so it must never be suppressed here.
+    if (th.blast) return false;
     const qx = th.x + th.wx * t0 - px;
     const qy = th.y + th.wy * t0 - py;
     const outer = th.R + dodgeDpPad;
@@ -6240,11 +7924,27 @@
     // have to outlive one plan — but they do have to stay inside an Int32.
     if (dodgeDpEpoch > 2e9 || dodgeDpVisit > 2e9) {
       dodgeDpStamp.fill(0); dodgeDpSeen.fill(0); dodgeDpSeenB.fill(0);
+      // The visibility memo is stamped with the epoch too, so it has to be
+      // cleared with it: the counter restarts at 1, and a cell last written on
+      // plan 1 and never since would otherwise read as current.
+      dodgeVisStamp.fill(0);
       dodgeDpEpoch = 0; dodgeDpVisit = 0;
     }
     dodgeDpEpoch++;
 
     const ox = prefix.x, oy = prefix.y;
+    // Published so dodgeDpVisible can turn a position into a cell. The epoch
+    // bumped just above is what invalidates the last plan's answers, which it
+    // has to: the grid's origin, width and cell size all move between plans, so
+    // a cached cell index means nothing across one.
+    dodgeDpOx = ox; dodgeDpOy = oy; dodgeDpHalf = half; dodgeDpCell = cell;
+    for (let i = 0, slot = 0; i < threats.length; i++) {
+      const th = threats[i];
+      if (!th.blast) continue;
+      th.vis = slot < DODGE_VIS_SLOTS ? slot : -1;
+      if (th.vis >= 0) dodgeVisBuild(th.vis, th.x, th.y, th.layer);
+      slot++;
+    }
     const start = half * w + half;
     let curLen = 1, q, layer;
 
@@ -6503,7 +8203,7 @@
   // more often than it is pressed. It is the same bot, deciding at the rate
   // the information arrives instead of at the rate the monitor refreshes.
   const DODGE_PLAN_KNOBS = ['horizon', 'clearance', 'leadK', 'halfLife',
-                            'follow', 'phantom', 'stepS', 'cell'];
+                            'follow', 'phantom', 'blast', 'stepS', 'cell'];
   const dodgePlanKnobs = new Float64Array(DODGE_PLAN_KNOBS.length);
 
   // Tests and latches in one pass, so it must be called exactly once per step.
@@ -6565,6 +8265,7 @@
     if (dodgePlan.packet !== packet) return false;
     if (dodgePlan.adds !== dodgeBulletAdds) return false;
     if (dodgePlan.live !== dodgeState.liveKey) return false;
+    if (dodgePlan.blasts !== dodgeState.blastKey) return false;
     // Phantoms carry no identity of their own, so the count stands in for one.
     // They are packet data — position, aim, weapon — so the counter above has
     // already caught every way one can appear or go; this is belt and braces
@@ -6645,6 +8346,16 @@
     // everything downstream — see dodgeAddPhantoms.
     dodgeAddPhantoms(threats, game, selfId, selfInfo, roster, layer, leadS, selfR,
       pos.x, pos.y, reach, horizon);
+    // Then the grenades, which are neither: a blast is not in the air and not a
+    // guess about anyone's intentions, it is a clock that has already been
+    // started. Appended to the same list and carrying the same fields, with
+    // `blast` the one flag the sweeps branch on. See dodgeAddBlasts.
+    dodgeAddBlasts(threats, selfId, selfInfo, roster, layer, leadS,
+      pos.x, pos.y, speed, horizon);
+    // And the grenades still in a hand, whose fuse is already running and whose
+    // clock is on the wire. See dodgeAddCookedNades.
+    dodgeAddCookedNades(threats, game, selfId, selfInfo, roster, layer, leadS,
+      pos.x, pos.y, speed, horizon);
     // The overwhelmingly common case, and the one that has to cost nothing:
     // nothing that could reach us — no round in the air and, with the firing
     // lines term on, nobody's aim passing near us either — so the keys are the
@@ -6739,6 +8450,7 @@
     dodgePlan.packet = packet;
     dodgePlan.adds = dodgeBulletAdds;
     dodgePlan.live = dodgeState.liveKey;
+    dodgePlan.blasts = dodgeState.blastKey;
     dodgePlan.count = threats.length;
     dodgePlan.userDir = userDir;
     // Where the newest packet put us, as against dodgePath[0], which is where
@@ -6751,6 +8463,149 @@
     dodgePath.at = now;
     dodgeApply(binds, open);
   }
+
+  // ---- Frag aim -----------------------------------------------------------
+  //
+  // While a grenade is cooking in our hand, the cursor is driven every frame to
+  // the throw that would land nearest the target — so releasing at any instant
+  // throws it there, and the user's job is reduced to deciding *when*.
+  //
+  // Driving continuously rather than fixing the aim on release turns out to be
+  // both simpler and better. Simpler because there is nothing to defer: the
+  // game builds one input message a frame from whatever the cursor currently
+  // is, so if the cursor has been right on every frame then it is right on the
+  // frame the release happens to land in, and no part of the release has to be
+  // intercepted or held back. Better because the throw is no longer a single
+  // solved instant that may already be stale by the time the packet goes out —
+  // it is re-solved against where the target is now, sixty times a second,
+  // until the moment it is let go.
+  //
+  // The user's real mouse is suppressed while this is driving, exactly as it is
+  // while the gun aimbot's key is held, but it is still *recorded* — target
+  // selection reads it, so moving the (invisible) cursor still chooses who to
+  // throw at. That division is deliberate: this answers "how hard, and in what
+  // direction", which is the part a human is bad at, and never "who".
+  const fragState = {
+    driving: false,
+    x: 0, y: 0,               // the synthetic cursor, in screen pixels
+    targetId: null,
+    err: 0,
+    // The solved landing point, so the overlay ring can show where the grenade
+    // is actually going rather than where the suppressed cursor points.
+    landX: 0, landY: 0, haveLand: false,
+    // Last frame's answer, used to warm-start the next solve.
+    bearing: NaN, len: NaN,
+  };
+
+  function fragActive() { return fragState.driving; }
+
+  // Hand the cursor back. Replays the user's real position once so the game's
+  // aim snaps to where their mouse actually is rather than holding the last
+  // thing we sent.
+  function fragRelease() {
+    if (!fragState.driving) return;
+    fragState.driving = false;
+    fragState.targetId = null;
+    fragState.haveLand = false;
+    fragState.bearing = NaN; fragState.len = NaN;
+    if (!realMouse.hasMoved) return;
+    fragDispatch(Math.round(realMouse.x), Math.round(realMouse.y));
+  }
+
+  function fragDispatch(x, y) {
+    const target = document.querySelector('canvas') || document.body;
+    if (!target) return;
+    try {
+      target.dispatchEvent(new MouseEvent('mousemove', {
+        bubbles: true, cancelable: true, view: window,
+        clientX: x, clientY: y, screenX: x, screenY: y,
+      }));
+    } catch {}
+  }
+
+  function fragTick() {
+    if (!FRAGBOT.enabled) { fragRelease(); return; }
+
+    const game = capturedGame;
+    const me = findLocalPlayerOnGame(game);
+    const selfId = Number(me?.__id ?? 0) || null;
+    if (!me || !selfId) { fragRelease(); return; }
+
+    // Cooking, with a fuse on it. This is the whole gate — the cook state is
+    // exactly "the pin is out and it has not left our hand", and it ends by
+    // itself the moment the throw goes out. Impact throwables are excluded by
+    // dodgeCookPhys and should be: their whole flight is the aim, and there is
+    // no detonation point to solve for.
+    const nTick = netClock.n - 1;
+    const st = dodgeCook.get(selfId);
+    const phys = dodgeCookPhys(st, nTick);
+    if (!phys) { fragRelease(); return; }
+
+    const sample = pageSamples[pageSamples.length - 1];
+    const player = sample ? liveSelf(sample) : null;
+    if (!player || !sample.enemies?.length) { fragRelease(); return; }
+    const [enemy] = pickTarget(player, sample.enemies, Date.now());
+    if (!enemy) { fragRelease(); return; }
+
+    const left = Math.max(0, phys.fuse - dodgeCookElapsed(st, nTick));
+    if (!(left > 0.05)) { fragRelease(); return; }   // already going off
+
+    // Where they will be when it detonates. Their position is a one-way trip
+    // old and a release now lands a one-way trip from now, which is the round
+    // trip; the fuse burns on top of that. Read off the same recovered clock
+    // the aim helper leads with, so a strafing target is led and a standing one
+    // is not.
+    const tNow = performance.now();
+    const leadMs = (smoothedPingMs() ?? 0) + left * 1000;
+    const pair = clockPairAt(enemy.id, tNow);
+    const at = pair ? pairAt(pair, tNow + leadMs) : {
+      x: enemy.x + (enemy.xv ?? 0) * (leadMs / 1000),
+      y: enemy.y + (enemy.yv ?? 0) * (leadMs / 1000),
+    };
+
+    const layer = Number.isFinite(me.layer) ? me.layer : 0;
+    const c = dodgeThrowContext(phys, me, layer, left);
+    if (!c.ok) { fragRelease(); return; }
+
+    // Warm start from last frame. Solving sixty times a second against a target
+    // that moves smoothly means the previous answer is nearly this one, so the
+    // sweep can open much narrower — but only while it is the same target and
+    // the last solve actually converged, or a stale seed would anchor the
+    // search somewhere it should have left.
+    const warm = fragState.driving && fragState.targetId === enemy.id &&
+      Number.isFinite(fragState.bearing) ? fragState : null;
+    const sol = fragSolve(c, at.x, at.y, warm);
+
+    const scale = getLivePxPerWorldUnit(sample);
+    if (!(scale > 0)) { fragRelease(); return; }
+
+    fragState.x = Math.round(window.innerWidth / 2 + sol.dx * sol.len * scale);
+    fragState.y = Math.round(window.innerHeight / 2 - sol.dy * sol.len * scale);
+    fragState.targetId = enemy.id;
+    fragState.err = sol.err;
+    fragState.landX = sol.x; fragState.landY = sol.y; fragState.haveLand = true;
+    fragState.bearing = Math.atan2(sol.dy, sol.dx);
+    fragState.len = sol.len;
+    fragState.driving = true;
+    fragDispatch(fragState.x, fragState.y);
+  }
+
+  function fragFrameTick() {
+    try { fragTick(); } catch { try { fragRelease(); } catch {} }
+    requestAnimationFrame(fragFrameTick);
+  }
+  requestAnimationFrame(fragFrameTick);
+
+  window.__frag = () => ({
+    enabled: !!FRAGBOT.enabled,
+    // Driving means the cursor is ours this frame: we are cooking, there is a
+    // target, and a throw at it has been solved.
+    driving: fragState.driving,
+    targetId: fragState.targetId,
+    // How far the solved throw misses the extrapolated target by, in units. A
+    // few hundredths is the search resolution; several units means a wall.
+    missBy: Number(fragState.err.toFixed(2)),
+  });
 
   function dodgeFrameTick() {
     try {
@@ -6782,8 +8637,58 @@
     // hostiles whose aim currently passes close enough to be charged for — one
     // per enemy, never more. See dodgeAddPhantoms.
     threats: dodgeState.threats.length,
-    live: dodgeState.threats.filter((t) => !t.phantom).length,
-    phantoms: dodgeState.threats.filter((t) => t.phantom).length,
+    live: dodgeState.threats.filter((t) => !t.phantom && !t.blast).length,
+    phantoms: dodgeState.threats.filter((t) => t.phantom && !t.blast).length,
+    // Grenades whose blast is being planned against, and the worst of them in
+    // HP at the centre — 125 for a frag, before the falloff and before the
+    // distance any plan puts between us and it. `blastIn` is how long the
+    // soonest of them has left, in seconds of plan time; it reads exactly
+    // `horizon` for a fuse the planner could not see the end of, which is the
+    // clamp in dodgeAddBlasts and not a measurement.
+    blasts: dodgeState.threats.filter((t) => t.blast && !t.phantom).length,
+    // Grenades still in a hand with the fuse already running, priced as
+    // phantoms — see dodgeAddCookedNades. Counted apart from `blasts` because
+    // one is a thing that exists and the other is a thing somebody is holding.
+    cooking: dodgeState.threats.filter((t) => t.blast && t.phantom).length,
+    worstBlast: Number(dodgeState.threats.reduce(
+      (m, t) => (t.blast ? Math.max(m, t.dmg) : m), 0).toFixed(1)),
+    blastIn: dodgeState.threats.reduce(
+      (m, t) => (t.blast && !t.phantom ? Math.min(m, t.tBoom) : m), Infinity),
+    // Every cook we are currently watching: who, what, and how long it has been
+    // burning. This is the readout that says whether the fix for cooks is
+    // working — a cook that never appears here is one the animation watch
+    // missed, and its grenade will arrive with a fuse read as full.
+    cooks: (() => {
+      const nn = netClock.n - 1;
+      const out = [];
+      for (const [id, st] of dodgeCook) {
+        if (!dodgeCookPhys(st, nn)) continue;
+        out.push({ id, weap: st.weap, held: Number(dodgeCookElapsed(st, nn).toFixed(2)),
+                   exact: st.exact });
+      }
+      return out;
+    })(),
+    // Grenades in the air whose cook we actually timed, against how many are
+    // being tracked at all. A `cookTimed` under `tracked` is not a fault — most
+    // throws are not cooked, and an untimed one is assumed uncooked — but a
+    // ratio that is always zero means the anim watch is not seeing throws.
+    tracked: dodgeProj.size,
+    cookTimed: (() => { let k = 0; for (const r of dodgeProj.values()) if (r.cookExact) k++; return k; })(),
+    // Grenades whose thrower the throw animation named outright, against those
+    // attributed by falling back to the nearest body. Only a named one can make
+    // a grenade harmless, so an `owned` well under `tracked` in a squad means
+    // the bot is dodging its own team's grenades — see dodgeProjThrower.
+    owned: (() => { let k = 0; for (const r of dodgeProj.values()) if (r.throwerSure) k++; return k; })(),
+    // Every grenade in the air: type, who threw it, how sure of that, and how
+    // long the fuse has left. The one readout that says whether attribution is
+    // working at all.
+    nades: [...dodgeProj.values()].map((r) => ({
+      type: r.type,
+      thrower: r.thrower || null,
+      sure: r.throwerSure,
+      cooked: r.cookExact ? Number(r.cooked.toFixed(2)) : null,
+      fuse: Number(Math.max(0, r.boomT - (Date.now() - r.at) / 1000).toFixed(2)),
+    })),
     // Worst round in the air, in HP, and how many of the *live* ones we could
     // actually name. A `typed` well under `live` means the addBullet hook went
     // on mid-flight or survev has shipped a bullet BULLET_DAMAGE doesn't list —
@@ -6791,12 +8696,12 @@
     // named (they are priced from the gun, or they do not exist) and so are
     // counted in neither, or they would hide exactly that failure.
     worstDmg: Number(dodgeState.threats.reduce(
-      (m, t) => (t.phantom ? m : Math.max(m, t.dmg)), 0).toFixed(1)),
-    typed: dodgeState.threats.filter((t) => !t.phantom && !!BULLET_DAMAGE[t.type]).length,
+      (m, t) => (t.phantom || t.blast ? m : Math.max(m, t.dmg)), 0).toFixed(1)),
+    typed: dodgeState.threats.filter((t) => !t.phantom && !t.blast && !!BULLET_DAMAGE[t.type]).length,
     // What the worst line currently aimed at us would take off if it were
     // fired, before DODGE.phantom's discount. 0 with nothing pointed our way.
     worstAimed: Number(dodgeState.threats.reduce(
-      (m, t) => (t.phantom ? Math.max(m, t.dmg) : m), 0).toFixed(1)),
+      (m, t) => (t.phantom && !t.blast ? Math.max(m, t.dmg) : m), 0).toFixed(1)),
     walls: dodgeState.walls.length,
     leadMs: Math.round(dodgeState.leadS * 1000),
     userHitIn: dodgeState.userHitIn,
@@ -7451,6 +9356,12 @@
             // interval log running.
             debugLogUpdateInterval();
             snapshotPlayers(game);
+            // Before the projectiles, because a grenade appearing this tick is
+            // dated by the throw animation of the tick before it — and after
+            // clockOnPacket, because both measure in ticks and convert with the
+            // slope it has just refit.
+            trackCookAnims(game);
+            snapshotProjectiles(game);
             // Strictly after both: it reads the pair snapshotPlayers has just
             // pushed, against the tick length clockOnPacket has just refit.
             dodgeTrackSpeed(game);
@@ -9253,6 +11164,206 @@
       (Date.now() - dodgePath.at) <= DODGE_PATH_STALE_MS;
   }
 
+  // ---- Grenade rings ----------------------------------------------------
+  //
+  // Every grenade in the air, drawn as the blast it is going to make: two rings
+  // at the *detonation* point rather than around the sprite, because for
+  // anything still moving those are not the same place and the one that matters
+  // is where it will be when the fuse runs out. A leader line joins the two
+  // when they differ, so a grenade mid-flight reads as "it is here, it goes off
+  // there" rather than as a ring that has drifted off its object.
+  //
+  // The rings are the game's own two radii. Inside the inner one the blast does
+  // its full damage flat; between them it ramps to nothing at the outer one.
+  // That ramp is measured from the centre rather than from the inner ring, so
+  // the step across the inner ring is real and worth being able to see: a frag
+  // is 125 just inside it and 73 just outside.
+  //
+  // The fuse is over the grenade, in seconds. A `~` in front of it means the
+  // cook was not measured — nobody was watched pulling the pin, so the number
+  // is the longest the fuse can be and the grenade may go off sooner. See
+  // dodgeProjBoom for where both numbers come from; nothing here computes
+  // anything, it reads the same per-packet record the planner is scored
+  // against.
+  const DODGE_RING_RGB = '255, 60, 48';
+
+  // Something to actually draw, not merely something tracked. `dodgeCook` keeps
+  // an entry per player we have watched and is only trimmed at 32, so asking it
+  // for a non-zero size answered "yes" for the whole round — which held the
+  // overlay canvas open and ran the draw path on every frame of a match with no
+  // grenade anywhere in it.
+  function dodgeRingsVisible() {
+    if (!DODGE.rings) return false;
+    if (dodgeProj.size > 0) return true;
+    const n = netClock.n - 1;
+    for (const st of dodgeCook.values()) if (dodgeCookPhys(st, n)) return true;
+    return false;
+  }
+
+  function drawGrenadeRings(ctx) {
+    const sample = pageSamples[pageSamples.length - 1];
+    const player = sample && sample.self;
+    if (!player) return;
+    const pi = stateOnClock(player.id, renderNowMs())
+      || interpPos('__self__', player.x, player.y);
+    const scale = getLivePxPerWorldUnit(sample);
+    if (!(scale > 0)) return;
+    const cx = window.innerWidth / 2;
+    const cy = window.innerHeight / 2;
+    const px = (wx) => cx + (wx - pi.x) * scale;
+    const py = (wy) => cy - (wy - pi.y) * scale;
+    const now = Date.now();
+    const me = findLocalPlayerOnGame(capturedGame);
+    const layer = Number.isFinite(me?.layer) ? me.layer : 0;
+    // Who we are, so a grenade that cannot hurt us can be left off the screen.
+    // Read through the same isHostileTo the planner, the sampler and the name
+    // tags use, so the four cannot disagree about who is on our side.
+    const selfId = Number(me?.__id ?? 0) || null;
+    const roster = findRosterOnGame(capturedGame) || capturedGame?.[GAME_ROSTER];
+    const selfInfo = roster && selfId != null ? dodgePlayerInfo(roster, selfId) : null;
+    const friendly = (id) => !!roster && !!id && id !== selfId &&
+      !isHostileTo(selfInfo, dodgePlayerInfo(roster, id));
+
+    // The live sprites, so a grenade is drawn where the renderer has it rather
+    // than where the last packet left it — the rings are a world annotation and
+    // have to sit on the object they annotate.
+    const list = getProjectiles();
+    for (let i = 0; i < list.length; i++) {
+      const p = list[i];
+      if (!p || !p.active || !p.pos) continue;
+      // An explosion only touches what shares its layer, so a grenade a floor
+      // away is drawing a circle we cannot be inside. Same test the threat
+      // build makes, for the same reason.
+      if (!sameLayerAs(layer, p.layer)) continue;
+      const phys = THROWABLE_PHYS[p.type];
+      if (!phys || phys.impact) continue;
+      const def = BLAST_DEFS[phys.blast];
+      if (!def || !(def[0] > 0)) continue;
+      const rec = dodgeProj.get(Number(p.__id ?? 0));
+      if (!rec) continue;
+      // A squadmate's grenade cannot touch us, so it is ink over the fight for
+      // nothing. Only a thrower the throw animation *named* is allowed to hide
+      // one: a guess from proximity is not enough to take a 12u circle off the
+      // screen, the same asymmetry that decides whether the planner may drop it.
+      // Our own is still drawn — it hurts us in full.
+      if (rec.throwerSure && friendly(rec.thrower)) continue;
+
+      // Counted from the packet the record is as of, so the disc grows smoothly
+      // between updates instead of stepping at 20Hz.
+      const left = Math.max(0, rec.boomT - (now - rec.at) / 1000);
+      drawBlastRing(ctx, px(rec.boomX), py(rec.boomY), px(p.pos.x), py(p.pos.y),
+                    def, scale, left, phys.fuse, false);
+    }
+
+    // The grenades still in a hand. Drawn from the same cook states the planner
+    // prices, at the holder's feet and with a dashed outline to say the place is
+    // a guess in a way a thrown grenade's is not — they can still throw it, and
+    // where it goes then is not knowable from anything on the wire. The fuse,
+    // though, is exactly as real as a thrown one's, and it is the thing worth
+    // seeing: somebody three quarters through a frag is about to produce a blast
+    // nobody gets to plan against.
+    const nTick = netClock.n - 1;
+    const pool = (findRosterOnGame(capturedGame) || capturedGame?.[GAME_ROSTER])?.playerPool;
+    const players = pool && typeof pool[POOL_GETALL] === 'function' ? pool[POOL_GETALL]() : [];
+    for (const p of players) {
+      if (!p || !p.active || p[PLAYER_NET]?.[NET_DEAD]) continue;
+      const pid = Number(p.__id ?? 0);
+      // A squadmate cooking a frag is not a thing that can happen to us, so it
+      // is ink for nothing. Our own is the opposite: knowing *that* we are
+      // cooking is not the same as knowing how much of the fuse is left, and
+      // that is the number the whole ring exists to show. It is also the fuse
+      // we can still do something about.
+      //
+      // This is display parting company with the loss on purpose. The planner
+      // does not price our own cook — we decide when it leaves our hand, so it
+      // is not a threat to plan around — but the overlay draws it, because the
+      // countdown is for the player and the loss is not.
+      if (friendly(pid)) continue;
+      const st = dodgeCook.get(pid);
+      const phys = dodgeCookPhys(st, nTick);
+      if (!phys) continue;
+      const def = BLAST_DEFS[phys.blast];
+      if (!def || !(def[0] > 0)) continue;
+      if (!sameLayerAs(layer, p.layer)) continue;
+      const pos = getXY(p[PLAYER_NET]?.[PLAYER_POS] ?? p[PLAYER_POS] ?? p.pos);
+      if (!pos) continue;
+      const left = Math.max(0, phys.fuse - dodgeCookElapsed(st, nTick));
+      const sx = px(pos.x), sy = py(pos.y);
+
+      // Our own cook is the one we can say something better about than "it goes
+      // off where you are standing". We know the cursor, and on this server the
+      // cursor *is* the throw strength — so the whole throw can be simulated and
+      // the ring put where the grenade would actually end up if we let go now.
+      // For anyone else the cursor is not on the wire and their feet remain the
+      // only honest answer.
+      if (pid === selfId && dodgeThrowPreview(phys, p, layer, left, dodgeThrowOut)) {
+        drawBlastRing(ctx, px(dodgeThrowOut.x), py(dodgeThrowOut.y), sx, sy,
+                      def, scale, left, phys.fuse, true);
+      } else {
+        drawBlastRing(ctx, sx, sy, sx, sy, def, scale, left, phys.fuse, true);
+      }
+    }
+
+  }
+
+  // One grenade's worth of ink: the damage radius outlined at (bx, by) where it
+  // goes off, a disc inside it growing to meet that outline as the fuse burns,
+  // and a leader back to (gx, gy) where the grenade is now. `held` dashes the
+  // outline, which is how a grenade still in a hand is told from one already
+  // committed to a place.
+  function drawBlastRing(ctx, bx, by, gx, gy, def, scale, left, fuse, held) {
+    const outer = def[2] * scale;
+
+    // How much of the fuse is gone, as a fraction of the whole of it. Measured
+    // against the throwable's own fuse rather than against when we first saw
+    // it, so a grenade cooked for three seconds arrives three quarters full
+    // instead of starting from empty and lying about how long there is.
+    const burnt = fuse > 0 ? Math.min(Math.max(1 - left / fuse, 0), 1) : 1;
+
+    // The damage radius, outlined. Fixed and faint: it is a fact about the
+    // grenade and not about the clock, so it must not compete with the thing
+    // that is moving. Dashed while the grenade is still in a hand, where the
+    // centre is a guess about somebody who has not committed to it yet.
+    ctx.setLineDash(held ? [5, 5] : []);
+    ctx.lineWidth = 1.25;
+    ctx.strokeStyle = `rgba(${DODGE_RING_RGB}, 0.55)`;
+    ctx.beginPath();
+    ctx.arc(bx, by, outer, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // And the clock, as a disc growing out to meet that outline. This is the
+    // whole of the countdown: full circle means now. It reads at a glance and
+    // without being looked at directly, which a number in the corner of a
+    // firefight does not, and it is in the units that actually matter — the
+    // ground the blast is about to cover — rather than in seconds the reader
+    // then has to convert into distance themselves.
+    if (burnt > 0.005) {
+      ctx.fillStyle = `rgba(${DODGE_RING_RGB}, 0.26)`;
+      ctx.beginPath();
+      ctx.arc(bx, by, outer * burnt, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Where it is now, against where it goes off. Only drawn once the two are
+    // far enough apart to be telling us something.
+    if (Math.hypot(gx - bx, gy - by) > 6) {
+      ctx.setLineDash([3, 4]);
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = `rgba(${DODGE_RING_RGB}, 0.6)`;
+      ctx.beginPath();
+      ctx.moveTo(gx, gy);
+      ctx.lineTo(bx, by);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = `rgba(${DODGE_RING_RGB}, 0.8)`;
+      ctx.beginPath();
+      ctx.arc(bx, by, 2.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+
   function drawDodgePlan(ctx) {
     const sample = pageSamples[pageSamples.length - 1];
     const player = sample && sample.self;
@@ -9383,13 +11494,14 @@
     // flipping the toggle back on resumes on the very next frame. Sampling,
     // aim and netcode are untouched — this is a display switch only.
     //
-    // The dodge plan is its own toggle on the same canvas, and one of the
-    // things it is for is watching the bot with nothing else drawn over the
-    // screen — so it holds the canvas open on its own, and neither switch can
-    // blank the other's drawing.
+    // The dodge plan and the grenade rings are their own toggles on the same
+    // canvas, and one of the things they are for is watching the bot with
+    // nothing else drawn over the screen — so each holds the canvas open on its
+    // own, and no switch can blank another's drawing.
     const showPlan = dodgePlanVisible();
-    overlayCanvas.style.display = (ESP.enabled || showPlan) ? 'block' : 'none';
-    if (!ESP.enabled && !showPlan) {
+    const showRings = dodgeRingsVisible();
+    overlayCanvas.style.display = (ESP.enabled || showPlan || showRings) ? 'block' : 'none';
+    if (!ESP.enabled && !showPlan && !showRings) {
       requestAnimationFrame(overlayFrame);
       return;
     }
@@ -9554,6 +11666,12 @@
         ctx.arc(axs, ays, 2.5, 0, Math.PI * 2);
         ctx.fill();
       }
+    }
+
+    // Under the plan, over the ESP: a 12u circle is a big shape and the plan is
+    // a thin line, so the line has to win where they cross.
+    if (showRings) {
+      try { drawGrenadeRings(ctx); } catch {}
     }
 
     // Last, so it sits over the rings rather than under them.

@@ -2,9 +2,11 @@
 
 Takes the movement keys for exactly as long as something is going to hit us,
 and hands them back when nothing is. Off by default; "Dodge bot" in the MOD
-tab. "Something" is every round in the air, plus — because a round in the air
+tab. "Something" is every round in the air; plus — because a round in the air
 is already half a beat too late to answer — one hypothetical round per enemy
-currently aimed at us, at a discount. See [Firing lines](#firing-lines).
+currently aimed at us, at a discount; plus the blast of every grenade whose fuse
+is already burning. See [Firing lines](#firing-lines) and
+[Grenades](#grenades).
 
 # What is and isn't dodgeable
 
@@ -514,6 +516,432 @@ along the aim, which matters only at ranges where nothing here helps anyway),
 and the magazine, which is not on the wire for anyone but us — an enemy who is
 dry, reloading or mid-switch is still modelled as able to fire.
 
+# Grenades
+
+A round is a line and a blast is a moment, and that difference decides
+everything about how one is scored. There is nothing to sweep, no closest
+approach to find, and no question of when contact begins: a grenade does exactly
+one thing to us and it does it at one instant. What has to be right is *where*
+it is at that instant and *when* that instant is — and the wire carries neither.
+
+A projectile's update is `pos`, `posZ` and `dir`, plus `type` and `layer` on a
+full update. No velocity, no fuse, no thrower. All three are reconstructed.
+
+## Where it will be
+
+By simulating it, not by solving it. The closed form exists — the airborne leg
+is a straight line at constant speed for `(velZ + √(velZ² + 2g·z₀))/g` seconds,
+1.044s for a frag, and the ground leg's entire remaining travel is exactly
+`speed/drag` however the tick length is chosen — but it stops existing the
+moment the grenade touches anything, and grenades are thrown at cover for a
+living. Stepping survev's own integrator handles bounces, the table it lands on
+and the river it falls in without any of them being a case anyone has to write,
+and it costs a few hundred multiplies for a threat that appears a handful of
+times a match.
+
+Three things about that loop are easy to write plausibly and get backwards, and
+all three change the answer by units:
+
+- **Drag applies only while it is resting.** `posZ <= obstacleBellowHeight` is
+  the server's test. An airborne grenade holds its horizontal speed *exactly*,
+  which is also why one snapshot delta measures that speed outright rather than
+  sampling something that is changing.
+- **There is no bounce in Z.** `posZ` is clamped at the floor and `velZ` carries
+  on downward, so a grenade lands once and stays landed. One arc covers the
+  whole life.
+- **A bounce keeps `max(1 + d·n, 0.15)` of its speed**, so a graze keeps almost
+  everything and a head-on hit keeps a sixth. Obstacles *below* it raise the
+  floor instead of turning it, which is how a grenade comes to rest on a crate.
+
+`tests/blast_sim.js` drives the shipped simulator against an independent
+transcription of `server/src/game/objects/projectile.ts` over open ground, a
+wall, a glancing wall, a table, a barrel, a bush, water, a cooked airburst and a
+short lob. Worst position error across the nine: **0.000u**. It also checks the
+two independently derivable numbers — the air time and the `v/drag` slide —
+which agree with the loop to 0.083u, the whole of which is Euler at 100Hz
+against the exact parabola.
+
+## Solved once
+
+The detonation point is solved on the first packet that can measure a velocity —
+the second one, since velocity takes two snapshots — and then **frozen for the
+life of the grenade**.
+
+That is not an optimisation, though it is one. Re-running the simulation every
+packet is *redundant*: simulating from a later state over a correspondingly
+shorter fuse lands in the same place, because the later state is on the
+trajectory the earlier run computed. All re-running can add is the jitter of
+re-deriving velocity from a fresh pair of quantised positions, which makes the
+blast point wander when it is a fixed spot on the ground. The same test file
+checks the invariant directly, re-solving each scenario from a quarter, a half
+and three quarters of the way through its fuse: **0.000u** of drift in every
+one, bounces and tables included.
+
+Getting that clean took a real fix. The simulation used to start with its floor
+at zero and build up from there, which is right for a grenade in the air and
+wrong for one already resting on a table — it would believe itself airborne,
+skip the drag it should have been under, fall to the ground and be put back.
+Handing it a state mid-slide diverged by 11u. The floor is now derived from the
+state the simulation is given, the way `obstacleBellowHeight` is carried across
+ticks on the server.
+
+Freezing has one cost worth naming: if the world changes under the prediction —
+a crate the grenade would have bounced off is destroyed mid-flight — the frozen
+point is stale and nothing re-checks it.
+
+## When it goes off
+
+The fuse is not on the wire, but the *animation* is. The server calls
+`playAnim(Anim.Cook, fuseTime)` the instant the pin comes out and
+`playAnim(Anim.Throw, …)` the instant it leaves the hand, and both ride the
+player's full update as `animType`/`animSeq`. Those two transitions bracket the
+cook exactly, to within the packet they arrived on.
+
+They are read off **netData**, through `mangled.js` — `netData.animType` and
+`netData.animSeq`, derived by the same `derive_field_on` anchor as
+`activeWeapon`, off `this.<netData>.<X> = e.animType`. The client also keeps a
+render-side `player.anim` under readable names that would need no dictionary
+entry, and it is the fallback, but it is not the source: `player.anim` is the
+animation the client is *playing*, and it resets `anim.type` to None locally —
+without touching `anim.seq` — when the selected animation has no data and when
+the active weapon stops being a throwable. Neither fires during a real cook, so
+reading it worked; but a transition detected by a sequence change and then
+classified by a type something local may have rewritten is a fragile pair to
+hang the whole fuse estimate on. netData is the verbatim wire copy and nothing
+but the packet writes to it.
+
+That is worth the bookkeeping because cooking is the whole difficulty. An
+uncooked frag detonates 4s after the throw and is at rest for the last second
+and a half of it; one cooked for three seconds goes off about where it lands.
+
+**We never see a grenade at the height it was thrown from.** The server creates
+it at `posZ` 0.5 on a 100Hz physics tick and serialises the world at 33Hz, so
+one to three ticks of flight have already happened by the time the first packet
+carrying it arrives, and `posZ` is between 0.549 and 0.644. Any test for spawn
+height is a test that cannot pass — and while one was the gate on this path,
+nothing behind it ever ran: no grenade was attributed, no cook was carried, and
+every fuse read as full.
+
+So the age comes from the arc, which has two answers — the same `posZ` occurs
+once going up and once coming down — and **the throw animation picks between
+them**:
+
+1. **Somebody threw within the last few ticks.** The grenade is at the start of
+   its flight, so the ascending root is the age, and their cook comes with it.
+   This close to the throw `velZ` is still near its full 5 and the inversion is
+   at its best conditioned, dating it to a fraction of a millisecond.
+2. **Nobody threw.** We have picked it up in the middle of a life we did not
+   watch, so the descending root is taken — the larger of the two, which reads
+   as the older grenade, the one that goes off sooner. The fuse is assumed full,
+   which is the longest it can be. A second snapshot with a rising `posZ`
+   corrects the branch.
+
+The cook itself is only carried from a thrower the animation *named*, never from
+the fallback that guesses the nearest body — better an assumed full fuse than
+somebody else's measured one. And "watched begin" means we had an update about
+that player on the tick before the pin came out, not merely that we have seen
+them at some point: a player cooking out of view sends no updates at all, so
+when they walk back in their `animSeq` has moved and their `animType` is Cook,
+and nothing in that packet distinguishes a pin pulled just now from one pulled
+three seconds ago behind a wall.
+
+An unmeasured cook reads as "nobody cooked it", which is the longest fuse the
+grenade can have. That would be a grenade the planner never sees, except for the
+rule below.
+
+The elapsed time is measured in pseudotime — the clock the netcode block
+recovers — because that is what the tick indices mean and it is jitter-free by
+construction. Wall time is the fallback rather than a fabricated tick length:
+survev's `netSyncTps` is 33, so assuming 50ms would inflate every cook by two
+thirds and read a 2s cook as 3.3s — a fifth of a frag's fuse, invented.
+
+## The grenade nobody has thrown
+
+A frag spends up to four seconds in a hand before it spends any in the air, and
+that is the part of its life we can see coming: the pin is out, the fuse is
+running, and the clock is on the wire as an animation. Starting only when the
+projectile exists is late for a bullet and much later for this.
+
+It is also wrong in the dangerous direction for the throw that matters most. A
+grenade cooked for three seconds goes off about where it lands, so the planner
+first meets it with under a second of fuse on a threat it has never seen.
+
+So a player currently cooking contributes one blast **at their own feet**, at
+the moment their fuse runs out. If they never throw it that is exactly what
+happens; if they do, they throw it somewhere unknowable — at us, which is worse,
+or away, which is better. Their own position is the neutral reading and the only
+one that does not require guessing at intent.
+
+Which is why it is priced as a **phantom**, on the same footing as the round
+nobody has fired: a real cost in the loss, deliberately not an event in the
+readouts, and scaled by `DODGE.phantom` as the probability half of the
+expectation. The two knobs multiply, so **Firing lines** at 0 turns this off
+along with the aim term.
+
+Only a cook we can actually time is counted — an unwatched one is not counted
+from when we noticed, it is not counted at all. Our own cook is skipped: we
+decide when it leaves our hand, and the projectile it becomes is picked up like
+anyone else's.
+
+**Three things end a cook, and all three have to be caught**, because a cook
+that does not end is a ring expanding forever on somebody holding nothing.
+
+- **The animation leaves Cook** — *any* animation, not `Anim.Throw`. Throwing by
+  switching back to a gun, which is how most grenades are actually thrown, runs
+  `throwThrowable()` and `cancelAnim()` in the same server tick, and only the
+  last state of a tick reaches the wire. What we see is Cook → None, and the
+  `Anim.Throw` in between never existed as far as any packet is concerned.
+  Watching for Throw alone left the cook running forever *and* quietly cost the
+  resulting grenade its thrower and its cook time. Leaving Cook is therefore
+  read as the throw; the ways that can be a lie — a cook cancelled inside
+  `cookTime`, a `cancelAnim` from a revive — produced no grenade, and nothing
+  reads the throw without one appearing.
+- **The player stops sending updates**, which means they are out of view and the
+  cook may have ended without us.
+- **The clock.** A cook cannot outlive its own fuse: the server force-throws at
+  `cookTicker > fuseTime` and gives the Cook animation exactly that long to run,
+  so getting past it means the grenade left their hand while we were not
+  looking.
+
+On the overlay a cooked grenade draws with a **dashed** outline, which is how a
+place that is still a guess is told from one already committed to. The fuse in
+it is as real as a thrown grenade's.
+
+**For our own cook the place stops being a guess**, and the ring moves off our
+feet onto the ground where the grenade would actually land. We know the cursor,
+and on this server the cursor *is* the throw strength: `throwThrowable` scales
+the throw by `clamp(mouseDist, 0, 18) / 18`, so half a cursor is half a throw
+and everything past 18 units is the same full-strength lob. That makes the
+cursor a throttle rather than only an aim, and a ring on the ground is the only
+honest readout of it — the alternative is learning the mapping by feel.
+
+The whole throw is ported: the spawn a hand's length out along the aim and
+**clipped back to the first wall**, which is the case that matters because
+cooking behind cover and lobbing over it is what people do; our own movement
+folded in at `playerVelMult`; the `amped_explosives` multipliers on both range
+and speed when we have the perk. The result goes through the same
+`dodgeSimBlast` every other grenade does, from a state we construct instead of
+one the wire delivered, so the bounces and the slide are the same physics.
+
+Two deliberate choices. It reads the **live cursor**, not the aim the last
+packet carried — the question is what happens if we let go *now*, and the cursor
+is a round trip ahead of the wire. And our own movement comes from the packet
+ring rather than from the movement keys, because that is the velocity the server
+actually applied and it already carries every reason it might not be 12: water,
+being downed, a heavy weapon.
+
+For anyone else's cook the cursor is not on the wire, so their feet remain the
+only honest answer and the ring stays there.
+
+## A fuse that outlasts the horizon
+
+The horizon is 0.8s and an uncooked frag has three seconds left when it lands,
+so scoring only what fits inside the plan would make every grenade invisible
+until its last 0.8s — by which point the blast is 12u across, a player covers
+9.6u, and there is no escape left to plan.
+
+So a fuse that runs past the horizon **detonates at the end of the horizon
+instead** — but still *where the grenade actually goes off*, not where it
+happens to be when the horizon runs out. The time is a guess the horizon forces
+on us; the place is not, so it is not guessed as well. That is a correction as
+much as a simplification: scoring the position at horizon-end meant a grenade
+sailing over our heads on its way to landing twenty units away was charged as
+detonating overhead, which is the one thing it is certainly not going to do.
+
+The time discount already prices the far end of the horizon at a quarter of face
+value, and every step re-reads the fuse one tick shorter. Nothing about the
+horizon itself had to change.
+
+## What it costs
+
+`dodgeDpBlast` replaces the sweep for a blast, and it is cheaper than the thing
+it replaces: the leg containing `tBoom` carries us to one position, that
+position is one distance from the blast, and the distance decides the damage. No
+other leg is charged, because on no other leg does the explosion exist — which
+makes the once-only billing rule automatic rather than enforced, so `billOpen`,
+`dodgeDpSkip` and the already-inside test never come into it.
+
+The falloff is survev's own, with one surprise: past `rad.min` the ramp is
+measured from the *centre*, not from `rad.min`, so it does not resume at full
+damage where the plateau ends. A frag is 125 out to 5u and about 73 just past
+it, decaying to nothing at 12. That step is the game's, not ours. `DODGE.
+clearance` is subtracted from the distance before the curve is evaluated, the
+same doubt it stands for everywhere else, and assuming we are that much closer
+than we think can only raise the charge.
+
+Because `f` here is a fraction of real HP rather than a probability that a hit
+happens at all, and both are multiplied by the same `w × DODGE_HIT_COST`, a
+blast is directly comparable to a round: 125 HP of frag against 11 of MP5 falls
+out without any of it being a special case in the loss.
+
+## Cover, per cell
+
+Cover was tested once, from the blast to where we already stood, and a wall
+dropped the threat outright. That was safe in one direction only: the bot could
+not be pulled *out* of cover by a blast a wall would stop, but neither could it
+be held *in* cover, because a plan that walked us out from behind the wall was
+not charged for it either.
+
+`dodgeDpVisible` answers it per cell of the search grid instead, memoized on
+exactly the pattern `dodgeDpMoveFor` uses for movement and for the same reason:
+walls do not move within a plan, so the answer cannot depend on when we arrive,
+and the several states that reach a cell pay for the raycast once between them.
+The wall becomes a gradient the search can climb — zero behind it, full in front
+of it — so staying put and stepping back into cover are things the planner now
+has an opinion about.
+
+The cost is bounded by the frontier, not by the grid. A blast is billed on the
+one layer its instant falls in, so only the cells reached on that layer are ever
+asked: at most the beam width times nine headings, and far fewer in practice
+because headings out of neighbouring cells land in the same cells. Blockers are
+prefiltered per plan to those that could stand between the blast and anywhere
+reachable, so each ray scans a handful of obstacles rather than the map, and the
+distance test runs first so most of the grid never reaches the raycast at all.
+
+Four blasts get per-cell visibility; any beyond that fall back to the
+single-point answer, as does the rollout that feeds `userHitIn` — it runs before
+the search, so the grid its cells would be indexed against does not exist yet.
+
+The occlusion predicate is the explosion's own, not `blocksBullets`:
+`collidable && height > 0.5`, which is a higher bar than a bullet's 0.25 and —
+unlike a bullet — does not let a blast through a window.
+
+A blast a wall already blocks is now deliberately still a threat, costing
+nothing everywhere the wall covers. That is the point of doing it per cell, and
+it does mean the bot engages for grenades it is already safe from; the plan it
+finds is the user's own keys until those keys would walk into the blast.
+
+## Whose grenade it is
+
+This has to be right, because the three cases are genuinely different: **a
+squadmate's frag cannot hurt us at all** (`Player.damage` returns early on a
+shared `teamId`), **our own hurts us in full** (the same test is skipped when
+the source is the victim), and an unknown thrower is treated as hostile,
+matching what the bullet path does with an unknown shooter. Getting it backwards
+either walks the bot off a harmless grenade or leaves it standing on our own.
+
+The wire never says. It says two things that together very nearly do.
+
+**The throw animation names them.** `throwThrowable` calls `addProjectile` and
+`playAnim(Anim.Throw, …)` in the same call, on the same tick, and both are dirty
+in the same packet — so the thrower is animating a throw in the very packet the
+grenade first appears in. `Anim.Throw` is played nowhere else in the game. That
+alone usually leaves one candidate.
+
+**The type is the second gate.** A cook records what was in hand when the pin
+came out — read at the Cook transition, not at the throw, because throwing your
+last grenade switches your weapon before the packet is built. So a `frag` can
+only have come from someone who was cooking a frag, which separates them from
+whoever threw a smoke on the same tick.
+
+**Geometry ranks whatever is left**, and does it by the hand rather than the
+body. The throw leaves from `player.pos + rotate({0.5,-1.0}, aim)` — 1.118u out
+at 63.4° off the aim — so the expected point is fixed by two things both on the
+wire, and the test is oriented instead of a circle. It is measured to the
+*segment* from body to hand, not to the point, because the server clips the
+spawn back along exactly that segment when a wall is in the way, so anywhere on
+it is a perfect fit rather than an error of up to a hand's length. Two players
+standing 0.4u apart and throwing in opposite directions are separated by 1.00u
+of fit against a 0.35u margin; a radius around the body could not tell them
+apart at all.
+
+**One candidate needs no geometry at all.** If one player threw a grenade of
+this type on this tick, that player threw this grenade; the position test exists
+to break ties, not to second-guess the animation. With two or more, the winner
+has to clear the fit tolerance *and* beat the runner-up by the margin, and the
+tolerance is widened by how far the grenade can have flown in the tick or so
+since it left the hand — `(speed × 2 + 7.2) × age`, the throw speed at the
+`amped_explosives` multiplier plus the most of their own motion a thrower can
+put into it. Anything else falls back to nearest body and is marked unsure.
+
+**`sure` gates exactly two things, and it is the asymmetry that decides which.**
+Being wrong is not the same size in both directions: calling an enemy frag a
+squadmate's and ignoring it costs 125 HP, while calling a squadmate's an enemy's
+costs a few hundred milliseconds of walking somewhere we did not need to go. So
+only a named thrower can make a grenade harmless, and only a named thrower is
+trusted with a cook time — better an assumed full fuse than somebody else's
+measured one. An unsure attribution reads as hostile like any other unowned
+grenade.
+
+`window.__dodge().nades` lists every grenade in the air with its type, thrower,
+whether that is named or guessed, and the fuse left; `owned` against `tracked`
+is the same story as a ratio. An `owned` well under `tracked` in a squad means
+the bot is dodging its own team's grenades.
+
+## Watching it
+
+**Grenade rings** in the MOD tab draws, for every grenade in the air, the blast
+it is going to make: a faint red outline of the damage radius at the
+*detonation* point rather than around the sprite, because for anything still
+moving those are not the same place and the one that matters is where it will be
+when the fuse runs out. A dashed leader joins the two when they differ, so a
+grenade mid-flight reads as "it is here, it goes off there" rather than as a ring
+that has drifted off its object.
+
+**The fuse is the fill.** A low-alpha disc grows out from the centre to meet
+that outline as the fuse burns, and a full circle means now. That is the whole
+of the countdown — there is no clock in seconds, and there shouldn't be: the
+disc reads without being looked at directly, which a number in the middle of a
+firefight does not, and it is already in the units that matter. Seconds have to
+be converted into ground before they mean anything; the disc *is* the ground.
+
+The outline stays at a fixed faint alpha because it is a fact about the grenade
+and not about the clock, so it must not compete with the thing that is moving.
+The fill is measured against the throwable's own fuse rather than against when we
+first saw it, so a grenade cooked for three seconds arrives three quarters full
+instead of starting from empty and understating how little time is left. A
+grenade still in a hand dashes its outline: the centre is a guess about somebody
+who has not committed to it yet.
+
+It is display only and works with the bot off, but it is not a second opinion:
+it reads the same per-packet flight record and cook state the loss is scored
+against, so what is on screen is what the planner is using — and it draws
+exactly what the planner prices. Grenades on another layer are not drawn, for
+the same reason they are not threats. **Neither is a squadmate's**: their frag
+cannot touch us, so a 12u circle over the middle of a fight is ink for nothing.
+
+That skip follows the planner's own asymmetry rather than being a second rule.
+A grenade *in the air* is hidden only when the throw animation **named** its
+thrower — a guess from proximity is not enough to take a blast off the screen,
+exactly as it is not enough to drop it from the loss. A grenade still in a
+**hand** needs no such caution: that is the player, in front of us, with the pin
+out, and there is nothing to attribute.
+
+**Our own grenades are always drawn, thrown or held**, and the held case is
+where the overlay parts company with the loss on purpose. The planner does not
+price our own cook — we decide when it leaves our hand, so it is not a threat to
+plan around — but knowing *that* we are cooking is not the same as knowing how
+much of the fuse is left, and that is the number the ring exists to show. It is
+also the only fuse on screen we can still do anything about. Our own thrown
+grenade is drawn for a simpler reason: it hurts us in full.
+
+Whether a fuse was measured or assumed no longer shows on the overlay — it is in
+`window.__dodge().nades` as `sure`, and in `cooks` as `exact`.
+
+## The knob, and what isn't modelled
+
+**Grenades** in the MOD tab scales what a blast is worth. Unlike **Firing
+lines** it is not a probability of anything — a fuse that runs out is not a
+guess — so 1 is the honest setting and the default; it is a knob because a 12u
+radius is wide enough that answering one moves us a long way. 0 goes back to
+rounds and firing lines only.
+
+- **Shrapnel is not priced.** Every fuse throwable also throws 8–12 pellets at
+  `v2.randomUnit()`, drawn on the server at detonation. There is no version of
+  that a plan could be right about, and modelling it would put noise into the
+  loss and nothing else. Only the core blast is charged.
+- **Cover is per cell**, not per grenade — see below.
+- **Impact throwables are ignored.** Potatoes, snowballs and coconuts detonate
+  on contact, which is a collision to predict rather than a clock to read.
+- **Layer changes mid-flight are not predicted.** The current layer is used, and
+  a grenade taking the stairs is a tick late being re-attributed.
+- **MIRV's children are not predicted.** They are spawned at detonation with a
+  velocity drawn from `randomPointInCircle`, so only the parent blast is scored;
+  the six minis become threats in their own right once they exist.
+- **`fuseVariance` is taken at its low end.** `mirv_mini` and `martyr_nade` add
+  a 0–0.3s draw the wire never carries, so the estimate is the earliest the
+  grenade can go off.
+
 # Deciding at the rate the news arrives
 
 The search is deterministic in its inputs. Run it twice against the same world
@@ -713,6 +1141,9 @@ the point count.
 | Clearance | 0.2 | added to our radius before anything is solved, as a safety factor |
 | Follow input | 1.0 | pull toward the keys you are holding, per second of opposition; also the only thing steering the bot when nothing is on course |
 | Firing lines | 0.35 | what an enemy's aim is worth, as the chance the shot is taken; 0 is rounds-only |
+| Grenades | 1.0 | what a grenade's blast is worth, as a multiplier on the damage it would do; 0 is off |
+| Grenade rings | off | draw each grenade's blast radius and fuse on the overlay |
+| Frag aim | off | aim the throw at the instant it is released (see [Frag aim](#frag-aim)) |
 
 `window.__dodge()` reports the live state — engaged or not, current heading,
 measured speed, wall count, the lead actually being applied, and time-to-impact
@@ -720,7 +1151,16 @@ both on the user's course and on the plan's. The threat count is split three
 ways: `threats` is everything being solved against, `live` is rounds genuinely
 in the air and `phantoms` is hostiles currently aimed near us, one apiece.
 `worstDmg` is the worst live round in HP and `worstAimed` the worst line pointed
-at us, undiscounted. A `typed` well under `live` means the `addBullet` hook went
+at us, undiscounted. `blasts` is grenades being planned against, `worstBlast`
+the worst of them at its centre and `blastIn` how long the soonest has left in
+plan time — a `blastIn` reading exactly `horizon` is the clamp in
+[Grenades](#grenades), not a measurement. `tracked` is grenades in the air and
+`cookTimed` how many of those we timed a cook for, and `owned` how many had a
+thrower named outright by the throw animation rather than guessed from
+proximity — see [Whose grenade it is](#whose-grenade-it-is). `nades` lists them
+individually. `cooking` is grenades still in a hand and `cooks` lists those with
+how long each has been burning and whether that is a measurement. A `cookTimed`
+that is always zero means the anim watch is not seeing throws at all. A `typed` well under `live` means the `addBullet` hook went
 on mid-flight or survev has shipped a bullet `BULLET_DAMAGE` doesn't list.
 Neither hit readout counts phantoms: they are a real cost in the loss and
 deliberately not an event in a number that answers "when does a round that
@@ -752,3 +1192,127 @@ never at what fraction of what's left that is — so the bot plays a hit the sam
 way at 12 HP as at 100, when at 12 the right move is to accept a wall-pin
 penalty that would be silly at full health. Armour and helmets aren't modelled
 either, and neither is `damageMult`.
+
+Grenades are a cost — [Grenades](#grenades) — but only their core blast.
+Shrapnel, impact throwables, MIRV's children and mid-flight layer changes are
+all listed there. The one worth repeating is what a cook we could not time does:
+it is not counted, so the grenade it produces arrives priced at a full fuse,
+which is the longest it can be and therefore the latest it can go off. That is
+the safe direction for the horizon clamp to be wrong in, but it is still a
+grenade the planner meets later than it could have.
+
+# Frag aim
+
+Off by default, and the only thing here that changes where a throw *goes*
+rather than what is known about it.
+
+**While a grenade is cooking, the cursor is driven every frame to the throw
+that would land nearest the target** — so releasing at any instant throws it
+there, and the user's job is reduced to deciding *when*.
+
+Driving continuously rather than fixing the aim on release is both simpler and
+better. Simpler because there is nothing to defer: the game builds one input
+message a frame from whatever the cursor currently is, so if the cursor has been
+right on every frame then it is right on the frame the release happens to land
+in, and no part of the release has to be intercepted, held back or replayed.
+Better because the throw is no longer a single solved instant that may already
+be stale by the time the packet goes out — it is re-solved against where the
+target is *now*, sixty times a second, until the moment it is let go.
+
+The gate is the cook state itself, which is exactly "the pin is out and it has
+not left our hand" and ends by itself the moment the throw goes out.
+
+The user's real mouse is suppressed while this drives, the same way it is while
+the gun aimbot's key is held, but it is still *recorded* — target selection
+reads it, so moving the invisible cursor still chooses who to throw at. When the
+takeover ends their real position is replayed once, so the aim snaps back to
+where their mouse actually is rather than holding the last thing we sent.
+
+The overlay ring follows the solve rather than the suppressed cursor, so what is
+drawn is where the grenade is actually going. It costs no second simulation —
+the solver already computed the landing point this frame.
+
+## What it aims at
+
+Whoever the **user's own cursor** was nearest when they let go, extrapolated to
+where they will be when the grenade goes off. Picking by their cursor keeps the
+choice theirs: this answers "how hard, and in what direction", which is the part
+a human is bad at, and not "who".
+
+The lead is the round trip plus the fuse — their position is a one-way trip old
+and our release lands a one-way trip from now — evaluated on the same recovered
+clock the aim helper leads with, so a strafing target is led and a standing one
+is not.
+
+## Solving the cursor
+
+Two variables, and the second is the throw's strength, so this is a genuinely
+two-dimensional aim rather than a direction with a range that takes care of
+itself. It cannot be inverted in closed form once a wall is involved: a throw
+that clears a crate and one that bounces off it differ by a degree and land
+twenty units apart.
+
+So it is searched — but seeded analytically, which is what keeps the search
+small. With nothing in the way a standing throw covers
+`speed × (tAir + 1/drag)`, the flight plus the whole of the slide, so the
+strength that reaches a given distance is one division away. The seed is usually
+the answer; the three-pass sweep around it is what copes with bounces, with the
+thrower's own motion folded into the velocity, and with a fuse too short to let
+the grenade finish sliding.
+
+### What it costs, and what it cost before
+
+Running this every frame put the whole thing on a budget it did not originally
+respect. The first version ran the game at **20fps**, and the test now measures
+the thing that did it: a solve against 40 obstacles in range took **38ms**.
+Four separate mistakes, each invisible against the empty-field benchmark that
+had been standing in for the measurement:
+
+- **Every candidate rebuilt the obstacle list from scratch**, and that list is
+  built by walking the entire obstacle pool — every obstacle on the map. A
+  hundred candidates meant a hundred full sweeps, plus another hundred from the
+  spawn clip. Both are now filtered once per solve: every candidate throws from
+  the same body and none can travel further than the strongest, so one disc
+  covers all of them.
+- **Every candidate was integrated at the server's own 100Hz.** Ranking does not
+  need that: the flight is a straight line at constant speed and the slide's
+  total is `v/drag` whatever the step, so neither of the two things that decide
+  where a grenade lands is sensitive to it. Candidates are ranked at 0.03s and
+  the *winner* is re-thrown at full resolution, so what comes back is exact even
+  though what found it was not.
+- **Every candidate simulated the whole fuse**, including the two-and-a-half
+  seconds a frag spends already at rest. It now stops when it stops — below a
+  thousandth of a unit per second, which has four ten-thousandths of a unit of
+  travel left in it, so the exit is finer than the position it exits from.
+- **The innermost loop did the full collision test on obstacles it was nowhere
+  near.** A bounds reject runs first now.
+
+Together: **38ms → 0.88ms** warm, 1.99ms cold, with every reachable target still
+solved to under 0.11u. The path simulation is still exact against the server
+transcription at 0.000u, which is the property none of this was allowed to cost.
+
+Two smaller per-frame leaks went with it. **Grenade rings** was holding the
+overlay canvas open for the whole round — it asked whether any cook state was
+*tracked* rather than whether any cook was *live*, and cook states are kept per
+player until there are 32 of them. And the cooked-grenade threat re-swept every
+obstacle on the map for its line of sight on every planner step, at up to 60Hz
+against packets arriving at 20; it is cached per packet now, like the thrown
+grenades' already was.
+
+Solving every frame makes the previous frame's answer a near-perfect seed, so a
+**warm** sweep opens an order of magnitude narrower — 0.05 rad against 0.28 —
+and the same three passes land that much finer. It is gated on the target not
+having changed, and it is self-correcting rather than trusted: a warm solve that
+does not converge is redone cold and the better of the two kept. That matters
+because the warm window can genuinely be outrun — a target three units away
+while we strafe past it moves the bearing further in one frame than the window
+is wide — and a seed that can no longer see the answer will sit where it is and
+report a large error rather than go looking. The test drives a strafing target
+for thirty frames (warm tracks cold exactly, 0.027u) and then hands the solver a
+seed pointing 180° the wrong way, which converges anyway.
+
+Two honesty properties the test pins down. A target out of range gets the
+longest throw available and an error saying how far short it fell, rather than a
+pretence that it reached — `window.__frag().missBy` is that number. And a target
+behind a wall solves to a throw that stops at the wall; the search cannot reach
+past it and does not claim to.

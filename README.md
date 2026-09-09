@@ -103,8 +103,8 @@ none of them touches input or gameplay state.
 
 ## Install
 
-Two ways to run the toolkit. Both load the same `core/mangled.js` and
-`core/inject.js` — see [Repository layout](#repository-layout).
+Two ways to run the toolkit. Both load the same `extension/core/mangled.js`
+and `extension/core/inject.js` — see [Repository layout](#repository-layout).
 
 **As a Chrome extension**
 
@@ -113,7 +113,7 @@ Two ways to run the toolkit. Both load the same `core/mangled.js` and
 3. Click **Load unpacked**
 4. Select the `extension/` folder
 
-**As a local mirror** (no extension install, and editing `core/inject.js` +
+**As a local mirror** (no extension install, and editing `extension/core/inject.js` +
 reloading the page is the whole edit loop)
 
 ```sh
@@ -125,19 +125,23 @@ See [webapp/README.md](webapp/README.md) for how the mirror works.
 ## Repository layout
 
 ```
-core/       inject.js + mangled.js — the toolkit, shared by both consumers
-extension/  manifest, content script, service worker; core/ is a symlink
-webapp/     reverse-proxy mirror that serves survev with core/ injected
-tools/      fetch_survev_js.py, derive_mangled.py
-tests/      netcode_sim.js
-docs/       design notes, sample log schema
-js_dump/    bundle cache (gitignored) — repopulated by tools/fetch_survev_js.py
+extension/       manifest, content script, service worker
+extension/core/  inject.js + mangled.js — the toolkit, shared by both consumers
+webapp/          reverse-proxy mirror that serves survev with core/ injected
+tools/           fetch_survev_js.py, derive_mangled.py
+tests/           netcode_sim.js
+docs/            design notes, sample log schema
+js_dump/         bundle cache (gitignored) — repopulated by tools/fetch_survev_js.py
 ```
 
-`core/` is deliberately not inside `extension/`: the mirror serves the same two
-files, and neither consumer should have to reach into the other. The extension
-picks them up through an `extension/core` symlink, which Chrome follows on an
-unpacked load.
+The shared toolkit lives *inside* `extension/` rather than beside it, because
+Chrome resolves content-script paths against the extension root and refuses any
+that escape it. `extension/core` was previously a symlink to a top-level
+`core/`; Chrome follows symlinks on an unpacked load, but only while they stay
+within the root, so the two scripts silently never injected — the extension
+loaded, the service worker started, and nothing ran on the page. Keeping the
+real directory under `extension/` costs the mirror nothing: `webapp/server.js`
+reads the files straight off disk through a single `CORE_DIR` constant.
 
 ## Architecture
 
@@ -145,8 +149,8 @@ Three layers, wired up by `extension/manifest.json`:
 
 | File | World | Role |
 | --- | --- | --- |
-| `core/mangled.js` | MAIN | Single dictionary mapping semantic names (`netData`, `localPlayer`, `inputBinds`, …) to the bundle's current mangled identifiers. Auto-generated. |
-| `core/inject.js` | MAIN | All gameplay logic. Reads every mangled name through `window.__SURVEV_MANGLED__`. |
+| `extension/core/mangled.js` | MAIN | Single dictionary mapping semantic names (`netData`, `localPlayer`, `inputBinds`, …) to the bundle's current mangled identifiers. Auto-generated. |
+| `extension/core/inject.js` | MAIN | All gameplay logic. Reads every mangled name through `window.__SURVEV_MANGLED__`. |
 | `extension/content.js` | Isolated | Bridges `window.postMessage` from inject.js to the service worker. |
 | `extension/background.js` | Service worker | Buffers samples, drives the toolbar badge, handles JSON export. |
 
@@ -166,7 +170,7 @@ it from a fresh bundle:
 ```sh
 pip install -r tools/requirements.txt   # one-time
 python tools/fetch_survev_js.py        # downloads the current bundle into js_dump/
-python tools/derive_mangled.py         # re-derives core/mangled.js from js_dump/
+python tools/derive_mangled.py         # re-derives extension/core/mangled.js
 # reload the extension in chrome://extensions (the mirror picks it up on reload)
 ```
 
@@ -183,7 +187,7 @@ If any anchor fails to match, the script aborts naming the specific entry
 that broke — that's the signal a regex in `derive_mangled.py` needs a new
 fallback.
 
-The script prints an old → new diff and writes a `core/mangled.js.bak` before
+The script prints an old → new diff and writes an `extension/core/mangled.js.bak` before
 overwriting, so re-running is safe.
 
 The mirror does this by itself. `webapp/server.js` watches the bundle hashes in

@@ -3,7 +3,7 @@
 # webapp repopulates it via tools/fetch_survev_js.py.
 js_dump/
 
-# derive_mangled.py's last-known-good backup of core/mangled.js.
+# derive_mangled.py's last-known-good backup of extension/core/mangled.js.
 *.bak
 
 node_modules/

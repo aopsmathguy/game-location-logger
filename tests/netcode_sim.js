@@ -46,7 +46,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const src = fs.readFileSync(path.join(__dirname, '..', 'core', 'inject.js'), 'utf8');
+const src = fs.readFileSync(path.join(__dirname, '..', 'extension', 'core', 'inject.js'), 'utf8');
 
 function extract(name) {
   const start = src.indexOf(`  function ${name}(`);

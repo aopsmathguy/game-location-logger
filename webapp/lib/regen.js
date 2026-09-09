@@ -1,6 +1,6 @@
 'use strict';
 
-// Keeps core/mangled.js current with whatever build of survev the browser is
+// Keeps extension/core/mangled.js current with whatever build of survev the browser is
 // actually being served.
 //
 // survev re-mangles its bundle on every deploy, and the bundle filenames are
@@ -77,7 +77,7 @@ function bundlePathsOnDisk() {
 // Staleness is "the page is loading a bundle we never derived against", not
 // "the two lists differ". A leftover in js_dump/ from a previous build is
 // harmless — derive_mangled.py picks the gameplay bundle by content, not by
-// filename — whereas a referenced bundle that is absent means core/mangled.js
+// filename — whereas a referenced bundle that is absent means extension/core/mangled.js
 // was derived from something the player is no longer running.
 function covered(wanted, onDisk) {
   const have = new Set(onDisk);

@@ -57,10 +57,10 @@ const LOGIN_UI = process.env.LOGIN_UI !== 'off';
 const WS_MODE = process.env.WS_MODE === 'proxy' ? 'proxy' : 'direct';
 
 const REPO_DIR = path.resolve(__dirname, '..');
-const CORE_DIR = path.join(REPO_DIR, 'core');
+const CORE_DIR = path.join(REPO_DIR, 'extension', 'core');
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
-// Explicit allowlist rather than a served directory. core/ holds only the two
+// Explicit allowlist rather than a served directory. extension/core/ holds only
 // toolkit files today, but derive_mangled.py also drops a mangled.js.bak
 // beside them, and nothing outside this map should be reachable over HTTP.
 const EXT_FILES = new Map([

@@ -169,7 +169,7 @@ What remains is inherent: during a stall there is no data to interpolate
 between, so the renderer extends the last line and is corrected when the stream
 resumes. Set `renderLag` to 0 in the MOD tab for the lowest-latency,
 highest-overshoot end of the trade; `tests/netcode_sim.js` re-measures both columns
-from `core/inject.js` itself.
+from `extension/core/inject.js` itself.
 
 Nothing here touches input, packets or gameplay state; it is purely a render
 path change, and the master toggle restores stock behaviour live.
