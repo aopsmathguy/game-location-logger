@@ -81,10 +81,30 @@ carried no reason at all.
 
 ## Limits
 
-- **OAuth does not work.** `/api/auth/google` and `/api/auth/discord` redirect
-  to providers whose `redirect_uri` is registered to survev.io, so you land
-  back on the real site. Play signed out, or with a local account if your
-  deployment has one.
+- **The login buttons need turning on.** The bundle's host table only carries
+  the `google`/`discord` flags for survev.io itself; from localhost it falls
+  back to the table's `default` entry, which has neither, so
+  `loginSupported()` came back false — the account block was hidden and,
+  because `anyLoginSupported()` also selects `credentials: 'omit'`, no
+  session cookie was sent with any `/api/` call. The proxy now adds both
+  flags to that entry, which renders the buttons and sends the cookie.
+  `LOGIN_UI=off` restores the old behaviour.
+- **Signing in takes one manual step.** Google and Discord will only redirect
+  to `https://api.survev.io/api/auth/<provider>/callback` — that URI is
+  registered to survev's OAuth client, and any other value is refused with
+  `redirect_uri_mismatch`, so the proxy cannot put itself in the browser's
+  return path. Sign-in therefore ends on the real API host and fails there.
+  It fails on the state check, though, before the authorization code is
+  spent: `/api/auth/<provider>` is proxied, so the `<provider>_oauth_state`
+  and `<provider>_code_verifier` cookies it sets came back through
+  `rewriteSetCookie` and are held against the mirror's origin, not
+  survev.io's. This origin is therefore the one that can still spend the
+  code. Copy the failed `api.survev.io/…/callback?…` URL out of the address
+  bar and paste it into **`/__login`**, which re-issues that query against
+  the proxied callback path with the cookies attached; upstream matches the
+  state, exchanges the code, and returns a session cookie that
+  `rewriteSetCookie` rewrites onto this host. Those two cookies carry
+  `Max-Age=600`, so finish within ten minutes or start the sign-in again.
 - **Cloudflare Turnstile** loads from `challenges.cloudflare.com` and is not
   proxied. If the upstream turns captcha on, it will be scored against a
   widget on an origin it does not expect.

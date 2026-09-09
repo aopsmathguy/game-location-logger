@@ -30,7 +30,7 @@
 // path for the calls that matter.
 //
 // Usage:  node server.js        (then open http://localhost:8080)
-// Env:    PORT, HOST, UPSTREAM, API_UPSTREAM, WS_MODE=direct|proxy
+// Env:    PORT, HOST, UPSTREAM, API_UPSTREAM, WS_MODE=direct|proxy, LOGIN_UI=off
 
 const http = require('http');
 const https = require('https');
@@ -45,6 +45,15 @@ const PORT = Number(process.env.PORT || 8080);
 const BIND = process.env.HOST || '127.0.0.1';
 const SITE_UPSTREAM = process.env.UPSTREAM || 'survev.io';
 const API_UPSTREAM = process.env.API_UPSTREAM || 'api.survev.io';
+
+// The bundle's host table (Vg.getProxyDef) is keyed by substrings of
+// location.hostname, so served from localhost nothing matches and it falls
+// back to the table's `default` entry. That entry carries no google/discord
+// flags, and Vg.loginSupported() is just a lookup of them — so the account
+// block is hidden, and anyLoginSupported() being false also picks
+// `credentials: 'omit'` for every /api/ fetch, which stops the browser
+// sending survev's session cookie at all. Setting LOGIN_UI=off restores that.
+const LOGIN_UI = process.env.LOGIN_UI !== 'off';
 const WS_MODE = process.env.WS_MODE === 'proxy' ? 'proxy' : 'direct';
 
 const REPO_DIR = path.resolve(__dirname, '..');
@@ -62,6 +71,7 @@ const EXT_FILES = new Map([
 
 const EXT_PREFIX = '/__ext/';
 const WS_PREFIX = '/__ws';
+const LOGIN_PREFIX = '/__login';
 
 // Injected in order: config first (the shim reads it), then the extension's
 // own two files in the order the manifest lists them — inject.js bails out if
@@ -187,6 +197,23 @@ function rewriteOrigins(text, selfOrigin) {
   return out;
 }
 
+// Puts the mirror on the same footing as survev.io: login buttons rendered,
+// session cookie sent with API calls. The minifier inlined the host table at
+// each of its four use sites, so this rewrites all four; the pattern is the
+// table's own `default` entry and appears nowhere else in the bundle. Matching
+// on the key rather than the apiUrl value keeps it independent of
+// rewriteOrigins having already replaced that URL.
+//
+// This does not make the OAuth round trip work — see README "Limits". The
+// provider's redirect_uri is registered to survev.io, so sign-in leaves here.
+function enableLoginUi(js) {
+  if (!LOGIN_UI) return js;
+  return js.replace(
+    /default\s*:\s*\{\s*apiUrl\s*:/g,
+    'default:{google:!0,discord:!0,apiUrl:',
+  );
+}
+
 function injectScripts(html) {
   const head = html.match(/<head[^>]*>/i) || html.match(/<html[^>]*>/i);
   if (!head) return INJECTED_HTML + html;
@@ -214,6 +241,92 @@ function rewriteSetCookie(values, requestIsSecure) {
     }
     return parts.join(';');
   });
+}
+
+// --------------------------------------------------------------- oauth hop
+
+// Google will only redirect to https://api.survev.io/api/auth/google/callback
+// — that URI is registered to survev's OAuth client, and anything else is
+// refused with redirect_uri_mismatch, so the proxy cannot put itself in the
+// browser's return path. The sign-in therefore lands on the real API host.
+//
+// It lands there and fails, which is the part that makes this recoverable.
+// /api/auth/<provider> is proxied, so the `<provider>_oauth_state` and
+// `<provider>_code_verifier` cookies it sets come back through
+// rewriteSetCookie and are stored against *this* origin, not survev.io. The
+// real callback sees neither, rejects the request on the state check, and
+// never reaches the token exchange — leaving the authorization code unused.
+//
+// So the code is still spendable, and this origin is the one holding the
+// cookies needed to spend it. Re-issuing the same query against the proxied
+// callback path replays it with those cookies attached: upstream matches the
+// state, exchanges the code against the verifier, and returns the session
+// cookie, which rewriteSetCookie then rewrites onto this host. Paste the
+// failed URL into /__login and this does the swap.
+const LOGIN_PAGE = `<!doctype html><meta charset="utf-8">
+<title>Sign in to the mirror</title>
+<style>
+ body{font:14px/1.55 system-ui,sans-serif;max-width:44rem;margin:3rem auto;padding:0 1.25rem}
+ h1{font-size:1.3rem} code{background:#8881;padding:.1em .35em;border-radius:3px}
+ textarea{width:100%;height:6.5rem;font:12px/1.4 ui-monospace,monospace;padding:.6rem;
+  box-sizing:border-box;border:1px solid #8886;border-radius:6px;background:transparent;color:inherit}
+ button{margin-top:.75rem;font:inherit;padding:.5rem 1.1rem;border-radius:6px;
+  border:1px solid #8886;background:#8881;color:inherit;cursor:pointer}
+ ol{padding-left:1.25rem} li{margin:.4rem 0} .err{color:#c33;font-weight:600}
+</style>
+<h1>Sign in to the mirror</h1>
+<p>Google only accepts <code>api.survev.io</code> as its redirect target, so the
+last step of sign-in leaves this mirror and fails on the real host. That failure
+happens before the code is spent, so it can be finished here.</p>
+<ol>
+ <li>Click Google or Discord on the mirror and sign in as usual.</li>
+ <li>You land on an <code>api.survev.io/api/auth/&hellip;/callback?&hellip;</code> error page.</li>
+ <li>Copy that whole URL from the address bar and paste it below.</li>
+</ol>
+<form method="GET" action="__LOGIN_PREFIX__">
+ <textarea name="url" required placeholder="https://api.survev.io/api/auth/google/callback?state=&hellip;&amp;code=&hellip;"></textarea>
+ <button type="submit">Finish sign-in</button>
+</form>
+<p>__ERROR__</p>`;
+
+function serveLogin(req, res) {
+  const q = new URL(req.url, 'http://x').searchParams;
+  const pasted = q.get('url');
+  let error = '';
+
+  if (pasted) {
+    let target = null;
+    try {
+      const u = new URL(pasted.trim());
+      // Only ever re-issue survev's own OAuth callback against ourselves;
+      // this must not become a way to aim the proxy at an arbitrary path.
+      if (/^\/api\/auth\/[\w-]+\/callback$/.test(u.pathname) && u.search) {
+        target = u.pathname + u.search;
+      }
+    } catch {
+      /* fall through to the error below */
+    }
+    if (target) {
+      log('login replay', target.split('?')[0]);
+      res.writeHead(302, { location: target, 'cache-control': 'no-store' });
+      res.end();
+      return;
+    }
+    error = '<span class="err">That is not an /api/auth/&lt;provider&gt;/callback '
+      + 'URL with a query string. Copy the whole address, including everything '
+      + 'after the <code>?</code>.</span>';
+  }
+
+  const body = Buffer.from(
+    LOGIN_PAGE.replace('__LOGIN_PREFIX__', LOGIN_PREFIX).replace('__ERROR__', error),
+    'utf8',
+  );
+  res.writeHead(200, {
+    'content-type': 'text/html; charset=utf-8',
+    'content-length': body.length,
+    'cache-control': 'no-store',
+  });
+  res.end(body);
 }
 
 // ---------------------------------------------------------------- http hop
@@ -279,6 +392,7 @@ function proxyHttp(req, res) {
       up.on('end', () => {
         const raw = Buffer.concat(chunks).toString('utf8');
         let text = rewriteOrigins(raw, selfOrigin);
+        if (isJs) text = enableLoginUi(text);
         if (isHtml) {
           // Against the unrewritten page: these are the bundle hashes survev
           // is serving right now, and a change in them is a redeploy. The run
@@ -401,6 +515,10 @@ function proxyWs(req, clientSocket, head) {
 const server = http.createServer((req, res) => {
   if (req.url.startsWith(EXT_PREFIX)) {
     serveExtFile(req, res);
+    return;
+  }
+  if (req.url === LOGIN_PREFIX || req.url.startsWith(`${LOGIN_PREFIX}?`)) {
+    serveLogin(req, res);
     return;
   }
   proxyHttp(req, res);
