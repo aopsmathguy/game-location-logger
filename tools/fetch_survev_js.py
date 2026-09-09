@@ -6,6 +6,12 @@ name. Files from previous fetches are deleted once the current fetch has fully
 succeeded, leaving js_dump/ holding exactly one build — otherwise stale
 gameplay bundles accumulate and derive_mangled.py has to guess which is
 current. Pass --keep-old to leave them alone.
+
+The webapp calls this with --paths, handing over the bundle references it just
+saw in the HTML it was proxying. That skips a second HTML fetch and closes the
+window where survev could redeploy between the server reading the page and this
+script asking for its own copy — which would leave js_dump/ holding a build the
+player is not actually running.
 """
 
 import argparse
@@ -74,24 +80,43 @@ def main() -> None:
         action="store_true",
         help=f"don't delete previous fetches' files from {OUTPUT_DIR}",
     )
+    ap.add_argument(
+        "--paths",
+        metavar="PATH",
+        nargs="+",
+        help="download these /js/ paths instead of scraping the HTML for them. "
+        "Must be the complete set for the build, since anything not listed is "
+        "treated as stale and pruned.",
+    )
+    ap.add_argument(
+        "--base-url",
+        default=BASE_URL,
+        help=f"origin to download from (default: {BASE_URL})",
+    )
     args = ap.parse_args()
+
+    base_url = args.base_url.rstrip("/")
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    print(f"Fetching {BASE_URL} ...")
-    html = fetch(BASE_URL).decode("utf-8", errors="replace")
+    if args.paths:
+        js_paths = sorted(set(args.paths))
+        print(f"Using {len(js_paths)} script reference(s) supplied by --paths.")
+    else:
+        print(f"Fetching {base_url} ...")
+        html = fetch(base_url).decode("utf-8", errors="replace")
 
-    js_paths = find_js_paths(html)
-    if not js_paths:
-        sys.exit("No /js/ references found in HTML.")
+        js_paths = find_js_paths(html)
+        if not js_paths:
+            sys.exit("No /js/ references found in HTML.")
 
-    print(f"Found {len(js_paths)} script reference(s).")
+        print(f"Found {len(js_paths)} script reference(s).")
 
     keep: set[str] = set()
     failed = 0
 
     for path in js_paths:
-        url = urllib.parse.urljoin(BASE_URL, path)
+        url = urllib.parse.urljoin(base_url + "/", path.lstrip("/"))
         filename = os.path.basename(path)
         out_raw = os.path.join(OUTPUT_DIR, filename)
         out_pretty = os.path.join(OUTPUT_DIR, filename.removesuffix(".js") + "_formatted.js")

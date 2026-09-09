@@ -39,6 +39,8 @@ const tls = require('tls');
 const fs = require('fs');
 const path = require('path');
 
+const regen = require('./lib/regen');
+
 const PORT = Number(process.env.PORT || 8080);
 const BIND = process.env.HOST || '127.0.0.1';
 const SITE_UPSTREAM = process.env.UPSTREAM || 'survev.io';
@@ -129,25 +131,51 @@ function serveExtFile(req, res) {
     return;
   }
 
+  if (name === 'status.json') {
+    res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+    res.end(JSON.stringify(regen.status(), null, 2));
+    return;
+  }
+
+  if (name === 'regen') {
+    // Manual kick, for after you have fixed an anchor that derive_mangled.py
+    // gave up on — the failed build is otherwise not retried.
+    regen.forceDerive();
+    res.writeHead(202, { 'content-type': 'text/plain', 'cache-control': 'no-store' });
+    res.end('regenerating; watch the server log\n');
+    return;
+  }
+
   const file = EXT_FILES.get(name);
   if (!file) {
     res.writeHead(404).end('not found');
     return;
   }
-  // no-store, so that editing inject.js and reloading the page is the whole
-  // edit loop — the main reason to run the toolkit this way instead of as an
-  // unpacked extension.
-  fs.readFile(file, (err, buf) => {
-    if (err) {
-      res.writeHead(500).end(`cannot read ${name}: ${err.message}`);
-      return;
-    }
-    res.writeHead(200, {
-      'content-type': 'application/javascript; charset=utf-8',
-      'cache-control': 'no-store',
-      'content-length': buf.length,
+
+  // mangled.js is the one file that can be mid-regeneration when it is asked
+  // for, and the only one where serving a stale copy is actively harmful. The
+  // browser is parked on a blocking <script> in <head> at this point, so
+  // waiting here costs page-load time and nothing else. Every other file, and
+  // a failed or disabled regeneration, falls straight through to the last
+  // known-good copy on disk.
+  const gate = name === 'mangled.js' ? regen.settle() : Promise.resolve();
+
+  gate.then(() => {
+    // no-store, so that editing inject.js and reloading the page is the whole
+    // edit loop — the main reason to run the toolkit this way instead of as an
+    // unpacked extension.
+    fs.readFile(file, (err, buf) => {
+      if (err) {
+        res.writeHead(500).end(`cannot read ${name}: ${err.message}`);
+        return;
+      }
+      res.writeHead(200, {
+        'content-type': 'application/javascript; charset=utf-8',
+        'cache-control': 'no-store',
+        'content-length': buf.length,
+      });
+      res.end(buf);
     });
-    res.end(buf);
   });
 }
 
@@ -249,8 +277,16 @@ function proxyHttp(req, res) {
       const chunks = [];
       up.on('data', (c) => chunks.push(c));
       up.on('end', () => {
-        let text = rewriteOrigins(Buffer.concat(chunks).toString('utf8'), selfOrigin);
-        if (isHtml) text = injectScripts(text);
+        const raw = Buffer.concat(chunks).toString('utf8');
+        let text = rewriteOrigins(raw, selfOrigin);
+        if (isHtml) {
+          // Against the unrewritten page: these are the bundle hashes survev
+          // is serving right now, and a change in them is a redeploy. The run
+          // this may start is picked up a moment later by the request for
+          // /__ext/mangled.js, which waits for it.
+          regen.ensureFresh(raw);
+          text = injectScripts(text);
+        }
         const body = Buffer.from(text, 'utf8');
         out['content-length'] = body.length;
         res.writeHead(up.statusCode || 502, out);
@@ -382,4 +418,13 @@ for (const [name, file] of EXT_FILES) {
 server.listen(PORT, BIND, () => {
   log(`mirroring https://${SITE_UPSTREAM} (api: ${API_UPSTREAM}) on http://${BIND}:${PORT}`);
   log(`websocket mode: ${WS_MODE}`);
+
+  const { enabled, onDisk } = regen.status();
+  if (!enabled) {
+    log('mangled.js regeneration: off (REGEN=off)');
+    return;
+  }
+  log(`mangled.js regeneration: on — ${onDisk.length} bundle(s) cached in js_dump/`);
+  // Picks up a fetch_survev_js.py run started by hand, without a page load.
+  regen.watchJsDump();
 });
