@@ -1719,7 +1719,7 @@
   // zone. Off by default: the cheats stay inert until they are turned on in
   // the MOD tab, so a fresh profile plays as stock survev.
   const AIMBOT = {
-    enabled: 0,
+    enabled: 1,
     bind: 16, // Shift. keyCode doesn't distinguish left from right, so both work.
   };
 
@@ -1729,22 +1729,25 @@
 
   // Enemy overlay master switch. Same hoisting reason, same default, as AIMBOT.
   const ESP = {
-    enabled: 0,
+    enabled: 1,
     // Dim an enemy whose shot line is blocked by map geometry — see the
     // line-of-sight block in the overlay. On by default, but it only shows
     // once the overlay itself is on.
     losDim: 1,
-    // Alpha the ring and its connecting line drop to when blocked. Defaults to
-    // the wrong-layer fade: both mean "no shot on this one", so they read as
-    // the same state rather than as a hierarchy of two different problems.
-    blockedAlpha: UNREACHABLE_ALPHA,
+    // Alpha the ring and its connecting line drop to when blocked. It used to
+    // default to UNREACHABLE_ALPHA, the wrong-layer fade, on the argument that
+    // both mean "no shot on this one" and should read as one state rather than
+    // as a hierarchy of two problems. Tuned apart from it since: a blocked
+    // enemy is worth a little less ink than an unreachable one, because there
+    // are far more of them at any moment.
+    blockedAlpha: 0.4,
     // See-through render: building roofs stop being drawn, so a house shows
     // its inside, and everything else that can be seen or shot through —
     // bushes, destroyed-obstacle rubble, tree canopies, smoke — is faded to
     // ESP_ALPHA. Off by default and independent of `enabled` above — it draws
     // nothing on the overlay canvas, it only changes how the game draws some
     // of its own art. See the ESP render block below.
-    esp: 0,
+    esp: 1,
   };
 
   // Bank shots: when the direct line is walled off, look for a one-bounce path
@@ -1764,7 +1767,7 @@
   // what "the shot is on" means. Same hoisting reason, same off-by-default, as
   // AIMBOT and ESP.
   const AUTOSHOOT = {
-    enabled: 0,
+    enabled: 1,
   };
 
   // True while the MOD tab is waiting for the user to press their new bind, so
@@ -2623,17 +2626,17 @@
     // extrapolation exactly cancels the lag), and only a *change* in the
     // target's motion is reacted to — lagged by reactionMs. "Perfect aim
     // given lag."
-    reactionMs: 140,
+    reactionMs: 110,
     // Fraction of the remaining world-space distance between the aim point
     // and the target point that we close per reference frame (AIM_REF_DT).
     // dt-corrected each frame so the closing rate is frame-rate independent.
     // 1.0 ⇒ instant snap; smaller ⇒ a slower glide onto the target.
-    followFraction: 0.3,
+    followFraction: 0.22,
     // How long a just-killed enemy stays in play after dying, in ms. Inside
     // that window it counts as a live player in every respect — it competes
     // for "nearest the cursor" on equal terms and gets shot at like anything
     // else — and once the timer is up it drops out entirely.
-    deadLingerMs: 600,
+    deadLingerMs: 500,
     // How much of the measured round trip to lead by, as a fraction. The state
     // we can see is one one-way delay old and a shot fired now arrives one
     // one-way delay later, so an un-compensated server resolves the shot
@@ -3190,14 +3193,14 @@
   // the auto-quickswap code below) because SETTINGS_SPECS binds a slider to it
   // and would hit the temporal dead zone otherwise.
   const AUTO_SWAP = {
-    enabled: 0,        // master switch; 0 = never synthesize a swap
+    enabled: 1,        // master switch; 0 = never synthesize a swap
     // Minimum fireDelay, in seconds, for a gun to be treated as
     // slow-firing. The default sits just under the 0.5s USAS-12 so the
     // set is snipers, pump/semi shotguns, the S&W 500 and the potato
     // cannon — weapons whose post-shot dead time comfortably exceeds a
     // sidearm's switchDelay. Lower it toward 0.3 to also catch the M1014,
     // Saiga-12, SPAS-16 and M1100; raise it to restrict to bolt-actions.
-    slowFireThreshold: 0.5,
+    slowFireThreshold: 0.4,
   };
 
   // Live-tunable netcode-smoothing settings — hoisted up here for the same
@@ -3215,7 +3218,7 @@
     // Weight half-life of the clock regression, in packets (~5s at 20Hz).
     // Deliberately long: we are recovering a clock, and the whole point is
     // that individual arrivals barely move it.
-    clockHalfLife: 100,
+    clockHalfLife: 170,
     // Playout delay, in ticks: the render is taken at `t_now - renderLag *
     // tick` instead of at t_now. Half a tick is the natural setting — the
     // newest snapshot's pseudotime is on average half a tick old by the time
@@ -3261,7 +3264,7 @@
   // accident. The solver, and what each of these knobs actually buys, are in
   // the dodge-bot section below.
   const DODGE = {
-    enabled: 0,
+    enabled: 1,
     // Draw the plan the search actually returned — the polyline the winning
     // state was reached by, from where the ping lead leaves us out to the end
     // of the horizon — on the ESP overlay canvas, with the legs already spent
@@ -3270,7 +3273,7 @@
     // presses it (see dodgeStep); this gates the drawing alone. Off by default,
     // and worth having off: a line redrawn every 16ms over the middle of a
     // firefight is a lot of ink.
-    path: 0,
+    path: 1,
     // Draw, for every grenade in the air, the blast it is going to make: two
     // red rings at the detonation point — the full-damage plateau and the outer
     // edge of any damage at all — and the seconds left on its fuse over the
@@ -3281,10 +3284,10 @@
     // is on screen is what the loss is using and not a second opinion about it.
     // Off by default: a 12u circle is a lot of ink for something that is only
     // interesting for a few seconds a match.
-    rings: 0,
+    rings: 1,
     // How far ahead a plan is scored. Long enough to see the second bullet
     // of a burst, short enough that the enemy's own aim hasn't gone stale.
-    horizon: 0.8,
+    horizon: 1.2,
     // How much daylight halves what a near miss is billed — the scale of the
     // hit test's falloff, in world units off the hitbox. See dodgeDpClearance.
     //
@@ -3296,7 +3299,7 @@
     // which a miss becomes certain; nothing about the doubt it stands for is
     // that sharp, so it grades instead. Raise it and the bot gives rounds a
     // wider berth; drop it and it shaves them.
-    clearance: 0.35,
+    clearance: 0.3,
     // Multiplier on the measured round trip when advancing threats to where
     // the server will have them. 1.0 is the derivation in the section header;
     // drop it toward 0 to dodge what is drawn instead of what is real.
@@ -3315,7 +3318,7 @@
     // the default, 16x at 0.2 and 256x at the floor. Below 0.2 that crossover
     // passes mp5-against-awc and the bot will start taking the awc round later
     // over the mp5 round now, which is the point at which it is simply wrong.
-    halfLife: 0.4,
+    halfLife: 0.85,
     // Cost per second for running exactly opposite the keys the user is
     // holding, scaled by how opposed the heading is. It cannot buy a hit and is
     // not meant to. Comparing the two per leg, which is the only comparison the
@@ -3381,11 +3384,11 @@
     // Seconds one decision covers. horizon/stepS is how many decisions the
     // plan gets, and the search is a shortest path over (cell, time) — see
     // dodgeDpPlan.
-    stepS: 0.1,
+    stepS: 0.08,
     // What position is snapped to so that paths can merge. Finer is more
     // faithful and squarely more expensive; 0.2 measured a fifth of a point
     // better than 0.35 for nearly twice the time.
-    cell: 0.35,
+    cell: 0.05,
   };
 
   // Aim the throw at the instant it is released. Declared up here rather than
@@ -3397,7 +3400,7 @@
     // throw *goes* rather than what is known about it — everything else here
     // reads the world or drives our own feet, and a grenade that lands
     // somewhere the user did not point is a different kind of thing.
-    enabled: 0,
+    enabled: 1,
   };
 
   // ---------------------------------------------------------------------
