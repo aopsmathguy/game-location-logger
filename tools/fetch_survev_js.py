@@ -22,7 +22,12 @@ except ImportError:
     sys.exit("jsbeautifier not installed. Run: pip install jsbeautifier")
 
 BASE_URL = "https://survev.io"
-OUTPUT_DIR = "js_dump"
+
+# Anchored at the repo root, not the cwd: the webapp spawns this script from
+# its own directory, and js_dump/ is a repo-level cache shared with
+# derive_mangled.py.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+OUTPUT_DIR = REPO_ROOT / "js_dump"
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 
 
@@ -67,7 +72,7 @@ def main() -> None:
     ap.add_argument(
         "--keep-old",
         action="store_true",
-        help=f"don't delete previous fetches' files from {OUTPUT_DIR}/",
+        help=f"don't delete previous fetches' files from {OUTPUT_DIR}",
     )
     args = ap.parse_args()
 
@@ -109,7 +114,7 @@ def main() -> None:
     # run may still be present from the last one, and deleting it would leave
     # js_dump/ with no usable gameplay bundle at all.
     if not keep:
-        sys.exit(f"No scripts downloaded — leaving ./{OUTPUT_DIR}/ untouched.")
+        sys.exit(f"No scripts downloaded — leaving {OUTPUT_DIR} untouched.")
     if args.keep_old:
         print("Keeping previous fetches' files (--keep-old).")
     elif failed:
@@ -117,7 +122,7 @@ def main() -> None:
     else:
         prune_stale(keep)
 
-    print(f"Done. Output in ./{OUTPUT_DIR}/")
+    print(f"Done. Output in {OUTPUT_DIR}")
 
 
 if __name__ == "__main__":

@@ -26,9 +26,13 @@ from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
 
-JS_DUMP = Path(__file__).parent / "js_dump"
-MANGLED_JS = Path(__file__).parent / "mangled.js"
-BACKUP_JS = Path(__file__).parent / "mangled.js.bak"
+# Anchored at the repo root: this script lives in tools/, reads the bundle
+# cache at the root, and writes the dictionary that core/ shares between the
+# extension and the webapp.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+JS_DUMP = REPO_ROOT / "js_dump"
+MANGLED_JS = REPO_ROOT / "core" / "mangled.js"
+BACKUP_JS = REPO_ROOT / "core" / "mangled.js.bak"
 
 # Mangled-identifier shape. survev mangles to 2–8 char mixed-case identifiers,
 # but we don't bound length — capture any plausible JS ident.

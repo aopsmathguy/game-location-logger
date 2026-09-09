@@ -82,6 +82,53 @@
     potato_cannon: 100, potato_smg: 100, potato_lmg: 100, bugle: 100
   };
 
+  // Same gun type -> the bulletType it fires, which is the key into
+  // BULLET_DAMAGE and BULLET_RANGE below. Derived from the same dump as
+  // GUN_BULLET_SPEED, from the `bulletType` field of each gun def, and it is
+  // deliberately laid out in the same order and the same groups so the two read
+  // side by side.
+  //
+  // A live round needs none of this — it arrives carrying its own bulletType,
+  // and the addBullet hook stamps it on. This is for the round nobody has fired
+  // yet: the phantom shot the dodge planner charges for pointing a gun at us
+  // (see dodgeAddPhantoms), which has to be priced from the gun alone.
+  //
+  // The mapping is not the regular `bullet_<gun>` a third of it looks like —
+  // shotguns share pellet types, every dual fires its base gun's round, and the
+  // potato guns and the bugle all fire the damageless `bullet_invis` — so it is
+  // written out rather than derived.
+  const GUN_BULLET_TYPE = {
+    mp5: 'bullet_mp5', mac10: 'bullet_mac10', ump9: 'bullet_ump9',
+    vector: 'bullet_vector', vector45: 'bullet_vector45', scorpion: 'bullet_scorpion',
+    vss: 'bullet_vss', famas: 'bullet_famas', hk416: 'bullet_hk416',
+    m4a1: 'bullet_m4a1', mk12: 'bullet_mk12', l86: 'bullet_l86',
+    m249: 'bullet_m249', qbb97: 'bullet_qbb97', scout_elite: 'bullet_scout',
+    ak47: 'bullet_ak47', scar: 'bullet_scar',
+    scarssr: 'bullet_scarssr', an94: 'bullet_an94', groza: 'bullet_groza',
+    grozas: 'bullet_grozas', dp28: 'bullet_dp28', bar: 'bullet_bar',
+    imbel: 'bullet_imbel', pkp: 'bullet_pkp', model94: 'bullet_model94',
+    mkg45: 'bullet_mkg45', blr: 'bullet_blr', mosin: 'bullet_mosin',
+    sv98: 'bullet_sv98', awc: 'bullet_awc', m39: 'bullet_m39', svd: 'bullet_svd',
+    garand: 'bullet_garand', barrett: 'bullet_barrett',
+    ash12: 'bullet_ash12',
+    m870: 'bullet_buckshot', m1100: 'bullet_birdshot', mp220: 'bullet_buckshot',
+    saiga: 'bullet_buckshot',
+    spas12: 'bullet_flechette', spas16: 'bullet_flechette', m1014: 'bullet_slug',
+    usas: 'bullet_frag',
+    m9: 'bullet_m9', m9_dual: 'bullet_m9', m9_cursed: 'bullet_m9_cursed',
+    m93r: 'bullet_m93r', m93r_dual: 'bullet_m93r',
+    glock: 'bullet_glock', glock_dual: 'bullet_glock', p30l: 'bullet_p30l',
+    p30l_dual: 'bullet_p30l',
+    ot38: 'bullet_ot38', ot38_dual: 'bullet_ot38', ots38: 'bullet_ots38',
+    ots38_dual: 'bullet_ots38',
+    colt45: 'bullet_colt45', colt45_dual: 'bullet_colt45', m1911: 'bullet_m1911',
+    m1911_dual: 'bullet_m1911', m1a1: 'bullet_m1a1',
+    deagle: 'bullet_deagle', deagle_dual: 'bullet_deagle', sw500: 'bullet_sw500',
+    flare_gun: 'bullet_flare', flare_gun_dual: 'bullet_flare',
+    potato_cannon: 'bullet_invis', potato_smg: 'bullet_invis',
+    potato_lmg: 'bullet_invis', bugle: 'bullet_invis',
+  };
+
   // bulletType (as it arrives on the wire, and as stamped onto barn entries by
   // the addBullet hook) -> [damage, falloff], lifted verbatim from
   // survev's `shared/defs/gameObjects/bulletDefs.ts`. Two numbers because those
@@ -134,6 +181,33 @@
     shrapnel_barrel: [2, 1], shrapnel_stove: [5, 1], shrapnel_frag: [20, 1],
     shrapnel_strobe: [3, 1], shrapnel_usas: [5, 1], shrapnel_mirv_mini: [6, 1],
     shrapnel_bomb_iron: [10, 1], shrapnel_cobalt: [5, 1],
+  };
+
+  // bulletType -> the def's `distance`, in world units: how far a round of this
+  // type flies before it expires.
+  //
+  // Kept apart from BULLET_DAMAGE on purpose, for the reason that table gives
+  // for not carrying distance itself: a live round's range is its own, decayed
+  // by reflects and scaled by the wire's distanceMult and variance, and the
+  // barn entry already has that number. This is the base value from the def,
+  // which is only ever the right one for a round that does not exist yet — the
+  // phantom shot in dodgeAddPhantoms, whose range and damage falloff both need
+  // a denominator and have no instance to read one from.
+  const BULLET_RANGE = {
+    bullet_mp5: 100, bullet_mac10: 50, bullet_ump9: 100, bullet_vector: 46,
+    bullet_vector45: 45, bullet_scorpion: 120, bullet_vss: 125, bullet_famas: 150,
+    bullet_hk416: 175, bullet_m4a1: 165, bullet_mk12: 400, bullet_l86: 425,
+    bullet_m249: 220, bullet_qbb97: 200, bullet_scout: 450, bullet_ak47: 200,
+    bullet_scar: 175, bullet_scarssr: 200, bullet_an94: 300, bullet_groza: 175,
+    bullet_grozas: 185, bullet_dp28: 225, bullet_bar: 275, bullet_imbel: 200,
+    bullet_pkp: 200, bullet_model94: 175, bullet_mkg45: 145, bullet_blr: 400,
+    bullet_mosin: 500, bullet_sv98: 520, bullet_awc: 300, bullet_m39: 400,
+    bullet_svd: 425, bullet_garand: 444, bullet_barrett: 400, bullet_ash12: 70,
+    bullet_buckshot: 27, bullet_birdshot: 25, bullet_flechette: 45, bullet_slug: 60,
+    bullet_frag: 24, bullet_m9: 100, bullet_m9_cursed: 100, bullet_m93r: 100,
+    bullet_glock: 44, bullet_p30l: 100, bullet_ot38: 125, bullet_ots38: 135,
+    bullet_colt45: 110, bullet_m1911: 88, bullet_m1a1: 88, bullet_deagle: 120,
+    bullet_sw500: 160, bullet_flare: 16, bullet_invis: 1,
   };
 
   function looksLikePlayer(obj) {
@@ -1583,12 +1657,13 @@
     // the wrong-layer fade: both mean "no shot on this one", so they read as
     // the same state rather than as a hierarchy of two different problems.
     blockedAlpha: UNREACHABLE_ALPHA,
-    // Render only what is actually part of the collision set: building roofs,
-    // bushes and destroyed-obstacle rubble stop being drawn, so a house shows
-    // its inside. Off by default and independent of `enabled` above — it
-    // draws nothing on the overlay canvas, it only stops the game drawing
-    // some of its own art. See the collidable-only render block below.
-    collidableOnly: 0,
+    // See-through render: building roofs stop being drawn, so a house shows
+    // its inside, and everything else that can be seen or shot through —
+    // bushes, destroyed-obstacle rubble, tree canopies, smoke — is faded to
+    // ESP_ALPHA. Off by default and independent of `enabled` above — it draws
+    // nothing on the overlay canvas, it only changes how the game draws some
+    // of its own art. See the ESP render block below.
+    esp: 0,
   };
 
   // Bank shots: when the direct line is walled off, look for a one-bounce path
@@ -3106,6 +3181,15 @@
   // the dodge-bot section below.
   const DODGE = {
     enabled: 0,
+    // Draw the plan the search actually returned — the polyline the winning
+    // state was reached by, from where the ping lead leaves us out to the end
+    // of the horizon — on the ESP overlay canvas, with the legs already spent
+    // faded. Display only, and now purely so: the course itself is walked back
+    // out of the search whether this is on or not, because the bot holds it and
+    // presses it (see dodgeStep); this gates the drawing alone. Off by default,
+    // and worth having off: a line redrawn every 16ms over the middle of a
+    // firefight is a lot of ink.
+    path: 0,
     // How far ahead a plan is scored. Long enough to see the second bullet
     // of a burst, short enough that the enemy's own aim hasn't gone stale.
     horizon: 0.8,
@@ -3171,6 +3255,24 @@
     // dodgeAlignFill — but the total of it over the horizon does not depend on
     // `halfLife`, so this number means what it always meant.
     follow: 1,
+    // How much of a hit an enemy's *aim* is worth: the chance that the round
+    // they are lined up to fire actually gets fired. Each hostile pointing a
+    // gun near us contributes one more threat — a round leaving their gun at
+    // the last frame we have — scaled by this. See dodgeAddPhantoms.
+    //
+    // It exists because everything else here is reactive. A round becomes a
+    // cost only once it is in the air, which at any range where flight time is
+    // under the round trip is already too late; the line you are standing on is
+    // knowable a long time before the shot that punishes it. This is the only
+    // term that costs anything for walking down someone's barrel.
+    //
+    // In the same currency as every other term — the loss is expected HP, and
+    // this is the probability half of the expectation — so it is directly
+    // comparable to a live round of the same gun. At 0.35 a Barrett lined up on
+    // our path outweighs an mp5 round genuinely in the air. At 1 aim is treated
+    // as fire and the bot will not stand in a line it could leave. At 0 none of
+    // it runs, and the bot is exactly what it was before: rounds only.
+    phantom: 0.35,
     // Seconds one decision covers. horizon/stepS is how many decisions the
     // plan gets, and the search is a shortest path over (cell, time) — see
     // dodgeDpPlan.
@@ -3219,7 +3321,7 @@
       section: 'ESP' },
     { id: 'esp.losDim',   store: ESP,    key: 'losDim',  label: 'Dim blocked', kind: 'toggle' },
     { id: 'esp.blockedAlpha', store: ESP, key: 'blockedAlpha', label: 'Blocked fade',      min: 0,    max: 1,    step: 0.05, decimals: 2 },
-    { id: 'esp.collidableOnly', store: ESP, key: 'collidableOnly', label: 'Collidable only', kind: 'toggle' },
+    { id: 'esp.esp', store: ESP, key: 'esp', label: 'ESP', kind: 'toggle' },
     { id: 'names.enemy',  store: NAME_TAGS, key: 'enabled', label: 'Enemy names', kind: 'toggle',
       section: 'Name tags' },
     { id: 'bank.enabled', store: BANK,  key: 'enabled', label: 'Bank shots', kind: 'toggle',
@@ -3229,11 +3331,13 @@
       section: 'Autoshoot' },
     { id: 'dodge.enabled',  store: DODGE, key: 'enabled',   label: 'Dodge bot', kind: 'toggle',
       section: 'Dodge bot' },
+    { id: 'dodge.path',     store: DODGE, key: 'path',      label: 'Show plan', kind: 'toggle' },
     { id: 'dodge.horizon',  store: DODGE, key: 'horizon',   label: 'Horizon',      unit: 's',  min: 0.2,  max: 2,    step: 0.05, decimals: 2 },
     { id: 'dodge.clearance', store: DODGE, key: 'clearance', label: 'Clearance',               min: 0.05, max: 1.5,  step: 0.05, decimals: 2 },
     { id: 'dodge.halfLife', store: DODGE, key: 'halfLife',  label: 'Hit half-life', unit: 's', min: 0.1,  max: 5,    step: 0.05, decimals: 2 },
     { id: 'dodge.leadK',    store: DODGE, key: 'leadK',     label: 'Ping lead',                min: 0,    max: 2,    step: 0.05, decimals: 2 },
     { id: 'dodge.follow',   store: DODGE, key: 'follow',    label: 'Follow input',             min: 0,    max: 5,    step: 0.1,  decimals: 1 },
+    { id: 'dodge.phantom',  store: DODGE, key: 'phantom',   label: 'Firing lines',             min: 0,    max: 1,    step: 0.05, decimals: 2 },
     { id: 'dodge.stepS',    store: DODGE, key: 'stepS',     label: 'Step',         unit: 's',  min: 0.03, max: 0.3,  step: 0.01, decimals: 2 },
     { id: 'dodge.cell',     store: DODGE, key: 'cell',      label: 'Grid',         unit: 'u',  min: 0.05, max: 0.5,  step: 0.05, decimals: 2 },
     { id: 'aim.reactionMs',     store: AIM_HUMAN, key: 'reactionMs',     label: 'Reaction',  unit: 'ms', min: 0,    max: 400,  step: 5,    decimals: 0,
@@ -3968,17 +4072,25 @@
   // input loop reads, so this is keybind-agnostic.
   let autoSwapFireWasDown = false;
 
+  // Auto-quickswap tracing. Off by default — every line below is one per shot
+  // — so turn it on at runtime with `window.__SURVEV_LOG_AUTOSWAP__ = true`
+  // when you need to see why a gun did or did not get swapped.
+  window.__SURVEV_LOG_AUTOSWAP__ = false;
+  const autoSwapLog = (msg) => {
+    if (window.__SURVEV_LOG_AUTOSWAP__) console.log(`[autoswap] ${msg}`);
+  };
+
   function autoSwapOnFirePressed(game) {
     const me = findLocalPlayerOnGame(game);
-    if (!me) { console.log('[autoswap] skip: no local player'); return; }
+    if (!me) { autoSwapLog('skip: no local player'); return; }
     const weapon = getCurrentWeapon(me);
-    if (!weapon) { console.log('[autoswap] skip: no current weapon'); return; }
+    if (!weapon) { autoSwapLog('skip: no current weapon'); return; }
     if (!isSlowFireGun(weapon)) {
       const delay = GUN_FIRE_DELAY[weapon];
       const why = delay === undefined ? 'unknown fireDelay'
         : AUTO_SWAP_NEVER.has(weapon) ? 'never-swap list'
         : `fireDelay ${delay}s < ${AUTO_SWAP.slowFireThreshold}s threshold`;
-      console.log(`[autoswap] skip: ${weapon} — ${why}`);
+      autoSwapLog(`skip: ${weapon} — ${why}`);
       return;
     }
     autoSwapQueueAfterShot(game, me, weapon);
@@ -3994,7 +4106,7 @@
       // resets gunSwitchCooldown so the other gun is ready as soon as
       // its own switchDelay elapses — beats waiting out the slow gun's
       // fireDelay.
-      if (log) console.log(`[autoswap] queued swap after ${weapon} shot`);
+      if (log) autoSwapLog(`queued swap after ${weapon} shot`);
       setTimeout(() => autoSwapEmitInput(game, AUTO_SWAP_INPUT_EQUIP_OTHER), AUTO_SWAP_FIRE_TO_SWAP_MS);
     } else {
       // Single-gun case: tap melee then return to the gun via
@@ -4004,7 +4116,7 @@
       // index the gun lives in. Stagger the two inputs by one tick
       // each so Fire/EquipMelee/EquipLastWeap each land on their own
       // server tick in order.
-      if (log) console.log(`[autoswap] queued melee-tap after ${weapon} shot`);
+      if (log) autoSwapLog(`queued melee-tap after ${weapon} shot`);
       setTimeout(() => autoSwapEmitInput(game, AUTO_SWAP_INPUT_EQUIP_MELEE), AUTO_SWAP_FIRE_TO_SWAP_MS);
       setTimeout(() => autoSwapEmitInput(game, AUTO_SWAP_INPUT_EQUIP_LAST), AUTO_SWAP_FIRE_TO_SWAP_MS * 2);
     }
@@ -4449,8 +4561,35 @@
   const DODGE_SPEED_MIN = 3;        // below this we assume we weren't moving
   const DODGE_SPEED_MAX = 24;       // above it, a teleport or a bad frame
   const DODGE_SPEED_WINDOW = 10;    // moving deltas the estimate is the max of
-  const DODGE_PLAN_MS = 16;         // one plan per frame at 60Hz
-  const DODGE_WALL_STEP = 0.3;      // world units per wall-march sample
+  // The floor on how often the planner runs at all. It is a rate limiter and
+  // no longer a cadence: a plan is made when the world it was made against has
+  // changed and not otherwise — see dodgeStep. Two rAF callbacks inside one
+  // 16ms slice still only get one search between them.
+  const DODGE_PLAN_MS = 16;
+  // How far the ping lead has to move before the standing plan is thrown away
+  // rather than re-indexed, as a distance rather than a time: the lead is a
+  // position correction, so what matters is how far it slides the plan's own
+  // start, and one grid cell is the resolution the search rounded that start to
+  // in the first place. At the default cell and full speed that is ~29ms of
+  // ping. See dodgePlanTime for the re-indexing the smaller shifts get.
+  const DODGE_LEAD_SLACK_CELLS = 1;
+  // Movement integration. Fixed in TIME rather than in distance, so the
+  // resolution of a leg does not change with our speed — a wade at 9 and a
+  // sprint at 12 are sampled equally finely, and the sub-step is the same
+  // quantity everywhere it appears (the sweep's segments, the depenetration's
+  // cadence, the fallback normal's meaning).
+  const DODGE_SUBSTEP_S = 0.01;     // seconds per movement sub-step
+  // `stepS` tops out at 0.3, so a leg is at most 30 sub-steps. The cap is a
+  // guard against a bad `dur` reaching here, not a budget.
+  const DODGE_SUBSTEP_MAX = 64;
+  // Depenetration passes per sub-step. Pushing out of one obstacle can push us
+  // into another — a doorway, or the seam between two crates — so it iterates.
+  // Four resolves every configuration the map actually produces; past that we
+  // are in a wedge with no exit and stopping is the honest answer.
+  const DODGE_DEPEN_PASSES = 4;
+  // Left beyond the surface after a push, so the next sub-step's overlap test
+  // reads clear rather than re-firing on a point sitting exactly on the edge.
+  const DODGE_DEPEN_EPS = 1e-4;
   // How many threats the per-threat scratch arrays start out sized for. Not a
   // cap: every round that survives the reachability filter is planned against,
   // and dodgeGrowThreats widens the arrays if a fight ever produces more. Sized
@@ -4526,7 +4665,17 @@
   const dodgeState = {
     engaged: false,
     dirIdx: 0,
-    lastPlanAt: 0,
+    // When dodgeStep last ran its body, throttled by DODGE_PLAN_MS. Not when it
+    // last planned — that is dodgePlan.at, and the two are different things now
+    // that a plan outlives the frame that made it.
+    lastStepAt: 0,
+    // Identity of the live rounds the last threat build accepted, as a hash of
+    // the barn slots they sit in. This is the one input to a plan that is not
+    // packet data: rounds fly and die on the client between updates, so a round
+    // going out is news the packet counter cannot carry. Slots are pooled, so a
+    // slot leaving the set changes this; a slot handed straight back out to a
+    // new round inside one gap would not, which is what dodgeBulletAdds is for.
+    liveKey: 0,
     speed: DODGE_SPEED_FALLBACK,
     selfR: PLAYER_RADIUS,
     // The last DODGE_SPEED_WINDOW packet deltas that showed movement, as a
@@ -4646,6 +4795,14 @@
   // out, and is only ever read while `alive`. Bullets already in flight when
   // the hook goes on have no stamp and price at DODGE_DMG_REF, which lasts as
   // long as they do.
+  // Rounds entering the world, counted. The planner replans when its inputs
+  // change and nothing else, and a round being fired is the one input that
+  // arrives mid-gap and cannot be seen by comparing two threat sets: the barn
+  // pools its slots, so a round that dies and one that is born into the same
+  // slot between two steps leave dodgeState.liveKey exactly as it was. This
+  // rides the hook that is already in that path — see dodgeStep.
+  let dodgeBulletAdds = 0;
+
   function hookBulletBarn(barn) {
     if (!barn || barn.__dodgeTypeHook) return barn;
     const orig = barn.addBullet;
@@ -4666,6 +4823,7 @@
           }
         }
         const ret = orig.apply(this, arguments);
+        dodgeBulletAdds++;
         try {
           const b = slot || (Array.isArray(list) ? list[list.length - 1] : null);
           if (b) b.__dodgeType = bullet?.bulletType ?? null;
@@ -4729,6 +4887,9 @@
                              px, py, reach, horizon) {
     const out = dodgeState.threats;
     out.length = 0;
+    // Rebuilt from nothing every step, so an empty barn reads as an empty set
+    // rather than as the last set that was in it.
+    dodgeState.liveKey = 0;
     const barn = findBulletBarn(game);
     const bullets = barn?.bullets;
     if (!Array.isArray(bullets)) return out;
@@ -4811,7 +4972,157 @@
       // in the innermost loop in the whole mod.
       const w = dmg / DODGE_DMG_REF;
 
-      out.push({ x, y, wx, wy, tMax, R, due, dmg, w, type: btype });
+      // `phantom` is false rather than absent so that a live round and the
+      // hypothetical one dodgeAddPhantoms appends share a shape — every edge of
+      // the search reads this array and a second hidden class would deoptimise
+      // the hottest loop in the mod.
+      out.push({ x, y, wx, wy, tMax, R, due, dmg, w, type: btype, phantom: false });
+      // The slot, folded in — accepted rounds only, and in the order the barn
+      // holds them, so this changes if any of them stops being a threat and not
+      // if one merely moves. `i + 1` because slot 0 must not be a no-op.
+      dodgeState.liveKey = (Math.imul(dodgeState.liveKey, 31) + i + 1) | 0;
+    }
+    return out;
+  }
+
+  // ---- The shot nobody has fired -----------------------------------------
+  //
+  // Everything above is reactive: a threat exists once a round does. That is
+  // the whole of what the bot could see, and it is half a beat too late by
+  // construction — see "What is and isn't dodgeable". The round is already in
+  // the air when it becomes a cost, so at any range where flight time is under
+  // the round trip, no plan beats it. What *is* knowable before the trigger is
+  // pulled is the line: standing in front of a gun is a decision we make with
+  // our own feet, several hundred milliseconds before the shot that punishes it.
+  //
+  // So each hostile pointing a gun near us contributes one more threat — a
+  // round fired from where they were at the last frame we have, along the aim
+  // that same frame carried, out of the gun they are holding. It travels, it is
+  // clipped by walls, it is priced by BULLET_DAMAGE, and it is swept exactly
+  // like a real one. It is a real cost in the loss and not a special case
+  // anywhere below this function; the only thing separating it from a live
+  // round is `phantom`, which keeps it out of the two hit readouts, and the
+  // weight.
+  //
+  // DODGE.phantom is that weight, and what it means is the chance the shot is
+  // actually taken. The loss is expected HP — `w * bill * DODGE_HIT_COST`, where
+  // `bill` already carries the chance the round connects — so multiplying `w` by
+  // a probability of firing keeps the phantom in the same currency as every
+  // other term and comparable to a live round of the same gun. At 0.35 a
+  // Barrett aimed down our path outweighs an mp5 round genuinely in the air,
+  // which is the ordering anyone would want; at 1 the bot treats aim as fire and
+  // will not stand in a line it could leave; at 0 none of this runs at all.
+  //
+  // Three properties worth being deliberate about:
+  //
+  //   The ray is frozen. The phantom is not re-aimed as the plan moves us, and
+  //   must not be — an enemy modelled as tracking us perfectly makes every
+  //   position equally doomed, the term goes flat, and a flat term steers
+  //   nothing. Frozen, it has a gradient that points off the line, which is the
+  //   entire object of the exercise.
+  //
+  //   It is one round, not a stream. Fire rate is not modelled, so this prices
+  //   being on the line at a particular instant rather than living there. That
+  //   understates a held trigger and is the conservative direction for a term
+  //   that is a guess about intent.
+  //
+  //   It shares the reach filter with live rounds, so a phantom only exists
+  //   while someone's aim already passes within our own reach of us. Pointing a
+  //   gun somewhere else costs nothing, and neither does an enemy behind a wall.
+  //
+  // Not modelled: pellet count and spread (a shotgun contributes one pellet
+  // down the centre line, at one pellet's damage), the muzzle offset
+  // (`barrelLength`, ~2.6u along the aim — it matters only at ranges where
+  // nothing here helps anyway), and the magazine, which is not on the wire for
+  // anyone but us. An enemy who is dry, reloading or mid-switch is still
+  // modelled as able to fire.
+  function dodgeAddPhantoms(out, game, selfId, selfInfo, roster, layer, leadS, selfR,
+                            px, py, reach, horizon) {
+    const k = dodgeClamp(DODGE.phantom, 0, 1, 0);
+    if (!(k > 0)) return out;
+    const pool = roster && roster.playerPool;
+    const players = (pool && typeof pool[POOL_GETALL] === 'function')
+      ? pool[POOL_GETALL]() : null;
+    if (!Array.isArray(players)) return out;
+
+    const R = selfR;
+    for (let i = 0; i < players.length; i++) {
+      const p = players[i];
+      if (!p || !p.active) continue;
+      const id = Number(p.__id ?? 0);
+      if (!Number.isFinite(id) || id === 0) continue;
+      if (selfId != null && id === selfId) continue;
+      // Dead is obvious; downed is the same rule the game plays by — a knocked
+      // player cannot shoot, so their aim is not a threat and charging for it
+      // would push the bot away from the one enemy it should be walking toward.
+      const net = p[PLAYER_NET];
+      if (net && (net[NET_DEAD] || net[NET_DOWNED])) continue;
+      if (roster && !isHostileTo(selfInfo, dodgePlayerInfo(roster, id))) continue;
+      // Their round would be born on their layer, so this is the same test the
+      // live path makes against `b.layer`, including the stairwell clause.
+      const theirLayer = Number.isFinite(p.layer) ? p.layer : 0;
+      if (!sameLayerAs(layer, theirLayer) && !(layer & 2)) continue;
+
+      // The gun decides everything else. A melee, a throwable or bare fists
+      // resolves to no entry and contributes nothing, which is also how an
+      // unlisted new gun behaves — it is skipped rather than guessed at, since
+      // there is no instance to fall back on the way a live round has.
+      const gun = getCurrentWeapon(p);
+      if (!gun || !Object.prototype.hasOwnProperty.call(GUN_BULLET_SPEED, gun)) continue;
+      const speed = GUN_BULLET_SPEED[gun];
+      const type = GUN_BULLET_TYPE[gun];
+      if (!(speed > 0) || !type) continue;
+      if (!Object.prototype.hasOwnProperty.call(BULLET_RANGE, type)) continue;
+      // Flares and the potato guns' invisible round, dropped for the same
+      // reason the live path drops them: zero damage.
+      const bdef = BULLET_DAMAGE[type];
+      if (bdef && !(bdef[0] > 0)) continue;
+
+      const pos = p[PLAYER_POS] || p[PLAYER_POS2];
+      const aim = p[PLAYER_DIR];
+      if (!pos || !aim) continue;
+      if (!Number.isFinite(pos.x) || !Number.isFinite(pos.y)) continue;
+      if (!Number.isFinite(aim.x) || !Number.isFinite(aim.y)) continue;
+      // The wire sends a unit vector, but this is the axis the whole threat is
+      // built on and a stale or half-written one would put the ray somewhere
+      // it isn't. One sqrt per enemy per frame is nothing next to being wrong.
+      const alen = Math.hypot(aim.x, aim.y);
+      if (!(alen > 1e-6)) continue;
+      const dx = aim.x / alen, dy = aim.y / alen;
+
+      const total = BULLET_RANGE[type];
+      let remaining = total;
+      // Fired at the last frame we have, so by plan-time zero — which is a
+      // round trip from now, the same instant the live rounds are advanced to —
+      // it has been flying for exactly that long. Same lead, same clock.
+      const lead = Math.min(leadS * speed, remaining);
+      const x = pos.x + dx * lead;
+      const y = pos.y + dy * lead;
+      remaining -= lead;
+      if (!(remaining > 0)) continue;
+      const flown = total - remaining;
+
+      const wall = firstBulletHit(x, y, x + dx * remaining, y + dy * remaining, layer, 0);
+      if (wall && wall.dist < remaining) {
+        if (!(wall.dist > 0)) continue;
+        remaining = wall.dist;
+      }
+
+      const wx = dx * speed, wy = dy * speed;
+      const tMax = remaining / speed;
+      const due = dodgeReachTime(x, y, wx, wy, tMax, px, py, R + reach);
+      // Aimed anywhere that cannot reach anywhere we could be, inside the
+      // horizon. This is what keeps a phantom from existing for every enemy on
+      // screen, and with it the planner still costs nothing in the common case
+      // of nobody pointing anything at us.
+      if (due < 0 || due > horizon) continue;
+
+      // Priced from the def rather than from an instance: no reflects, no
+      // wire multipliers, base range as the falloff's denominator. See
+      // BULLET_RANGE for why that number lives in its own table.
+      const dmg = dodgeBulletDamage(type, flown + speed * due, total, 0);
+      const w = k * dmg / DODGE_DMG_REF;
+      out.push({ x, y, wx, wy, tMax, R, due, dmg, w, type, phantom: true });
     }
     return out;
   }
@@ -4906,38 +5217,188 @@
     return out;
   }
 
-  // How far inside the inflated set a point is; 0 when it is clear of all of
-  // them. Depth rather than a boolean because that is what lets us tell
-  // "moving into the wall" from "sliding along one we are already touching".
-  function dodgeDepth(x, y, walls) {
-    let worst = 0;
-    for (let i = 0; i < walls.length; i++) {
-      const w = walls[i];
-      const d = w.box
-        ? Math.min(x - w.minX, w.maxX - x, y - w.minY, w.maxY - y)
-        : w.rad - Math.hypot(x - w.x, y - w.y);
-      if (d > worst) worst = d;
+  // ---- Depenetration -----------------------------------------------------
+  //
+  // Walls arrive from dodgeBuildWalls already inflated by our own radius, so
+  // everything here is a POINT against a solid shape and both algorithms stay
+  // in their simplest form. Overlap is resolved by the minimum translation:
+  // find the shortest way out and take it.
+  //
+  // Why push out rather than refuse the step. A refusal has to answer "does
+  // this move enter the wall", which along a heading that grazes a face is a
+  // question about the step size and not about the world — and answering it
+  // wrong in the safe direction pins us against the wall, which is the single
+  // worst place to be while a round is in the air. Resolving the overlap
+  // instead makes the wall-ward component of a heading die and the tangential
+  // component survive, which is sliding, and it falls straight out of the
+  // geometry rather than being a case anyone has to write.
+  //
+  // It also gives the grid snap somewhere to land. dodgeDpPlan rounds every
+  // node to a cell centre and that rounding is not obstacle-aware, so a node
+  // can be quantised up to half a cell inside a wall. Under the old march that
+  // was survivable but permanent — depth-relative stepping let us leave, but
+  // nothing ever pulled us back out. Here the next sub-step ejects it.
+  const dodgeDepenOut = { x: 0, y: 0 };
+
+  // Circle: the normal is radial, and the exit distance is whatever is left of
+  // the radius. Dead centre has no defined normal — it happens when a snap
+  // lands exactly on a barrel's axis — so the caller's fallback (the reverse of
+  // our heading) decides, which backs us out the way we came in.
+  function dodgeDepenCircle(x, y, w, fx, fy) {
+    const dx = x - w.x, dy = y - w.y;
+    const d2 = dx * dx + dy * dy;
+    if (d2 >= w.rad * w.rad) return false;
+    const d = Math.sqrt(d2);
+    if (d > 1e-9) {
+      const inv = (w.rad - d + DODGE_DEPEN_EPS) / d;
+      dodgeDepenOut.x = x + dx * inv;
+      dodgeDepenOut.y = y + dy * inv;
+    } else {
+      const push = w.rad + DODGE_DEPEN_EPS;
+      dodgeDepenOut.x = x + fx * push;
+      dodgeDepenOut.y = y + fy * push;
     }
-    return worst;
+    return true;
   }
 
-  // How far we actually get this way before something stops us. A step is
-  // only refused if it puts us *deeper* into an obstacle than we already
-  // are — a plain inside/outside test would report every wall-ward heading as
-  // blocked the moment we touched a wall, and the bot would stand against it
-  // and eat the shot instead of sliding along it, which is the one thing it
-  // most needs to be able to do while cornered.
-  function dodgeTravel(x, y, dx, dy, maxDist, walls) {
-    if (!walls.length || !(maxDist > 0)) return maxDist > 0 ? maxDist : 0;
-    const start = dodgeDepth(x, y, walls);
-    const steps = Math.ceil(maxDist / DODGE_WALL_STEP);
-    let got = 0;
-    for (let s = 1; s <= steps; s++) {
-      const d = Math.min(s * DODGE_WALL_STEP, maxDist);
-      if (dodgeDepth(x + dx * d, y + dy * d, walls) > start + 1e-4) break;
-      got = d;
+  // Rectangle: the four face distances are the four candidate exits, and the
+  // smallest is the minimum translation. Axis-aligned throughout — `ori` is a
+  // quarter-turn count, so a rotated AABB is still an AABB (see the collider
+  // notes above) — which is what keeps this to four subtractions and a min.
+  //
+  // Corners are square rather than rounded, because dodgeBuildWalls inflates
+  // the box rather than taking a true Minkowski sum. That over-inflates a
+  // corner by up to (sqrt2 - 1) * selfR diagonally, keeping us slightly further
+  // off it than the game would. Erring toward clearance is the right side for
+  // something whose whole job is not being touched, and it is the behaviour the
+  // distance march had too.
+  function dodgeDepenBox(x, y, w) {
+    const dl = x - w.minX;  if (dl <= 0) return false;
+    const dr = w.maxX - x;  if (dr <= 0) return false;
+    const db = y - w.minY;  if (db <= 0) return false;
+    const dt = w.maxY - y;  if (dt <= 0) return false;
+    let best = dl, ax = -1, ay = 0;
+    if (dr < best) { best = dr; ax = 1;  ay = 0; }
+    if (db < best) { best = db; ax = 0;  ay = -1; }
+    if (dt < best) { best = dt; ax = 0;  ay = 1; }
+    const push = best + DODGE_DEPEN_EPS;
+    dodgeDepenOut.x = x + ax * push;
+    dodgeDepenOut.y = y + ay * push;
+    return true;
+  }
+
+  // Resolve every overlap at (x, y), leaving the result in dodgeDepenOut.
+  // `fx, fy` is the fallback normal for the degenerate circle case and should
+  // be the reverse of the heading.
+  //
+  // Three outcomes, because the caller has to treat the third differently:
+  //
+  //   CLEAR     nothing overlapped; the point is untouched.
+  //   RESOLVED  overlapped, and a later pass confirmed the result is clear.
+  //   STUCK     passes ran out with an overlap still live.
+  //
+  // STUCK is not a tuning failure and more passes will not fix it — per-shape
+  // MTV can genuinely cycle. Two boxes overlapping in a narrow strip, with the
+  // point inside the strip, have each shape preferring to eject along the strip
+  // while the union's only real exit is across it: box A pushes right, box B
+  // pushes it straight back left, forever. Detecting that and telling the
+  // caller is the honest answer; dodgeSubstep then refuses the step, which
+  // leaves us at the last position known to be clear.
+  //
+  // Keeping that invariant — every position the planner reports is outside
+  // everything — is what stops the cycle being reachable in the first place.
+  // Overlaps only ever arrive from one sub-step of travel or half a cell of
+  // snap, so they are shallow, and shallow overlaps resolve on the first pass.
+  const DODGE_DEPEN_CLEAR = 0;
+  const DODGE_DEPEN_RESOLVED = 1;
+  const DODGE_DEPEN_STUCK = 2;
+
+  function dodgeDepenetrate(x, y, walls, fx, fy) {
+    const n = walls.length;
+    let moved = false;
+    for (let pass = 0; pass < DODGE_DEPEN_PASSES; pass++) {
+      let hit = false;
+      for (let i = 0; i < n; i++) {
+        const w = walls[i];
+        if (w.box ? dodgeDepenBox(x, y, w) : dodgeDepenCircle(x, y, w, fx, fy)) {
+          x = dodgeDepenOut.x; y = dodgeDepenOut.y;
+          hit = true; moved = true;
+        }
+      }
+      // A pass that finds nothing is the confirmation that we are out; without
+      // one we only know the last push happened, not that it worked.
+      if (!hit) {
+        dodgeDepenOut.x = x; dodgeDepenOut.y = y;
+        return moved ? DODGE_DEPEN_RESOLVED : DODGE_DEPEN_CLEAR;
+      }
     }
-    return got;
+    dodgeDepenOut.x = x; dodgeDepenOut.y = y;
+    return DODGE_DEPEN_STUCK;
+  }
+
+  // One sub-step of travel: advance, then resolve. Refuses the step outright
+  // when the overlap will not resolve, leaving us where we were.
+  //
+  // Every integration site goes through this — dodgeMove, dodgeAdvance and
+  // dodgeDpEdge — and that is load-bearing rather than tidiness. dodgeDpEdge
+  // re-walks the path that dodgeMove already measured, and the DP transition
+  // uses dodgeMove's endpoint while the threat sweep uses dodgeDpEdge's
+  // polyline. If the two integrations disagreed by so much as one refused
+  // sub-step, the planner would be scoring a path that does not end where it
+  // believes it ends.
+  const dodgeStepOut = { x: 0, y: 0, bent: false };
+
+  function dodgeSubstep(x, y, sx, sy, walls, fx, fy, out) {
+    const cx = x + sx, cy = y + sy;
+    const st = dodgeDepenetrate(cx, cy, walls, fx, fy);
+    if (st === DODGE_DEPEN_CLEAR) {
+      out.x = cx; out.y = cy; out.bent = false;
+    } else if (st === DODGE_DEPEN_STUCK) {
+      out.x = x; out.y = y; out.bent = true;      // refused
+    } else {
+      out.x = dodgeDepenOut.x; out.y = dodgeDepenOut.y; out.bent = true;
+    }
+  }
+
+  // ---- Movement ----------------------------------------------------------
+  //
+  // Integrate one leg at DODGE_SUBSTEP_S, depenetrating after each sub-step.
+  // Leaves the endpoint in `out` along with `bent` — whether any push actually
+  // fired. `bent` is the whole reason this reports more than a position: an
+  // unbent leg is a straight line at full speed, which lets the threat sweep
+  // stay a single closed-form solve, and only a bent one has to be followed
+  // segment by segment. See dodgeDpEdge.
+  const dodgeMoveOut = { x: 0, y: 0, bent: false };
+
+  function dodgeMove(x, y, dx, dy, speed, dur, walls, out) {
+    out.bent = false;
+    if (!(dur > 0)) { out.x = x; out.y = y; return out; }
+    const still = dx === 0 && dy === 0;
+    if (!walls.length) {
+      out.x = x + dx * speed * dur;
+      out.y = y + dy * speed * dur;
+      return out;
+    }
+    // Standing still cannot enter anything new, so one resolve settles it —
+    // and it does still need one, because the snap may have put us inside.
+    if (still) {
+      if (dodgeDepenetrate(x, y, walls, 0, 0) !== DODGE_DEPEN_CLEAR) {
+        x = dodgeDepenOut.x; y = dodgeDepenOut.y; out.bent = true;
+      }
+      out.x = x; out.y = y;
+      return out;
+    }
+    let steps = Math.ceil(dur / DODGE_SUBSTEP_S);
+    if (steps > DODGE_SUBSTEP_MAX) steps = DODGE_SUBSTEP_MAX;
+    const h = dur / steps;
+    const sx = dx * speed * h, sy = dy * speed * h;
+    for (let s = 0; s < steps; s++) {
+      dodgeSubstep(x, y, sx, sy, walls, -dx, -dy, dodgeStepOut);
+      x = dodgeStepOut.x; y = dodgeStepOut.y;
+      if (dodgeStepOut.bent) out.bent = true;
+    }
+    out.x = x; out.y = y;
+    return out;
   }
 
   // ---- Rolling a course forward ------------------------------------------
@@ -4994,22 +5455,35 @@
       return;
     }
 
-    const want = speed * d;
-    const got = dodgeTravel(c.x, c.y, dir.x, dir.y, want, walls);
-    const tMove = want > 0 ? d * (got / want) : 0;
-    if (tMove > 0) {
+    // Same adaptive split the DP edge makes, for the same reason: a leg that
+    // never touches anything is a straight line and solves in closed form, and
+    // only a leg that gets pushed has to be walked. `hitAt` takes a min over
+    // whatever it is told, so sub-stepping needs no special billing rule here.
+    dodgeMove(c.x, c.y, dir.x, dir.y, speed, d, walls, dodgeMoveOut);
+    if (!dodgeMoveOut.bent) {
       const vx = dir.x * speed, vy = dir.y * speed;
       for (let i = 0; i < n; i++) {
-        dodgeSweep(i, c.x, c.y, vx, vy, threats[i], c.t, tMove, c.hitAt);
+        dodgeSweep(i, c.x, c.y, vx, vy, threats[i], c.t, d, c.hitAt);
       }
-      c.x += dir.x * got;
-      c.y += dir.y * got;
-    }
-    const tStuck = d - tMove;
-    if (tStuck > 0) {
-      for (let i = 0; i < n; i++) {
-        dodgeSweep(i, c.x, c.y, 0, 0, threats[i], c.t + tMove, tStuck, c.hitAt);
+      c.x = dodgeMoveOut.x; c.y = dodgeMoveOut.y;
+    } else {
+      let steps = Math.ceil(d / DODGE_SUBSTEP_S);
+      if (steps > DODGE_SUBSTEP_MAX) steps = DODGE_SUBSTEP_MAX;
+      const h = d / steps;
+      const sx = dir.x * speed * h, sy = dir.y * speed * h;
+      const invH = 1 / h;
+      let x = c.x, y = c.y;
+      for (let s = 0; s < steps; s++) {
+        dodgeSubstep(x, y, sx, sy, walls, -dir.x, -dir.y, dodgeStepOut);
+        const ax = dodgeStepOut.x, ay = dodgeStepOut.y;
+        const vx = (ax - x) * invH, vy = (ay - y) * invH;
+        const ts = c.t + s * h;
+        for (let i = 0; i < n; i++) {
+          dodgeSweep(i, x, y, vx, vy, threats[i], ts, h, c.hitAt);
+        }
+        x = ax; y = ay;
       }
+      c.x = x; c.y = y;
     }
     c.t += d;
   }
@@ -5039,10 +5513,9 @@
     if (!(dur > 0)) return;
     const dir = DODGE_DIRS[dirIdx];
     if (dir.x === 0 && dir.y === 0) return;
-    const want = speed * dur;
-    const got = dodgeTravel(c.x, c.y, dir.x, dir.y, want, walls);
-    c.x += dir.x * got;
-    c.y += dir.y * got;
+    dodgeMove(c.x, c.y, dir.x, dir.y, speed, dur, walls, dodgeMoveOut);
+    c.x = dodgeMoveOut.x;
+    c.y = dodgeMoveOut.y;
   }
 
   // When a finished rollout is first hit, or Infinity if it never is. This is
@@ -5054,6 +5527,10 @@
     const n = threats.length;
     let firstHit = Infinity;
     for (let i = 0; i < n; i++) {
+      // A shot nobody has fired cannot be a time we get hit. It is a real cost
+      // in the loss and deliberately not an event in the readouts, which exist
+      // to say what the rounds actually in the air are going to do.
+      if (threats[i].phantom) continue;
       const hit = c.hitAt[i];
       if (hit < firstHit) firstHit = hit;
     }
@@ -5099,6 +5576,168 @@
   // frame and read immediately.
   const dodgeBest = { dir: 0, cost: Infinity, firstHit: Infinity };
 
+  // ---- Getting the whole plan back out of the search -------------------
+  //
+  // The search's own answer is one heading — the one to press now — and every
+  // other leg behind it is overwritten as the layers swap. That was enough
+  // while the plan was remade from scratch every frame. It is not enough now:
+  // a plan is held and played out until something about the world changes (see
+  // dodgeStep), so the legs after the first have to survive the function that
+  // found them.
+  //
+  // What is recovered is the winning state's ancestry, not a re-simulation of
+  // the heading it opens with: the two differ the moment the plan turns, which
+  // is exactly when it matters, both to hold and to look at.
+  //
+  // Two things read the result. dodgePlan takes the headings and is load
+  // bearing — it is what gets pressed. dodgePath takes the positions and is
+  // display only, drawn by drawDodgePlan under the "Show plan" toggle. Neither
+  // is read by the search.
+  //
+  // One entry per completed layer, holding the states the beam kept and the
+  // state in the layer before that each was reached from. Only survivors are
+  // ever expanded, so a parent recorded here is always still in the previous
+  // entry — which is what makes walking the winner back to the start a lookup
+  // rather than a search over the grid.
+  const dodgeTrace = { layers: [], depth: 0 };
+
+  // The course the bot is holding: one heading per decision, in plan order, and
+  // everything needed to say which of them is the one to be pressing now.
+  //
+  // The clock this is indexed on is plan time, whose zero is "the world as the
+  // server will have it when a press made at `at` lands" — a full round trip
+  // ahead of the packet the plan was built from. `lead` is the size of that
+  // correction when the plan was made, and it is kept because it is the thing
+  // that can move underneath a held plan: see dodgePlanTime.
+  //
+  // The rest is the world this was planned against, kept so the next step can
+  // ask whether any of it has changed rather than assume it has — see
+  // dodgePlanFresh.
+  const dodgePlan = {
+    n: 0,                       // legs, i.e. how many decisions it holds
+    dirs: new Int8Array(32),    // DODGE_DIRS index per leg, in plan order
+    dt: 0,                      // seconds one leg covers
+    at: 0,                      // Date.now() the plan was made at
+    lead: 0,                    // the ping lead it was built with, seconds
+    leg: -1,                    // the leg being pressed right now
+    // What it was planned against.
+    packet: -1,                 // netStats.updates
+    adds: -1,                   // dodgeBulletAdds
+    live: 0,                    // dodgeState.liveKey
+    count: -1,                  // threat count, phantoms included
+    userDir: -1,                // the heading the user was holding
+  };
+
+  function dodgePlanEnsure(n) {
+    if (dodgePlan.dirs.length >= n) return;
+    dodgePlan.dirs = new Int8Array(Math.ceil(n / 32) * 32);
+  }
+
+  // The walked-back polyline in world units, plus where we actually were when
+  // it was planned. `at` is what stops a plan from a fight that has ended being
+  // drawn over a quiet screen, and it is refreshed on every step that keeps the
+  // plan — a plan being played out is current, not stale, and the line would
+  // otherwise blink out between packets on a slow link.
+  const dodgePath = {
+    n: 0,
+    x: new Float64Array(32),
+    y: new Float64Array(32),
+    at: 0,
+    startX: 0,
+    startY: 0,
+  };
+
+  // How long a plan is worth drawing. One step at the planner's own 16ms floor
+  // plus room for a dropped frame; past that dodgeStep has stopped touching it,
+  // which means the keys have gone back.
+  const DODGE_PATH_STALE_MS = 120;
+
+  function dodgePathEnsure(n) {
+    if (dodgePath.x.length >= n) return;
+    const cap = Math.ceil(n / 32) * 32;
+    dodgePath.x = new Float64Array(cap);
+    dodgePath.y = new Float64Array(cap);
+  }
+
+  // Snapshot one finished layer: the states the beam kept, the state in the
+  // layer before that each was reached from, and the heading of the edge
+  // between them. Called after the beam has pruned, so `len` is at most
+  // DODGE_DP_BEAM and this is a few hundred bytes a layer.
+  //
+  // It runs unconditionally now. It used to be gated on the "Show plan" toggle,
+  // which was right while the tail of a plan was only ever looked at; the tail
+  // is pressed now, so the toggle gates the drawing and nothing else.
+  function dodgeTraceCapture(depth, list, len, parent, dirs) {
+    let e = dodgeTrace.layers[depth];
+    if (!e || e.idx.length < len) {
+      const cap = Math.ceil(len / 64) * 64;
+      e = {
+        idx: new Int32Array(cap), par: new Int32Array(cap),
+        dir: new Int8Array(cap), len: 0,
+      };
+      dodgeTrace.layers[depth] = e;
+    }
+    for (let i = 0; i < len; i++) {
+      const j = list[i];
+      e.idx[i] = j;
+      e.par[i] = parent[j];
+      e.dir[i] = dirs[j];
+    }
+    e.len = len;
+    dodgeTrace.depth = depth + 1;
+  }
+
+  // Walk the winning state back to the start and write the result out in plan
+  // order: the headings into dodgePlan, which is what gets pressed, and the
+  // positions into dodgePath, which is what gets drawn.
+  //
+  // Positions are the grid's, not the mover's: every layer snaps to `cell`, so
+  // these are the points the search actually scored, and drawing the unsnapped
+  // ends of the legs instead would draw a path it never considered. The
+  // headings have no such caveat — they are exactly the edges the loss was
+  // charged on.
+  //
+  // The lookup per layer is linear over at most DODGE_DP_BEAM entries, which is
+  // 64 comparisons against a search that has just done several thousand edges.
+  function dodgeTraceWalk(bi, ox, oy, half, w, cell) {
+    const depth = dodgeTrace.depth;
+    dodgePath.n = 0;
+    dodgePlan.n = 0;
+    if (depth <= 0) return;
+    dodgePathEnsure(depth + 1);
+    dodgePlanEnsure(depth);
+    let idx = bi;
+    for (let d = depth - 1; d >= 0; d--) {
+      const e = dodgeTrace.layers[d];
+      let k = -1;
+      for (let i = 0; i < e.len; i++) {
+        if (e.idx[i] === idx) { k = i; break; }
+      }
+      // Can't happen while the capture sits where it does — every state in a
+      // layer was expanded from one in the entry before it — but a course that
+      // silently invents a leg is worse than no course, so a broken chain drops
+      // the whole plan. dodgeStep then presses the search's own opening heading
+      // for this step and plans again on the next one.
+      if (k < 0) { dodgePath.n = 0; dodgePlan.n = 0; return; }
+      const ix = idx % w, iy = (idx / w) | 0;
+      dodgePath.x[d + 1] = ox + (ix - half) * cell;
+      dodgePath.y[d + 1] = oy + (iy - half) * cell;
+      // e.dir[k] is the heading of the edge that reached this state, so it is
+      // the heading held over leg `d` — the leg ending at the point just
+      // written.
+      dodgePlan.dirs[d] = e.dir[k];
+      idx = e.par[k];
+    }
+    dodgePlan.n = depth;
+    // Point 0 is where the search started, i.e. where the ping lead leaves the
+    // newest packet — not where the packet put us, and not where the sprite is
+    // drawn. dodgeStep records the packet position separately; drawDodgePlan
+    // draws all three and what separates them.
+    dodgePath.x[0] = ox;
+    dodgePath.y[0] = oy;
+    dodgePath.n = depth + 1;
+  }
+
   // What disagreeing with the keys the user is holding costs, per second of
   // leg, per heading. Filled once per plan rather than per edge, because it
   // depends on nothing that varies inside the search: the held heading is fixed
@@ -5115,18 +5754,20 @@
   // asked for, but it is not the opposite of it either.
   //
   // The discount reaches this term too, and it is the half of it with the
-  // better excuse. Only the opening leg is ever pressed — dodgeStep replans
-  // every frame and applies plan.dir, so legs 2..n exist to judge that opening
-  // and are then thrown away. Undiscounted, the planner is exactly indifferent
-  // about *when* it disobeys: deviating on leg 1 and complying to the end costs
-  // the same as complying until the last leg and deviating there. That spends
-  // the budget on compliance that never happens. Discounted, it complies now
-  // and defers the deviation, and "now" is the only leg that becomes a keypress.
+  // better excuse. The near legs are the ones that get pressed: the opening leg
+  // always, the one after it only if nothing new has arrived by the time it
+  // comes due, and the far end almost never — a plan is dropped the moment the
+  // world it was made against moves, which at 20Hz of updates is about every
+  // half a leg. Undiscounted, the planner is exactly indifferent about *when*
+  // it disobeys: deviating on leg 1 and complying to the end costs the same as
+  // complying until the last leg and deviating there. That spends the budget on
+  // compliance that mostly never happens. Discounted, it complies now and
+  // defers the deviation, toward the legs that are actually pressed.
   //
-  // It sharpens the tiebreak on the right variable, too. dodgeDpFirst carries
-  // the opening heading, which is the entire output of the search, so weighting
-  // leg 1 more heavily separates the states by the thing being decided rather
-  // than by the tail they share.
+  // It sharpens the tiebreak on the right variable, too. The opening heading is
+  // the one part of the course that is certain to be used, so weighting leg 1
+  // more heavily separates the states by the thing being decided rather than by
+  // the tail they share.
   //
   // What the discount must not do is quietly change the slider. Summed over the
   // horizon the discounted leg lengths come to (1 - exp(-H/tau)) * tau rather
@@ -5140,8 +5781,8 @@
   //
   // That leaves the whole loss at zero whenever nothing is on course either,
   // which is now a state the bot sits in rather than a state it never reaches:
-  // with no threshold to cross it plans every frame a round is in the air,
-  // including the many frames where none of them is close to anything. What
+  // with no threshold to cross it plans whenever a round is in the air,
+  // including the many plans where none of them is close to anything. What
   // wins a completely flat loss is decided by the tie rule and not by accident.
   // `di` is enumerated from 0, the relaxation keeps the incumbent on equal cost
   // (`c >= cost` continues), and the beam's sort is stable — so the standing
@@ -5191,7 +5832,26 @@
   let dodgeDpHit = null, dodgeDpHitB = null;
   let dodgeDpSeen = null, dodgeDpSeenB = null;
   let dodgeDpList = null, dodgeDpListB = null;
-  let dodgeDpTravel = null, dodgeDpStamp = null;
+  // Which state each state was reached from, as a grid index into the layer
+  // before, and the heading of the edge that reached it. Together they are the
+  // whole plan rather than its first leg: walk the parents back from the winner
+  // and read the headings off, and dodgeStep has a course to hold rather than a
+  // key to press once. That is what makes replanning optional — see
+  // dodgeTraceWalk and dodgePlan.
+  //
+  // The search itself reads neither; dodgeDpFirst carries the opening heading,
+  // which is all it ever needed. Both stores are unconditional: two writes on
+  // the edges that improve a cell, against a table already carrying nine
+  // Float32 pairs per cell, and a branch in that loop costs more than the
+  // stores do.
+  let dodgeDpParent = null, dodgeDpParentB = null;
+  let dodgeDpDir = null, dodgeDpDirB = null;
+  // Memoized leg outcome per (cell, heading): the displacement it produces and
+  // whether the path bent getting there. Displacement rather than an absolute
+  // position because it is small — at most speed*dt, about 1.2 units — and a
+  // Float32 carries that to far more precision than it carries a world
+  // coordinate a thousand units from the origin.
+  let dodgeDpMoveX = null, dodgeDpMoveY = null, dodgeDpBent = null, dodgeDpStamp = null;
   let dodgeDpTouch = new Float64Array(DODGE_THREAT_ALLOC);
   // How much of a hit each threat is worth on the edge being scored: 1 inside
   // the hitbox, halving for every DODGE.clearance beyond it, 0 well outside.
@@ -5206,6 +5866,10 @@
   // of the two, since a slightly closer pass later in the leg can be worth less
   // than a slightly wider one now.
   let dodgeDpBill = new Float64Array(DODGE_THREAT_ALLOC);
+  // Per-leg billing mask for the sub-stepped path: 1 where the round was
+  // already inside the band when the leg opened and so belongs to an earlier
+  // leg. Only the bent path reads it — see dodgeDpEdge.
+  let dodgeDpSkip = new Uint8Array(DODGE_THREAT_ALLOC);
 
   // Widen every per-threat scratch array to hold `n`. Called once a frame from
   // dodgeStep, after the threat set is built and before anything indexes by
@@ -5223,6 +5887,7 @@
     dodgeDpTouch = new Float64Array(dodgeThreatCap);
     dodgeDpFactor = new Float64Array(dodgeThreatCap);
     dodgeDpBill = new Float64Array(dodgeThreatCap);
+    dodgeDpSkip = new Uint8Array(dodgeThreatCap);
     dodgeCtxPrefix.hitAt = new Float64Array(dodgeThreatCap);
     dodgeCtxWork.hitAt = new Float64Array(dodgeThreatCap);
   }
@@ -5308,7 +5973,10 @@
     dodgeDpHit = new Float64Array(n); dodgeDpHitB = new Float64Array(n);
     dodgeDpSeen = new Int32Array(n); dodgeDpSeenB = new Int32Array(n);
     dodgeDpList = new Int32Array(n); dodgeDpListB = new Int32Array(n);
-    dodgeDpTravel = new Float32Array(n * 9); dodgeDpStamp = new Int32Array(n * 9);
+    dodgeDpParent = new Int32Array(n); dodgeDpParentB = new Int32Array(n);
+    dodgeDpDir = new Int8Array(n); dodgeDpDirB = new Int8Array(n);
+    dodgeDpMoveX = new Float32Array(n * 9); dodgeDpMoveY = new Float32Array(n * 9);
+    dodgeDpBent = new Uint8Array(n * 9); dodgeDpStamp = new Int32Array(n * 9);
     dodgeDpEpoch = 0; dodgeDpVisit = 0;
   }
 
@@ -5383,52 +6051,105 @@
     }
   }
 
-  // How far heading `di` gets from this cell. Keyed by cell rather than by
-  // (cell, layer) because the answer cannot depend on when we arrive — and the
-  // wall march is the most expensive thing in the loop, so the several layers
-  // that can reach a cell pay for it once between them.
-  function dodgeDpTravelFor(idx, di, px, py, want, walls) {
+  // Where heading `di` leaves us from this cell, and whether it bent. Keyed by
+  // cell rather than by (cell, layer) because the answer cannot depend on when
+  // we arrive — walls do not move within a plan — so the several layers that
+  // can reach a cell pay for the integration once between them. The key is
+  // exact rather than approximate: every node's position is reconstructed from
+  // its cell index, so a cell index and a position are the same thing.
+  //
+  // Result goes into dodgeMoveOut, matching dodgeMove's own contract, so the
+  // caller reads both hit and miss the same way.
+  function dodgeDpMoveFor(idx, di, px, py, speed, dt, walls) {
     const key = idx * 9 + di;
-    if (dodgeDpStamp[key] === dodgeDpEpoch) return dodgeDpTravel[key];
+    if (dodgeDpStamp[key] === dodgeDpEpoch) {
+      dodgeMoveOut.x = px + dodgeDpMoveX[key];
+      dodgeMoveOut.y = py + dodgeDpMoveY[key];
+      dodgeMoveOut.bent = dodgeDpBent[key] === 1;
+      return dodgeMoveOut;
+    }
     const dir = DODGE_DIRS[di];
-    const got = dodgeTravel(px, py, dir.x, dir.y, want, walls);
+    dodgeMove(px, py, dir.x, dir.y, speed, dt, walls, dodgeMoveOut);
     dodgeDpStamp[key] = dodgeDpEpoch;
-    dodgeDpTravel[key] = got;
-    return got;
+    dodgeDpMoveX[key] = dodgeMoveOut.x - px;
+    dodgeDpMoveY[key] = dodgeMoveOut.y - py;
+    dodgeDpBent[key] = dodgeMoveOut.bent ? 1 : 0;
+    return dodgeMoveOut;
+  }
+
+  // Is this threat inside the falloff band at the instant the leg opens? The
+  // billing rule needs this once per leg, and the sub-stepped path cannot ask
+  // dodgeDpSweep for it — every sub-step after the first opens inside whatever
+  // the one before it was inside, which would silence the charge entirely.
+  function dodgeDpInBand(th, t0, px, py) {
+    const qx = th.x + th.wx * t0 - px;
+    const qy = th.y + th.wy * t0 - py;
+    const outer = th.R + dodgeDpPad;
+    return qx * qx + qy * qy < outer * outer;
   }
 
   // One leg: what it costs, the worst contact inside it, and where it ends.
-  // `billOpen` is passed down from the layer index — see dodgeDpSweep — and
-  // only ever to whichever half of the leg is genuinely its opening, so a leg
-  // split into a moving part and a pinned part cannot bill the same round twice.
-  function dodgeDpEdge(px, py, t0, di, dt, speed, travel, threats, billOpen) {
+  //
+  // Two paths, chosen by whether depenetration fired anywhere in the leg, and
+  // both exact:
+  //
+  //   not bent — nothing was touched, so the leg is a straight line at full
+  //     speed for the whole of `dt` and one closed-form solve per threat is
+  //     the entire answer. This is the overwhelming majority of edges and it
+  //     costs exactly what the old distance-clipped version cost.
+  //
+  //   bent — the path is a polyline, so it is walked at DODGE_SUBSTEP_S and
+  //     each segment solved at its own constant velocity. ~dt/0.01 times the
+  //     sweep work, paid only on edges that actually touch geometry.
+  //
+  // `billOpen` is the layer index (see dodgeDpSweep): a round already inside
+  // the band when the leg opens belongs to whichever earlier leg it entered on,
+  // except on layer 0 where there is no earlier leg. That test is made ONCE
+  // here, against the leg's own opening, and the sub-steps then sweep
+  // unconditionally so the closest approach is found across the whole leg
+  // rather than trapped in the sub-step the round happened to enter on.
+  // dodgeDpSweep's own max-fold (`bill > dodgeDpBill[i]`) picks the winner.
+  function dodgeDpEdge(px, py, t0, di, dt, speed, mvx, mvy, bent, threats, walls, billOpen) {
     const n = threats.length;
     let i;
     for (i = 0; i < n; i++) {
       dodgeDpFactor[i] = 0; dodgeDpBill[i] = 0; dodgeDpTouch[i] = Infinity;
     }
-    let cost = 0, nx = px, ny = py;
+    let cost = 0;
+    const nx = px + mvx, ny = py + mvy;
     const dir = DODGE_DIRS[di];
 
-    if (dir.x === 0 && dir.y === 0) {
-      for (i = 0; i < n; i++) dodgeDpSweep(i, px, py, 0, 0, threats[i], t0, dt, billOpen);
+    if (!bent) {
+      // Free flight — or standing still, where the velocity is zero and this is
+      // the same solve. No wall was touched, so speed was never interrupted.
+      const vx = dir.x * speed, vy = dir.y * speed;
+      for (i = 0; i < n; i++) dodgeDpSweep(i, px, py, vx, vy, threats[i], t0, dt, billOpen);
     } else {
-      const want = speed * dt;
-      const tMove = want > 0 ? dt * (travel / want) : 0;
-      if (tMove > 0) {
-        const vx = dir.x * speed, vy = dir.y * speed;
-        for (i = 0; i < n; i++) dodgeDpSweep(i, px, py, vx, vy, threats[i], t0, tMove, billOpen);
-        nx = px + dir.x * travel;
-        ny = py + dir.y * travel;
+      // Which threats this leg is allowed to charge for at all.
+      for (i = 0; i < n; i++) {
+        dodgeDpSkip[i] = (!billOpen && dodgeDpInBand(threats[i], t0, px, py)) ? 1 : 0;
       }
-      const tStuck = dt - tMove;
-      if (tStuck > 0) {
-        // The pinned part opens the leg only when there was no moving part;
-        // otherwise its "open" is the moving part's close, which is mid-encounter.
-        const stuckOpens = billOpen && !(tMove > 0);
+      let steps = Math.ceil(dt / DODGE_SUBSTEP_S);
+      if (steps > DODGE_SUBSTEP_MAX) steps = DODGE_SUBSTEP_MAX;
+      const h = dt / steps;
+      const sx = dir.x * speed * h, sy = dir.y * speed * h;
+      const invH = 1 / h;
+      let x = px, y = py;
+      for (let s = 0; s < steps; s++) {
+        dodgeSubstep(x, y, sx, sy, walls, -dir.x, -dir.y, dodgeStepOut);
+        const ax = dodgeStepOut.x, ay = dodgeStepOut.y;
+        // The segment's own velocity, push-out included — which is how a slide
+        // gets its tangential speed into the solve instead of being modelled as
+        // running at the wall and stopping. A refused sub-step gives zero, and
+        // the sweep correctly sees us parked for its duration.
+        const vx = (ax - x) * invH, vy = (ay - y) * invH;
+        const ts = t0 + s * h;
+        // `true` suppresses dodgeDpSweep's own already-inside bail-out; the
+        // leg-level decision was made above and lives in dodgeDpSkip.
         for (i = 0; i < n; i++) {
-          dodgeDpSweep(i, nx, ny, 0, 0, threats[i], t0 + tMove, tStuck, stuckOpens);
+          if (!dodgeDpSkip[i]) dodgeDpSweep(i, x, y, vx, vy, threats[i], ts, h, true);
         }
+        x = ax; y = ay;
       }
     }
 
@@ -5451,7 +6172,8 @@
         // would put back a cliff in the term the falloff exists to smooth. The
         // two differ by less than the time a round takes to cross a body — ~20ms
         // against a half-life of hundreds — so nothing measurable rides on it.
-        cost += threats[i].w * bill * DODGE_HIT_COST;
+        const th = threats[i];
+        cost += th.w * bill * DODGE_HIT_COST;
         // For the readout only, undiscounted, and a binary question: is this a
         // hit. `f > 0.5` sits at `dmin < R + 0.98 * clearance` — near enough one
         // clearance outside the body rather than on it, so the readout calls a
@@ -5460,7 +6182,10 @@
         // below it anywhere outside; nothing but the HUD reads this, and the
         // takeover test is dodgeCtxFirstHit, which is separate and exact.
         const f = dodgeDpFactor[i], tt = dodgeDpTouch[i];
-        if (f > 0.5 && tt < hit) hit = tt;
+        // Phantoms are excluded here for the same reason as in
+        // dodgeCtxFirstHit: `planHitIn` answers "when does a round that exists
+        // reach us", and a guess about someone's trigger finger is not that.
+        if (f > 0.5 && tt < hit && !th.phantom) hit = tt;
       }
     }
     dodgeDpOut.cost = cost; dodgeDpOut.hit = hit; dodgeDpOut.x = nx; dodgeDpOut.y = ny;
@@ -5470,6 +6195,14 @@
   function dodgeDpPlan(threats, speed, walls, horizon, userDirIdx) {
     const prefix = dodgeCtxPrefix;
     const best = dodgeBest;
+    // Dropped up here, ahead of every path out of this function: whether the
+    // search finds a course, declines to run, or loses the chain walking one
+    // back, nothing that survives is older than this call. An empty plan is not
+    // a failure state — it is dodgeStep being told to press the opening heading
+    // and come back next step.
+    dodgePath.n = 0;
+    dodgePlan.n = 0;
+    dodgeTrace.depth = 0;
     const window = horizon - prefix.t;
     const curDir = prefix.lastDir >= 0 ? prefix.lastDir : 0;
 
@@ -5481,6 +6214,10 @@
     let dt = dodgeClamp(DODGE.stepS, 0.03, 0.3, 0.1);
     const steps = Math.max(1, Math.round(window / dt));
     dt = window / steps;
+    // The leg length the plan will be indexed by while it is held. Stamped
+    // before the search rather than after it so the two can never disagree
+    // about how long a decision lasts.
+    dodgePlan.dt = dt;
     const cell = dodgeClamp(DODGE.cell, 0.05, 0.5, 0.35);
     dodgeDpSetClearance(dodgeClamp(DODGE.clearance, 0.05, 1.5, 0.35));
     dodgeDpSetHalfLife(dodgeClamp(DODGE.halfLife, 0.1, 5, 0.4));
@@ -5508,7 +6245,6 @@
     dodgeDpEpoch++;
 
     const ox = prefix.x, oy = prefix.y;
-    const want = speed * dt;
     const start = half * w + half;
     let curLen = 1, q, layer;
 
@@ -5517,6 +6253,8 @@
     dodgeDpCost[start] = 0;
     dodgeDpFirst[start] = -1;
     dodgeDpHit[start] = Infinity;
+    // No parent for the start: dodgeTraceWalk stops at layer 0 and writes the
+    // origin itself as the first point.
 
     for (layer = 0; layer < steps; layer++) {
       const t0 = layer * dt;
@@ -5531,8 +6269,9 @@
         const f0 = dodgeDpFirst[idx], h0 = dodgeDpHit[idx];
 
         for (let di = 0; di < DODGE_DIRS.length; di++) {
-          const travel = di === 0 ? 0 : dodgeDpTravelFor(idx, di, px, py, want, walls);
-          const e = dodgeDpEdge(px, py, t0, di, dt, speed, travel, threats, layer === 0);
+          const mv = dodgeDpMoveFor(idx, di, px, py, speed, dt, walls);
+          const e = dodgeDpEdge(px, py, t0, di, dt, speed, mv.x - px, mv.y - py,
+                                mv.bent, threats, walls, layer === 0);
           const c = base + e.cost + dodgeAlignPenalty[di] * alignS;
 
           const jx = half + Math.round((e.x - ox) / cell);
@@ -5546,6 +6285,8 @@
           dodgeDpCostB[j] = c;
           dodgeDpFirstB[j] = layer === 0 ? di : f0;
           dodgeDpHitB[j] = h0 < e.hit ? h0 : e.hit;
+          dodgeDpParentB[j] = idx;
+          dodgeDpDirB[j] = di;
         }
       }
 
@@ -5557,6 +6298,8 @@
       t = dodgeDpHit; dodgeDpHit = dodgeDpHitB; dodgeDpHitB = t;
       t = dodgeDpSeen; dodgeDpSeen = dodgeDpSeenB; dodgeDpSeenB = t;
       t = dodgeDpList; dodgeDpList = dodgeDpListB; dodgeDpListB = t;
+      t = dodgeDpParent; dodgeDpParent = dodgeDpParentB; dodgeDpParentB = t;
+      t = dodgeDpDir; dodgeDpDir = dodgeDpDirB; dodgeDpDirB = t;
       curLen = nextLen;
       if (!curLen) break;
 
@@ -5573,6 +6316,10 @@
         for (q = 0; q < DODGE_DP_BEAM; q++) dodgeDpList[q] = dodgeDpOrder[q];
         curLen = DODGE_DP_BEAM;
       }
+
+      // After the prune, so what is kept is exactly what the next layer can be
+      // reached from.
+      dodgeTraceCapture(layer, dodgeDpList, curLen, dodgeDpParent, dodgeDpDir);
     }
 
     let bi = -1;
@@ -5583,6 +6330,7 @@
     if (bi >= 0) {
       best.dir = dodgeDpFirst[bi] >= 0 ? dodgeDpFirst[bi] : curDir;
       best.firstHit = dodgeDpHit[bi];
+      dodgeTraceWalk(bi, ox, oy, half, w, cell);
     }
     return best;
   }
@@ -5629,6 +6377,14 @@
     dodgeState.dirIdx = 0;
     dodgeState.userHitIn = Infinity;
     dodgeState.planHitIn = Infinity;
+    dodgePath.n = 0;
+    // The course goes with the keys. Handing them back and keeping a plan
+    // around would let a stale one be picked up again by the next step that
+    // happened to match it — and every path into here is one where the plan is
+    // wrong: the toggle went off, we died, the round ended, or the step threw.
+    dodgePlan.n = 0;
+    dodgePlan.leg = -1;
+    dodgePlan.packet = -1;
   }
 
   // Our real speed, measured rather than assumed. GameConfig says 12, but
@@ -5711,6 +6467,121 @@
     dodgeState.speed = DODGE_SPEED_FALLBACK;
   }
 
+  // ---- Holding a plan, and knowing when to drop it ---------------------
+  //
+  // The search is deterministic in its inputs. Run it twice against the same
+  // world and it returns the same course, so a second run is worth exactly what
+  // the world has changed by since the first — and between two server updates
+  // the world has changed by nothing the plan did not already model. Rounds
+  // move on the client, but they move in straight lines at constant speed,
+  // which is precisely how the plan advanced them; re-reading their positions
+  // 16ms later just re-derives the state the plan is already holding.
+  //
+  // So the bot plans on new information and plays the answer out in between.
+  // What counts as new information is every input the search reads:
+  //
+  //   the packet counter   our position, everyone else's, their aim, their
+  //                        weapon, the layer, the walls, the measured speed —
+  //                        all of it arrives together, so one comparison covers
+  //                        the lot (netStats.updates, bumped by the camera
+  //                        interp setter, which fires once per update packet)
+  //   a round fired        dodgeBulletAdds, off the addBullet hook
+  //   a round gone         dodgeState.liveKey, the identity of the live set
+  //   the keys             the user's own heading, which is the whole of the
+  //                        alignment term and so of what they are asking for
+  //   the knobs            anything in the MOD tab the loss reads
+  //   the lead             but only past DODGE_LEAD_SLACK_CELLS — see below
+  //
+  // The user's heading is in that list rather than folded into the packet
+  // clock because it is the one input that is theirs and not the server's.
+  // Waiting a packet to notice it would put up to a full update of lag on the
+  // steering, which is the opposite of what "Follow input" is for.
+  //
+  // What this is not is a way to commit to a course. A plan is dropped the
+  // instant anything it was made against moves, which at 20Hz of updates is
+  // about every 50ms, and every leg after the first is still thrown away far
+  // more often than it is pressed. It is the same bot, deciding at the rate
+  // the information arrives instead of at the rate the monitor refreshes.
+  const DODGE_PLAN_KNOBS = ['horizon', 'clearance', 'leadK', 'halfLife',
+                            'follow', 'phantom', 'stepS', 'cell'];
+  const dodgePlanKnobs = new Float64Array(DODGE_PLAN_KNOBS.length);
+
+  // Tests and latches in one pass, so it must be called exactly once per step.
+  // A non-finite knob reads as 0 rather than as NaN, which would never compare
+  // equal to itself and would quietly put the planner back on every frame.
+  function dodgeKnobsChanged() {
+    let changed = false;
+    for (let i = 0; i < DODGE_PLAN_KNOBS.length; i++) {
+      const v = Number(DODGE[DODGE_PLAN_KNOBS[i]]);
+      const n = Number.isFinite(v) ? v : 0;
+      if (dodgePlanKnobs[i] !== n) { dodgePlanKnobs[i] = n; changed = true; }
+    }
+    return changed;
+  }
+
+  // Where a press made now lands in the plan's own time.
+  //
+  // Plan time is not wall time offset by a constant: its zero is the moment a
+  // press reaches the server, so it is anchored to the far end of the ping
+  // lead. A press made `d` seconds after the plan lands `d` seconds later in
+  // plan time only while the lead is what it was — and if the link has moved,
+  // the press arrives that much earlier or later relative to the world the plan
+  // described, which is exactly `prefixS - dodgePlan.lead`.
+  //
+  // The correction is right for the threats too, and for free. Plan time is one
+  // clock for the whole scored world: at plan time `t` the rounds are where the
+  // search put them at `t`, because that is how they were swept. So indexing
+  // the course at the true `t` reads the leg that was scored against the rounds
+  // as they will actually be — a slower link does not just delay our press, it
+  // delays it into a world the plan already has an opinion about.
+  //
+  // It only holds while the plan lasts. A lead that moves far enough to slide
+  // the plan's own start off the cell it was rounded to is a different start
+  // state, not a different index into this one, and dodgePlanMatches drops the
+  // plan instead.
+  function dodgePlanTime(now, prefixS) {
+    return (now - dodgePlan.at) / 1000 + (prefixS - dodgePlan.lead);
+  }
+
+  // Which leg to be pressing, or -1 if the plan has nothing left to say.
+  //
+  // A negative plan time means the link sped up and our press now lands before
+  // the plan's own zero. The opening leg is the answer: it is the heading the
+  // plan commits to at its start, and the alternative — pressing nothing —
+  // would spend the gap standing still, which the search never scored.
+  function dodgePlanLeg(now, prefixS) {
+    if (dodgePlan.n <= 0 || !(dodgePlan.dt > 0)) return -1;
+    const t = dodgePlanTime(now, prefixS);
+    const leg = t <= 0 ? 0 : Math.floor(t / dodgePlan.dt);
+    return leg < dodgePlan.n ? leg : -1;
+  }
+
+  // Is the standing plan still about the world in front of us?
+  function dodgePlanMatches(packet, threats, userDir, prefixS, speed) {
+    // No packet clock — the netcode hook never found the camera's interp field
+    // — and nothing here can tell a new update from an old one. Every step
+    // plans, which is what the bot did before it could hold a course at all.
+    if (packet < 0) return false;
+    if (dodgePlan.packet !== packet) return false;
+    if (dodgePlan.adds !== dodgeBulletAdds) return false;
+    if (dodgePlan.live !== dodgeState.liveKey) return false;
+    // Phantoms carry no identity of their own, so the count stands in for one.
+    // They are packet data — position, aim, weapon — so the counter above has
+    // already caught every way one can appear or go; this is belt and braces
+    // over the reach filter, which is the one thing about a phantom that can
+    // turn over without an update, since it is measured against our own
+    // position and our own position is packet data too.
+    if (dodgePlan.count !== threats.length) return false;
+    if (dodgePlan.userDir !== userDir) return false;
+    // The lead, as the distance it slides the plan's start rather than as a
+    // time: anything under a cell is what the search rounded away regardless,
+    // and dodgePlanTime absorbs it exactly. Past that the plan starts somewhere
+    // it wasn't scored from.
+    const cell = dodgeClamp(DODGE.cell, 0.05, 0.5, 0.35);
+    return Math.abs(prefixS - dodgePlan.lead) * speed <=
+      DODGE_LEAD_SLACK_CELLS * cell;
+  }
+
   function dodgeStep() {
     // Movement is read with isBindDown, but a rising edge in setInputHeld
     // also arms isBindPressed for a frame and nothing else would take it
@@ -5734,8 +6605,10 @@
       if (dodgeState.engaged) dodgeRelease();
       return;
     }
-    if (now - dodgeState.lastPlanAt < DODGE_PLAN_MS) return;
-    dodgeState.lastPlanAt = now;
+    if (now - dodgeState.lastStepAt < DODGE_PLAN_MS) return;
+    dodgeState.lastStepAt = now;
+    // Once per step, because it latches what it reads.
+    const knobsChanged = dodgeKnobsChanged();
 
     const layer = Number.isFinite(me.layer) ? me.layer : 0;
     const selfId = Number(me.__id ?? me.playerId ?? 0) || null;
@@ -5746,6 +6619,16 @@
     const leadS = Math.max(0, (Number.isFinite(ping) ? ping : 0) / 1000) *
       dodgeClamp(DODGE.leadK, 0, 2, 1);
     const horizon = dodgeClamp(DODGE.horizon, 0.2, 2, 0.8);
+    // Hoisted above the threat build because both are read by the freshness
+    // test as well as by the search: the lead is what plan time is anchored to,
+    // and the user's heading is an input to the loss in its own right. Their
+    // arguments are at the two sites that use them — the prefix carry below,
+    // and dodgePlanMatches.
+    const prefixS = Math.min(leadS, horizon * 0.5);
+    const userDir = dodgeUserDirIdx(binds);
+    // The server update this step is looking at, or -1 if the packet clock
+    // never came up. See dodgePlanMatches.
+    const packet = netStats.hookedCamera ? netStats.updates : -1;
 
     const speed = dodgeState.speed;
     const reach = speed * horizon;
@@ -5757,13 +6640,49 @@
     const selfR = dodgeState.selfR;
     const threats = dodgeBuildThreats(game, selfId, selfInfo, roster, layer, leadS, selfR,
       pos.x, pos.y, reach, horizon);
+    // Then the rounds nobody has fired: one per hostile whose aim already
+    // passes near us. Appended to the same list, and indistinguishable to
+    // everything downstream — see dodgeAddPhantoms.
+    dodgeAddPhantoms(threats, game, selfId, selfInfo, roster, layer, leadS, selfR,
+      pos.x, pos.y, reach, horizon);
     // The overwhelmingly common case, and the one that has to cost nothing:
-    // nothing in the air that could reach us, so the keys are the user's. This
-    // is not a takeover threshold — it is the planner having nothing to plan
-    // against, in which case its answer would be the user's own heading anyway.
-    // See the section header.
+    // nothing that could reach us — no round in the air and, with the firing
+    // lines term on, nobody's aim passing near us either — so the keys are the
+    // user's. This is not a takeover threshold; it is the planner having
+    // nothing to plan against, in which case its answer would be the user's own
+    // heading anyway. See the section header.
+    //
+    // Phantoms make this fire less often, and that is the cost of the term
+    // rather than a side effect of it: being aimed at is a thing the planner
+    // now has an opinion about, so it plans while it is true. What keeps that
+    // from meaning "always" is dodgeAddPhantoms' own reach filter — a gun
+    // pointed anywhere that cannot reach anywhere we could be inside the
+    // horizon contributes nothing at all.
     if (!threats.length) {
       if (dodgeState.engaged) dodgeRelease();
+      return;
+    }
+
+    // Nothing the last plan was made against has moved, and the plan still has
+    // a leg for the moment our press will land in. Press it. This is the common
+    // case by a wide margin — updates arrive at ~20Hz and steps run at up to
+    // 60Hz, so two steps in three answer here, and the search does not run.
+    //
+    // Everything above this line still runs on every step, and has to: the
+    // threat set is what says whether the keys are still ours to hold, and it
+    // is also half of the freshness test. What is skipped is the search, which
+    // is two orders of magnitude more of the frame than the rest of it.
+    const leg = dodgeState.engaged && !knobsChanged &&
+      dodgePlanMatches(packet, threats, userDir, prefixS, speed)
+      ? dodgePlanLeg(now, prefixS) : -1;
+    if (leg >= 0) {
+      dodgeState.dirIdx = dodgePlan.dirs[leg];
+      dodgeState.leadS = prefixS;
+      dodgePlan.leg = leg;
+      // The plan is current, not stale — it is being pressed. Without this the
+      // drawn line ages out between packets on a slow link.
+      dodgePath.at = now;
+      dodgeApply(binds, dodgeState.dirIdx);
       return;
     }
 
@@ -5783,9 +6702,7 @@
     // The current heading is ours while engaged and the user's otherwise, and
     // either way it seeds the context's lastDir, which is what dodgeDpPlan
     // falls back to when no state survives the search.
-    const prefixS = Math.min(leadS, horizon * 0.5);
     dodgeState.leadS = prefixS;
-    const userDir = dodgeUserDirIdx(binds);
     const curDir = dodgeState.engaged ? dodgeState.dirIdx : userDir;
     dodgeCtxReset(dodgeCtxPrefix, pos.x, pos.y, curDir, threats.length);
     dodgeCarry(dodgeCtxPrefix, curDir, prefixS, speed, walls);
@@ -5805,10 +6722,34 @@
     const plan = dodgeDpPlan(threats, speed, walls, horizon, userDir);
     dodgeState.planMs = performance.now() - planAt;
     dodgeState.engaged = true;
-    dodgeState.dirIdx = plan.dir;
+    // The opening heading, taken off the walked-back course where there is one
+    // so that what is pressed now and what is held next step cannot come from
+    // two different readings of the same search. They agree by construction —
+    // dodgeDpFirst is the layer-0 heading of the winner's own chain, and so is
+    // dirs[0] — and reading one of them twice is how it stays that way.
+    const open = dodgePlan.n > 0 ? dodgePlan.dirs[0] : plan.dir;
+    dodgeState.dirIdx = open;
     dodgeState.planHitIn = plan.firstHit;
     dodgeState.planCost = plan.cost;
-    dodgeApply(binds, plan.dir);
+    // What this plan is about, so the next step can ask whether any of it still
+    // is. `at` and `lead` are the two halves of its clock — see dodgePlanTime.
+    dodgePlan.at = now;
+    dodgePlan.lead = prefixS;
+    dodgePlan.leg = 0;
+    dodgePlan.packet = packet;
+    dodgePlan.adds = dodgeBulletAdds;
+    dodgePlan.live = dodgeState.liveKey;
+    dodgePlan.count = threats.length;
+    dodgePlan.userDir = userDir;
+    // Where the newest packet put us, as against dodgePath[0], which is where
+    // the lead prefix leaves us. Stamped here rather than in the search because
+    // the search is handed the prefix and never sees this. Not the position the
+    // sprite is drawn at either — that is the playout, further back again; see
+    // drawDodgePlan for the three of them.
+    dodgePath.startX = pos.x;
+    dodgePath.startY = pos.y;
+    dodgePath.at = now;
+    dodgeApply(binds, open);
   }
 
   function dodgeFrameTick() {
@@ -5836,18 +6777,42 @@
     // billed half a hit, by twice this a quarter, and so on.
     clearance: Number(dodgeClamp(DODGE.clearance, 0.05, 1.5, 0.35).toFixed(3)),
     pingMs: smoothedPingMs(),
+    // Everything the planner is solving against, and the split. `threats` is
+    // the total; `live` is rounds genuinely in the air and `phantoms` is
+    // hostiles whose aim currently passes close enough to be charged for — one
+    // per enemy, never more. See dodgeAddPhantoms.
     threats: dodgeState.threats.length,
-    // Worst round in the air, in HP, and how many of the current threats we
-    // could actually name. A `typed` well under `threats` means the addBullet
-    // hook went on mid-flight or survev has shipped a bullet BULLET_DAMAGE
-    // doesn't list — either way those rounds are priced at DODGE_DMG_REF.
-    worstDmg: Number(dodgeState.threats.reduce((m, t) => Math.max(m, t.dmg), 0).toFixed(1)),
-    typed: dodgeState.threats.filter((t) => !!BULLET_DAMAGE[t.type]).length,
+    live: dodgeState.threats.filter((t) => !t.phantom).length,
+    phantoms: dodgeState.threats.filter((t) => t.phantom).length,
+    // Worst round in the air, in HP, and how many of the *live* ones we could
+    // actually name. A `typed` well under `live` means the addBullet hook went
+    // on mid-flight or survev has shipped a bullet BULLET_DAMAGE doesn't list —
+    // either way those rounds are priced at DODGE_DMG_REF. Phantoms are always
+    // named (they are priced from the gun, or they do not exist) and so are
+    // counted in neither, or they would hide exactly that failure.
+    worstDmg: Number(dodgeState.threats.reduce(
+      (m, t) => (t.phantom ? m : Math.max(m, t.dmg)), 0).toFixed(1)),
+    typed: dodgeState.threats.filter((t) => !t.phantom && !!BULLET_DAMAGE[t.type]).length,
+    // What the worst line currently aimed at us would take off if it were
+    // fired, before DODGE.phantom's discount. 0 with nothing pointed our way.
+    worstAimed: Number(dodgeState.threats.reduce(
+      (m, t) => (t.phantom ? Math.max(m, t.dmg) : m), 0).toFixed(1)),
     walls: dodgeState.walls.length,
     leadMs: Math.round(dodgeState.leadS * 1000),
     userHitIn: dodgeState.userHitIn,
     planHitIn: dodgeState.planHitIn,
     planMs: Number(dodgeState.planMs.toFixed(2)),
+    // The course being held and where in it we are. `planLeg` climbing off 0
+    // is the plan being played out — it means the press about to land falls
+    // past the first decision, i.e. more than one step of plan time has gone by
+    // without the world producing anything new. `planAgeMs` is wall time since
+    // the search ran, and at a healthy 20Hz of updates it sits under 50.
+    planLeg: dodgePlan.leg,
+    planLegs: dodgePlan.n,
+    planAgeMs: dodgePlan.n > 0 ? Math.round(Date.now() - dodgePlan.at) : 0,
+    // Points in the drawn plan, one per layer plus the start. 0 whenever
+    // "Show plan" is off — nothing walks the search back otherwise.
+    pathPts: dodgePath.n,
     barnFound: !!findBulletBarn(capturedGame),
   });
 
@@ -6304,9 +7269,10 @@
   // Logs how far our own position moved between consecutive server updates.
   // Reads the pair snapshotPlayers just pushed, so the delta is netData pos
   // (the server's authoritative position), never the interpolated render pos.
-  // Toggle at runtime with `window.__SURVEV_LOG_DISP__ = false`. Remove this
-  // block and its call in the camera setter when done.
-  window.__SURVEV_LOG_DISP__ = true;
+  // Off by default; turn it on at runtime with
+  // `window.__SURVEV_LOG_DISP__ = true`. Remove this block and its call in the
+  // camera setter when done.
+  window.__SURVEV_LOG_DISP__ = false;
   // Standing still gives a delta of exactly 0 — position is quantized on the
   // wire, so a still player re-sends the identical value and the difference is
   // bit-for-bit zero. The threshold is here for the case that isn't: a delta
@@ -6339,6 +7305,39 @@
       `v=${Number.isFinite(speed) ? speed.toFixed(2) + 'u/s' : 'n/a'} ` +
       `pos=(${p2.x.toFixed(2)}, ${p2.y.toFixed(2)})`
     );
+  }
+  // ---- end TEMP DEBUG ------------------------------------------------------
+
+  // ---- TEMP DEBUG: per-packet server update interval -----------------------
+  // Collects the gap between consecutive server update packets and prints the
+  // batch every 3 seconds as one line — the dts alone, in arrival order. The
+  // gap is the game's own `(now - lastUpdateTime)` measurement, i.e. exactly
+  // what survev divides its lerp by. Off by default; turn it on at runtime
+  // with `window.__SURVEV_LOG_TICK__ = true`. Remove this block and its call
+  // in the camera setter when done.
+  window.__SURVEV_LOG_TICK__ = false;
+  const TICK_LOG_BATCH_MS = 3000;
+  const tickLog = { dts: [], since: 0 };
+  function debugLogUpdateInterval() {
+    if (!window.__SURVEV_LOG_TICK__) return;
+    const raw = netStats.rawMs;
+    if (!Number.isFinite(raw)) return;
+    const now = performance.now();
+    // First packet after a toggle or a fresh camera starts the window here
+    // rather than at 0, so the opening batch is a real 3s and not everything
+    // since page load.
+    if (!tickLog.since) tickLog.since = now;
+    tickLog.dts.push(raw);
+    if (now - tickLog.since < TICK_LOG_BATCH_MS) return;
+    console.log(`[${SOURCE}] ${tickLog.dts.map((d) => d.toFixed(1)).join(' ')}`);
+    tickLog.dts.length = 0;
+    // Advance from the deadline, not from `now`: the flush happens on a packet
+    // arrival, which is up to a tick late, and resetting to `now` would let
+    // that lateness accumulate and stretch the batches past 3s.
+    tickLog.since += TICK_LOG_BATCH_MS;
+    // Unless we were away long enough to miss whole windows (tab blur, round
+    // change), in which case skip forward instead of flushing empty batches.
+    if (now - tickLog.since >= TICK_LOG_BATCH_MS) tickLog.since = now;
   }
   // ---- end TEMP DEBUG ------------------------------------------------------
 
@@ -6448,6 +7447,9 @@
           recordUpdateInterval(v);
           try {
             clockOnPacket(performance.now());
+            // Before the snapshot work, so a throw in there still leaves the
+            // interval log running.
+            debugLogUpdateInterval();
             snapshotPlayers(game);
             // Strictly after both: it reads the pair snapshotPlayers has just
             // pushed, against the tick length clockOnPacket has just refit.
@@ -7428,9 +8430,10 @@
   };
 
   // ---------------------------------------------------------------------
-  // Collidable-only render: stop drawing everything that isn't part of the
-  // collision set — building roofs above all, plus bushes and the rubble a
-  // destroyed obstacle leaves behind.
+  // ESP render: stop anything that isn't part of the collision set from
+  // covering what is — building roofs come off entirely, and bushes, the
+  // rubble a destroyed obstacle leaves behind and smoke are faded down to
+  // where whatever they sit over stays readable through them.
   //
   // A house's inside is already being rendered. Its floor, its walls, the loot
   // and the players in it are all drawn on the same layer as the world
@@ -7447,23 +8450,26 @@
   // `visible` — so anything written there is gone within a frame. `renderable`
   // it never touches, and PIXI checks it before drawing the sprite.
   //
-  // Obstacles use the same flag for the rest of the rule. `collidable` is the
-  // game's own line between an object and scenery — a bush carries a collider
-  // and doesn't stop you — and a dead obstacle keeps its collider object but
-  // stops colliding, so both are art in front of nothing and both go. That
-  // matches the set `__bulletGeom` and the aim path already work from, which
-  // is what makes the view honest: what is left on screen is what a bullet
-  // and a body can actually hit.
+  // Obstacles are sorted by that same rule, but faded rather than switched
+  // off. `collidable` is the game's own line between an object and scenery — a
+  // bush carries a collider and doesn't stop you — and a dead obstacle keeps
+  // its collider object but stops colliding, so both are art in front of
+  // nothing. That line is the one `__bulletGeom` and the aim path already work
+  // from, which is what makes the view honest: what is left drawn solid is
+  // what a bullet and a body can actually hit.
   //
-  // A tree is on the other side of that line — it is collidable, it stops a
-  // bullet, and removing it would make the view lie about cover. But its
-  // leaves are drawn on top of whoever stands under them, which is exactly
-  // what this is here to stop, so canopy art is faded instead of removed. See
-  // CANOPY_ALPHA below for which art that is and how it is recognized.
+  // A tree is on the other side of it — it is collidable, it stops a bullet,
+  // and removing it would make the view lie about cover. But its leaves are
+  // drawn on top of whoever stands under them, which is exactly what this is
+  // here to stop, so canopy art is faded too, to the same ESP_ALPHA. Both
+  // sides of the line end up at one depth on purpose: the fade says "you can
+  // see through this", and the geometry underneath — solid or not — is what
+  // the ESP overlay and the aim path are for. See ESP_ALPHA below for which
+  // art counts as canopy and how it is recognized.
   //
   // Smoke is the same problem out of a different barn. A grenade cloud is not
   // an obstacle at all — it stops nothing and it is drawn over everything
-  // beneath it — so it is faded to that same CANOPY_ALPHA, and the two read at
+  // beneath it — so it is faded to that same ESP_ALPHA, and the two read at
   // one depth instead of a tree seen through smoke reading as two. Only the
   // mechanism differs: the barn assigns `sprite.alpha` on every frame it
   // draws, so the number is caught rather than written. See capArt below.
@@ -7595,10 +8601,13 @@
   // A tree is collidable, so it stays — but its leaves are drawn on top of
   // whoever is standing under them, which is the one thing this view exists to
   // stop. So canopy art is faded rather than removed: the tree still reads as
-  // a tree, and the player under it reads as a player. Smoke is faded to the
-  // same number, so everything this view leaves in front of a body is in front
-  // of it by the same amount.
-  const CANOPY_ALPHA = 0.35;
+  // a tree, and the player under it reads as a player. A bush, a dead
+  // obstacle's rubble and a smoke cloud are faded to the same number rather
+  // than each getting a depth of its own, so everything this view leaves in
+  // front of a body is in front of it by the same amount — what is solid
+  // reads solid, and everything you can walk or shoot through reads as one
+  // kind of thing.
+  const ESP_ALPHA = 0.3;
   // Which art counts as a canopy, by the game's own rule rather than by a list
   // of type names that would rot on the next content patch. `sprite.zOrd` is
   // the obstacle def's `img.zIdx`, and Obstacle.render treats >= 50 as "this
@@ -7656,7 +8665,7 @@
   // renders the particle — so there is no point in a frame where a value we
   // write is the one that gets drawn. The write is intercepted instead of
   // repeated: an own accessor keeps the game's number in `raw` and hands back
-  // the lower of it and CANOPY_ALPHA. The barn goes on assigning exactly as it
+  // the lower of it and ESP_ALPHA. The barn goes on assigning exactly as it
   // did, and a puff's own fade-out still plays, because those values are under
   // the cap and pass straight through — what is capped is how solid the cloud
   // gets, not how it dies.
@@ -7674,7 +8683,7 @@
         Object.defineProperty(sprite, 'alpha', {
           configurable: true,
           enumerable: true,
-          get() { return rec.raw < CANOPY_ALPHA ? rec.raw : CANOPY_ALPHA; },
+          get() { return rec.raw < ESP_ALPHA ? rec.raw : ESP_ALPHA; },
           set(v) { rec.raw = v; },
         });
       } catch { return; }
@@ -7692,7 +8701,7 @@
     } catch {}
   }
 
-  const collidableOnly = {
+  const espArt = {
     hidden: makeArtTracker(showArt),
     faded: makeArtTracker(unfadeArt),
     capped: makeArtTracker(uncapArt),
@@ -7706,7 +8715,7 @@
 
   function fadeArt(sprite, into) {
     if (!sprite) return;
-    try { sprite.alpha = CANOPY_ALPHA; } catch { return; }
+    try { sprite.alpha = ESP_ALPHA; } catch { return; }
     into.add(sprite);
   }
 
@@ -7714,17 +8723,17 @@
   // world we were reading disappears, so a round change can't strand an
   // invisible roof, or a faded canopy, on a sprite the next map recycles.
   function restoreHiddenArt() {
-    collidableOnly.hidden.releaseAll();
-    collidableOnly.faded.releaseAll();
-    collidableOnly.capped.releaseAll();
+    espArt.hidden.releaseAll();
+    espArt.faded.releaseAll();
+    espArt.capped.releaseAll();
   }
 
-  // One frame of the collidable-only view. Idle cost when off is the enabled
+  // One frame of the ESP view. Idle cost when off is the enabled
   // check plus, once, the restore.
-  function collidableOnlyTick() {
-    const st = collidableOnly;
+  function espTick() {
+    const st = espArt;
     const holding = st.hidden.live.size || st.faded.live.size || st.capped.live.size;
-    if (ESP.collidableOnly !== 1) {
+    if (ESP.esp !== 1) {
       if (holding) restoreHiddenArt();
       return;
     }
@@ -7753,11 +8762,15 @@
       const o = obstacles[i];
       if (!o || !o.active) continue;
       if (!o.collidable || o.dead) {
-        hideArt(o.sprite, hide);
+        // Faded, not removed: a bush is still cover from being seen even
+        // though it stops nothing, and rubble still says an obstacle was
+        // there. At ESP_ALPHA it reads as the same kind of pass-through art a
+        // canopy does, and anything drawn under it stays legible.
+        fadeArt(o.sprite, fade);
         // A door's frame is a second sprite the obstacle positions alongside
-        // its own, so a dead door that kept only the first would leave its
-        // casing floating with nothing to hold it up.
-        if (o.isDoor && o.door) hideArt(o.door.casingSprite, hide);
+        // its own, so a dead door that faded only the first would leave its
+        // casing standing solid around nothing.
+        if (o.isDoor && o.door) fadeArt(o.door.casingSprite, fade);
         continue;
       }
       // Collidable, so it stays on screen — but if the game draws it over the
@@ -7784,20 +8797,20 @@
   // `buildings: 0` in a live match means findBuildingPool hasn't identified the
   // pool — the roofs are still up and `mangled.js` may need re-deriving if it
   // stays that way once a match is running.
-  window.__collidableOnlyDiag = () => {
+  window.__espDiag = () => {
     const map = findMapOnGame(capturedGame);
     // Counted before `poolKey` is read: getBuildings is what resolves the key,
     // and with the toggle off nothing else ever has.
     const live = getBuildings().filter((b) => b && b.active).length;
     return {
-      enabled: ESP.collidableOnly === 1,
+      enabled: ESP.esp === 1,
       mapFound: !!map,
       mapLoaded: !!(map && map.mapLoaded),
       poolKey: cachedBuildingPoolKey,
       buildings: live,
-      hiddenSprites: collidableOnly.hidden.live.size,
-      fadedSprites: collidableOnly.faded.live.size,
-      cappedSprites: collidableOnly.capped.live.size,
+      hiddenSprites: espArt.hidden.live.size,
+      fadedSprites: espArt.faded.live.size,
+      cappedSprites: espArt.capped.live.size,
       smokeBarnKey: cachedSmokeBarnKey,
       smokeParticles: findSmokeParticles().length,
     };
@@ -8200,12 +9213,164 @@
     }
   }
 
+  // ---------------------------------------------------------------------
+  // The dodge plan, drawn.
+  //
+  // The line is the polyline dodgeTraceWalk recovered from the search — the
+  // legs behind the heading the bot is actually pressing, at the grid
+  // positions the loss was evaluated at. It is drawn from the same world ->
+  // screen projection as everything else on this canvas, and from the
+  // planner's own coordinates rather than from the screen centre, so where the
+  // plan starts and where the camera says we are are allowed to disagree.
+  //
+  // They do disagree, and there are three positions in it, not two:
+  //
+  //   playout   stateOnClock at renderNowMs(), held NETCODE.renderLag ticks
+  //             behind the clock so the lerp interpolates between snapshots it
+  //             has. This is the camera centre, i.e. your sprite.
+  //   packet    me[PLAYER_POS], the newest thing the server has said. Half a
+  //             tick to a tick ahead of the playout while moving — 0.3 to 0.6
+  //             units at full speed — and what dodgeStep plans from.
+  //   carried   packet + dodgeCarry(prefixS), the ping lead: where the heading
+  //             now held will have taken us by the time this frame's key press
+  //             reaches the server. dodgePath[0], where the search starts.
+  //
+  // Both gaps are drawn, and drawn differently, because they are owed to
+  // different things. The playout leg is the renderer being behind and is
+  // nothing the planner did; the lead leg is a correction the planner applies
+  // on purpose, and it goes to zero with the Ping lead knob. Merging them into
+  // one stub off the sprite — which is what this drew first — makes the
+  // renderer's lag look like part of the bot's lead, and at any normal ping
+  // the two are the same size.
+  //
+  // Nothing here can affect a plan. It reads a snapshot the frame already made
+  // and draws it.
+  // ---------------------------------------------------------------------
+  const DODGE_PATH_RGB = '255, 176, 0';
+
+  function dodgePlanVisible() {
+    return !!DODGE.path && dodgePath.n > 1 &&
+      (Date.now() - dodgePath.at) <= DODGE_PATH_STALE_MS;
+  }
+
+  function drawDodgePlan(ctx) {
+    const sample = pageSamples[pageSamples.length - 1];
+    const player = sample && sample.self;
+    if (!player) return;
+    // The camera's own centre, on the render clock — the same position the ESP
+    // rings are measured from, so the plan lands in the world rather than
+    // relative to a second idea of where we are.
+    const pi = stateOnClock(player.id, renderNowMs())
+      || interpPos('__self__', player.x, player.y);
+    const scale = getLivePxPerWorldUnit(sample);
+    if (!(scale > 0)) return;
+    const cx = window.innerWidth / 2;
+    const cy = window.innerHeight / 2;
+    const px = (wx) => cx + (wx - pi.x) * scale;
+    const py = (wy) => cy - (wy - pi.y) * scale;
+
+    const n = dodgePath.n;
+    const xs = dodgePath.x, ys = dodgePath.y;
+
+    ctx.lineJoin = 'round';
+
+    // Playout -> packet. Dotted and faint: this is the distance the renderer is
+    // behind the newest update, so it is a statement about the screen and not
+    // about the plan. Butt caps so the dots stay dots. The near end is the
+    // camera centre by construction — pi is what the projection is built on —
+    // but it is written through px/py anyway, because it is a world position
+    // that happens to land there and not a screen constant.
+    ctx.lineCap = 'butt';
+    ctx.setLineDash([1.5, 4]);
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = `rgba(${DODGE_PATH_RGB}, 0.3)`;
+    ctx.beginPath();
+    ctx.moveTo(px(pi.x), py(pi.y));
+    ctx.lineTo(px(dodgePath.startX), py(dodgePath.startY));
+    ctx.stroke();
+
+    ctx.lineCap = 'round';
+
+    // Packet -> carried, the ping lead. Dashed because it is not a decision —
+    // it is the distance the heading already held carries us while the press is
+    // in flight, and the search is handed its far end as a fait accompli. At
+    // Ping lead 0 this collapses and the plan starts on the packet.
+    ctx.setLineDash([4, 5]);
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = `rgba(${DODGE_PATH_RGB}, 0.45)`;
+    ctx.beginPath();
+    ctx.moveTo(px(dodgePath.startX), py(dodgePath.startY));
+    ctx.lineTo(px(xs[0]), py(ys[0]));
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // The handover, marked: everything nearer than this dot is latency, and
+    // everything past it is the search. Without it the two dash patterns are
+    // the only thing saying where one ends and the other begins, which is not
+    // much to go on at a glance in the middle of a fight.
+    ctx.fillStyle = `rgba(${DODGE_PATH_RGB}, 0.55)`;
+    ctx.beginPath();
+    ctx.arc(px(dodgePath.startX), py(dodgePath.startY), 2, 0, Math.PI * 2);
+    ctx.fill();
+
+    // A dark casing under the whole line first. The map runs from sand to dark
+    // water and a single stroke is legible over about half of it.
+    ctx.beginPath();
+    ctx.moveTo(px(xs[0]), py(ys[0]));
+    for (let i = 1; i < n; i++) ctx.lineTo(px(xs[i]), py(ys[i]));
+    ctx.lineWidth = 6;
+    ctx.strokeStyle = 'rgba(0, 0, 0, 0.35)';
+    ctx.stroke();
+
+    // Then the line, in two parts, split at the leg being pressed. The plan is
+    // held between packets rather than remade every frame — see dodgeStep — so
+    // it is worth being able to see it being spent: everything behind the split
+    // is a decision already sent, and everything ahead is what is left to hold
+    // if nothing new arrives. On a healthy link the split sits at the first or
+    // second dot and never travels far before the plan is replaced.
+    const done = Math.max(0, Math.min(dodgePlan.leg, n - 1));
+    if (done > 0) {
+      ctx.beginPath();
+      ctx.moveTo(px(xs[0]), py(ys[0]));
+      for (let i = 1; i <= done; i++) ctx.lineTo(px(xs[i]), py(ys[i]));
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = `rgba(${DODGE_PATH_RGB}, 0.35)`;
+      ctx.stroke();
+    }
+    ctx.beginPath();
+    ctx.moveTo(px(xs[done]), py(ys[done]));
+    for (let i = done + 1; i < n; i++) ctx.lineTo(px(xs[i]), py(ys[i]));
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = `rgba(${DODGE_PATH_RGB}, 0.9)`;
+    ctx.stroke();
+
+    // One dot per decision, so the step length is visible: the plan is a
+    // sequence of DODGE.stepS-long commitments, not a curve, and how far apart
+    // these sit is how coarse it is. Faded on the ones already spent, to the
+    // same value as the leg they open.
+    for (let i = 0; i < n - 1; i++) {
+      ctx.fillStyle = `rgba(${DODGE_PATH_RGB}, ${i < done ? 0.35 : 0.9})`;
+      ctx.beginPath();
+      ctx.arc(px(xs[i]), py(ys[i]), 2.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // The far end, at the horizon. Hollow, because it is where the plan stops
+    // being scored rather than anywhere it intends to arrive — the leg that
+    // gets pressed is the first one, and the rest exist to judge it.
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = `rgba(${DODGE_PATH_RGB}, 0.9)`;
+    ctx.beginPath();
+    ctx.arc(px(xs[n - 1]), py(ys[n - 1]), 5, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
   function overlayFrame() {
     // Ahead of the ESP gate below: both of these are their own toggle and have
     // to keep working (and keep the world's art switched off) with the ESP
     // overlay itself off.
     try { debugRenderTick(); } catch {}
-    try { collidableOnlyTick(); } catch {}
+    try { espTick(); } catch {}
 
     if (!ensureOverlayCanvas()) {
       requestAnimationFrame(overlayFrame);
@@ -8217,14 +9382,20 @@
     // ESP off: keep the loop (and the canvas) alive but draw nothing, so
     // flipping the toggle back on resumes on the very next frame. Sampling,
     // aim and netcode are untouched — this is a display switch only.
-    overlayCanvas.style.display = ESP.enabled ? 'block' : 'none';
-    if (!ESP.enabled) {
+    //
+    // The dodge plan is its own toggle on the same canvas, and one of the
+    // things it is for is watching the bot with nothing else drawn over the
+    // screen — so it holds the canvas open on its own, and neither switch can
+    // blank the other's drawing.
+    const showPlan = dodgePlanVisible();
+    overlayCanvas.style.display = (ESP.enabled || showPlan) ? 'block' : 'none';
+    if (!ESP.enabled && !showPlan) {
       requestAnimationFrame(overlayFrame);
       return;
     }
 
     const sample = pageSamples[pageSamples.length - 1];
-    if (sample && sample.self && sample.enemies && sample.enemies.length) {
+    if (ESP.enabled && sample && sample.self && sample.enemies && sample.enemies.length) {
       const player = sample.self;
       // Rendered player position, i.e. what the camera is centred on.
       const pi = stateOnClock(player.id, renderNowMs())
@@ -8383,6 +9554,11 @@
         ctx.arc(axs, ays, 2.5, 0, Math.PI * 2);
         ctx.fill();
       }
+    }
+
+    // Last, so it sits over the rings rather than under them.
+    if (showPlan) {
+      try { drawDodgePlan(ctx); } catch {}
     }
 
     requestAnimationFrame(overlayFrame);

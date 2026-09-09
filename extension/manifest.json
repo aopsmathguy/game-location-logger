@@ -24,8 +24,8 @@
         "*://*.survev.io/*"
       ],
       "js": [
-        "mangled.js",
-        "inject.js"
+        "core/mangled.js",
+        "core/inject.js"
       ],
       "run_at": "document_start",
       "all_frames": true,
