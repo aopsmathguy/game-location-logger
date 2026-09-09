@@ -150,6 +150,38 @@ that asks for it. So the solver's `maxDist` is capped to 18 on a touch device.
 Without the cap it would solve throws it cannot request and land every one of
 them short.
 
+# Auto-quickswap: one half of it needed moving
+
+Auto-quickswap splits neatly, and only one half needed anything.
+
+The half that **emits** the swap was already fine. `autoSwapEmitInput` arms
+`isBindPressed` for `EquipOtherGun` (or the melee-tap pair), and the loop that
+copies pressed equip inputs onto the message —
+
+```js
+for (const input of [Reload, ..., EquipMelee, ..., EquipLastWeap, EquipOtherGun, ...])
+  if (binds.isBindPressed(input)) msg.addInput(input);
+```
+
+— sits *outside* the `if (device.touch)` branch, reading the same method the
+synthetic-input layer wraps. So does the `SwapWeapSlots` line below it. Nothing
+about getting a swap onto the wire is device-specific.
+
+The half that **triggers** it was inert. The feature edge-detects on the user's
+own trigger, and it read that as `realBindDown(binds, Fire)` — but on a pad the
+user's trigger is not the Fire bind, it is the separate `|| touch.shotDetected`
+term. The bind never moves, so the edge never arrived and the whole feature did
+nothing on a phone while looking perfectly healthy in the MOD tab.
+
+Both readers of "did the user pull the trigger" — this edge and the aim
+activation above — now go through one `userFireDown`, which is the union of the
+two terms the input message itself takes the union of. Both halves of it are
+read past our synthetic layer, which is what keeps autoshoot's own presses from
+queueing a swap on every burst it fires.
+
+Autoshoot's *own* use of the swap was never affected: it queues off its presses
+and the magazine drop, not off this edge.
+
 # Dodge: one vector instead of four keys
 
 [The dodge bot](dodge-bot.md#dodge-bot) plans in eight headings and used to
@@ -189,7 +221,10 @@ the one function, so they cannot drift apart —
 
 # What doesn't change
 
-- Autoshoot, in full. It rides the bind layer, which the mobile branch reads.
+- Autoshoot, in full. It rides the bind layer, which the mobile branch reads —
+  including the shot-then-quickswap it drives itself.
+- Auto-quickswap's emission, for the same reason. Only its fire edge moved; see
+  above.
 - Every solver: the aim lead, bank shots, the blast simulation, the dodge
   planner, the frag sweep. They compute world-space answers and know nothing
   about how those answers reach the wire.

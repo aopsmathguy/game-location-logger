@@ -57,10 +57,12 @@ function grabConst(name) {
   return Number(m[1]);
 }
 
-// A single-line `const NAME = ...;`, taken whole.
+// A single-line `const NAME = ...;` or `let NAME = ...;`, taken whole. Pass the
+// keyword with the name for a `let`.
 function grabLine(name) {
-  const m = new RegExp(`\n  const ${name} = .*;\n`).exec(src);
-  if (!m) throw new Error(`could not find const ${name} in inject.js`);
+  const decl = name.startsWith('let ') ? name : `const ${name}`;
+  const m = new RegExp(`\n  ${decl} = .*;\n`).exec(src);
+  if (!m) throw new Error(`could not find ${decl} in inject.js`);
   return m[0];
 }
 
@@ -123,14 +125,25 @@ const elg = eval(`(function () {
   ${extract('touchReleaseAim')}
   ${extract('touchDriveMove')}
   ${extract('touchReleaseMove')}
-  ${extract('touchFireHeld')}
+  ${extract('userFireDown')}
   ${extract('userAim')}
   ${extract('userAimScore')}
   ${extract('dodgeUserDirIdx')}
+  const AUTO_SWAP = { enabled: 1 };
+  const ensureBindHook = () => {};
+  const requestAnimationFrame = () => 0;
+  let swapsQueued = 0;
+  const autoSwapOnFirePressed = () => { swapsQueued++; };
+  ${grabLine('let autoSwapFireWasDown').replace('let ', 'let ')}
+  ${extract('autoSwapFrameTick')}
   return {
+    autoSwapFrameTick,
+    swaps: () => swapsQueued,
+    resetSwaps: () => { swapsQueued = 0; autoSwapFireWasDown = false; },
+    setAutoSwapEnabled: (v) => { AUTO_SWAP.enabled = v; },
     touchState, DODGE_DIRS,
     ensureTouchHook, touchActive, touchDriveAim, touchReleaseAim,
-    touchDriveMove, touchReleaseMove, touchFireHeld,
+    touchDriveMove, touchReleaseMove, userFireDown,
     userAim, userAimScore, dodgeUserDirIdx,
     setGame: (g) => { capturedGame = g; },
   };
@@ -447,13 +460,13 @@ function angDiff(a, b) {
   scene.touch.touches = [finger(scene.touch.rightLockedPadCenter, 0.4, range - 3)];
   frame(scene);
   ok('trigger: a partial pull aims without firing',
-     scene.touch.shotDetected === false && elg.touchFireHeld() === false,
+     scene.touch.shotDetected === false && elg.userFireDown() === false,
      `pulled ${(range - 3).toFixed(1)}px of ${range.toFixed(1)}px`);
 
   scene.touch.touches = [finger(scene.touch.rightLockedPadCenter, 0.4, range + 3)];
   frame(scene);
   ok('trigger: a full pull is the activation',
-     scene.touch.shotDetected === true && elg.touchFireHeld() === true,
+     scene.touch.shotDetected === true && elg.userFireDown() === true,
      `pulled ${(range + 3).toFixed(1)}px of ${range.toFixed(1)}px`);
 
   // Autoshoot presses Fire through the bind hook. That must not read back as
@@ -463,18 +476,81 @@ function angDiff(a, b) {
   scene.binds.synthetic.add(AUTO_SWAP_INPUT_FIRE);
   const msg = frame(scene);
   ok('trigger: autoshoot\'s own press does not latch the activation',
-     elg.touchFireHeld() === false && msg.shootHold === true,
+     elg.userFireDown() === false && msg.shootHold === true,
      'synthetic Fire reached the wire without reading back as the user');
   scene.binds.synthetic.delete(AUTO_SWAP_INPUT_FIRE);
 
   // A real bind still counts — a paired controller or keyboard goes through it.
   scene.binds.userDown.add(AUTO_SWAP_INPUT_FIRE);
   frame(scene);
-  ok('trigger: a real Fire bind still activates', elg.touchFireHeld() === true,
+  ok('trigger: a real Fire bind still activates', elg.userFireDown() === true,
      'a paired controller counts as the trigger');
 }
 
-// ---- 6. Dodge movement drives all eight headings ------------------------
+// ---- 6. Auto-quickswap's fire edge --------------------------------------
+//
+// The swap itself already reaches the wire on a pad: the loop that copies
+// pressed equip inputs onto the message runs outside the touch branch, off the
+// same isBindPressed the synthetic layer wraps. The *edge* that starts it is
+// the half that had to be re-pointed — on a pad the user's trigger is not the
+// Fire bind, so reading the bind alone left the whole feature inert.
+
+{
+  const scene = newScene();
+  const range = scene.touch.padPosRange / scene.touch.shotPadDetectMult;
+  // One rendered frame with the thumb at `px` out on the aim pad, or off it.
+  const pull = (px) => {
+    scene.touch.touches = px == null ? []
+      : [finger(scene.touch.rightLockedPadCenter, 0.4, px)];
+    frame(scene);
+    elg.autoSwapFrameTick();
+  };
+
+  elg.resetSwaps();
+  pull(null);
+  pull(range + 5);
+  ok('auto-quickswap: a pad pull is a trigger pull', elg.swaps() === 1,
+     `${elg.swaps()} queued off one pull past the shot threshold`);
+
+  // Holding it out is one trigger pull, not one per frame — the same edge a
+  // held mouse button gives.
+  for (let i = 0; i < 10; i++) pull(range + 5);
+  ok('auto-quickswap: holding the pad out stays one trigger pull',
+     elg.swaps() === 1, `${elg.swaps()} after 10 more held frames`);
+
+  pull(range - 5);   // eased back below the threshold
+  pull(range + 5);   // and pulled again
+  ok('auto-quickswap: easing off and pulling again is a second',
+     elg.swaps() === 2, `${elg.swaps()} after the second pull`);
+
+  // Autoshoot's own presses must not read as the user reaching for the
+  // trigger, or every burst it fires queues a swap of its own on top of the
+  // one autoshoot already queues itself.
+  elg.resetSwaps();
+  pull(null);
+  scene.binds.synthetic.add(AUTO_SWAP_INPUT_FIRE);
+  for (let i = 0; i < 10; i++) pull(null);
+  ok('auto-quickswap: autoshoot\'s own presses are not a trigger pull',
+     elg.swaps() === 0, `${elg.swaps()} off 10 synthetic presses`);
+  scene.binds.synthetic.delete(AUTO_SWAP_INPUT_FIRE);
+
+  // The toggle gates the action but not the edge tracking, so switching it on
+  // mid-pull doesn't fire off a pull that started before the toggle flipped.
+  elg.resetSwaps();
+  elg.setAutoSwapEnabled(0);
+  pull(null);
+  pull(range + 5);
+  elg.setAutoSwapEnabled(1);
+  pull(range + 5);
+  ok('auto-quickswap: enabling mid-pull does not fire off the old pull',
+     elg.swaps() === 0, `${elg.swaps()} queued`);
+  pull(range - 5);
+  pull(range + 5);
+  ok('auto-quickswap: the next fresh pull does', elg.swaps() === 1,
+     `${elg.swaps()} queued`);
+}
+
+// ---- 7. Dodge movement drives all eight headings ------------------------
 
 {
   const scene = newScene();
@@ -510,7 +586,7 @@ function angDiff(a, b) {
      `walking ${(bearingOf(back) * 180 / Math.PI).toFixed(1)}° at ${vlen(back).toFixed(2)}u/s`);
 }
 
-// ---- 7. The bot reads the user's heading, not its own -------------------
+// ---- 8. The bot reads the user's heading, not its own -------------------
 
 {
   const scene = newScene();
@@ -544,7 +620,7 @@ function angDiff(a, b) {
   elg.touchReleaseMove();
 }
 
-// ---- 8. Target selection without a cursor -------------------------------
+// ---- 9. Target selection without a cursor -------------------------------
 
 {
   const scene = newScene();
@@ -579,7 +655,7 @@ function angDiff(a, b) {
      elg.userAimScore(aim, player, { x: 1, y: 1 }), '');
 }
 
-// ---- 9. A desktop is untouched -----------------------------------------
+// ---- 10. A desktop is untouched -----------------------------------------
 
 {
   const scene = newScene();

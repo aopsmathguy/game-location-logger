@@ -101,11 +101,12 @@ none of them touches input or gameplay state.
 - **Position log** — periodic snapshots of self + enemy positions are sent
   to the service worker; click the toolbar icon to export as JSON
   (see `docs/sample.json` for the schema).
-- **Mobile** — the aim helper, autoshoot, frag aim and the dodge bot all work
-  on a touch device, where survev builds its input message from two virtual
-  pads instead of from a mouse and four keys. There is no key to hold, so the
-  **shot is the switch**: pulling the right pad far enough to fire turns the
-  aim helper and autoshoot on together. The dodge bot writes the movement
+- **Mobile** — the aim helper, autoshoot, auto-quickswap, frag aim and the
+  dodge bot all work on a touch device, where survev builds its input message
+  from two virtual pads instead of from a mouse and four keys. There is no key
+  to hold, so the **shot is the switch**: pulling the right pad far enough to
+  fire turns the aim helper and autoshoot on together, and is also what
+  auto-quickswap takes as the trigger pull. The dodge bot writes the movement
   vector the left pad would have produced, and frag aim encodes its solved
   throw strength as a pad deflection. See
   [On a phone](docs/mobile.md#on-a-phone).

@@ -1975,14 +1975,21 @@
     touchState.moveDy = 0;
   }
 
-  // The user's own trigger on a touch device. There are no keybinds to hold, so
-  // the activation *is* the shot: pulling the right pad past survev's own
-  // `shotDetected` threshold turns the aim helper and autoshoot on together.
-  // The bind is still consulted because a paired controller or keyboard goes
-  // through it, and it is read past our synthetic layer so autoshoot's own
-  // presses can't latch the aim on forever.
-  function touchFireHeld() {
-    return touchState.shot || realBindDown(capturedGame?.[GAME_BINDS], AUTO_SWAP_INPUT_FIRE);
+  // The user's own trigger, whatever the device gives them to pull it with: a
+  // mouse button or a controller, through the bind layer; or a thumb far enough
+  // out on the aim pad that survev's own `shotDetected` goes up. The pad half
+  // is not on the bind layer at all — the input message reads it as a separate
+  // `|| touch.shotDetected` term — so anything that wants to know what the
+  // *user* is doing has to ask here rather than reading Fire alone.
+  //
+  // Both halves are read past our synthetic layer: `shotDetected` is computed
+  // by the original pad reader before anything of ours runs and is never
+  // written to, and the bind goes through realBindDown. That is what keeps the
+  // two things that watch this — the aim activation and auto-quickswap's fire
+  // edge — from feeding back on autoshoot's own presses.
+  function userFireDown(binds) {
+    if (touchActive() && touchState.shot) return true;
+    return realBindDown(binds || capturedGame?.[GAME_BINDS], AUTO_SWAP_INPUT_FIRE);
   }
 
   function touchFrameTick() {
@@ -3499,9 +3506,9 @@
   // being held. A touch device has no bind to hold, so the trigger itself is
   // the activation: pulling the right pad far enough to shoot turns the aim
   // helper and autoshoot on together, which is the only spare gesture a phone
-  // has. See touchFireHeld.
+  // has. See userFireDown.
   function aimEngaged() {
-    return touchActive() ? touchFireHeld() : aimHeld;
+    return touchActive() ? userFireDown() : aimHeld;
   }
 
   // The desktop loop is started by the keydown that begins the hold; a pad has
@@ -3509,7 +3516,7 @@
   // engagement because releaseAim has already dropped the glide seed.
   function aimTouchTick() {
     try {
-      if (AIMBOT.enabled && !aimRafId && touchActive() && touchFireHeld()) {
+      if (AIMBOT.enabled && !aimRafId && touchActive() && userFireDown()) {
         aimRafId = requestAnimationFrame(aimFrame);
       }
     } catch {}
@@ -4633,8 +4640,13 @@
         ensureBindHook(binds);
         // The user's trigger, not ours — autoshoot holds the same input, and
         // reading the wrapped method would make every burst it fires look
-        // like a fresh trigger pull.
-        const isDown = realBindDown(binds, AUTO_SWAP_INPUT_FIRE);
+        // like a fresh trigger pull. On a pad their trigger isn't the Fire bind
+        // at all, which is why this asks userFireDown rather than realBindDown:
+        // reading the bind alone left auto-quickswap inert on a phone, since
+        // the edge it waits for never arrived. The swap it emits needed no such
+        // change — the loop that copies pressed equip inputs onto the message
+        // runs outside the touch branch, off the same isBindPressed we wrap.
+        const isDown = userFireDown(binds);
         // Gate the action, not the edge tracking: keeping `wasDown` current
         // while disabled means re-enabling mid-hold doesn't fire a swap off a
         // trigger pull that started before the toggle flipped.
