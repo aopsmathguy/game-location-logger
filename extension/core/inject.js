@@ -4448,6 +4448,11 @@
   // it live. Static, like GUN_BULLET_SPEED — re-derive when survev ships
   // new guns or rebalances existing ones. Guns absent from the table never
   // auto-swap.
+  //
+  // It has a second reader: the same delay is how long the server's
+  // `shotSlowdownTimer` runs, so dodgeComputeSpeed halves our speed for
+  // exactly this long after each round, and treats presence here as the test
+  // for whether the held weapon is a gun at all.
   const GUN_FIRE_DELAY = {
     // SMGs / ARs / LMGs
     mp5: 0.09, mac10: 0.045, ump9: 0.35, vector: 0.038, vector45: 0.044,
@@ -5153,7 +5158,7 @@
   // player streams carry `pos` and `dir` and nothing about how fast we are
   // allowed to move, so a client either measures the result after the fact or
   // recomputes the cause. dodgeComputeSpeed recomputes it, and everything from
-  // here to WEAPON_FIRE_DELAY is the server's own constants, lifted verbatim.
+  // here to WEAPON_ATTACK_SPEED is the server's own constants, lifted verbatim.
   //
   // Same static-table caveat as GUN_BULLET_SPEED: these are read out of the
   // bundle and the server repo offline, so they must be re-derived when survev
@@ -5212,23 +5217,12 @@
     bar: -1.5, barrett: -4, dp28: -2, imbel: -1, m249: -4, p30l: 1,
     pkp: -5, potato_lmg: -6, qbb97: -2, scout_elite: 5, spas16: -1, usas: -1,
   };
-  // `fireDelay` for every gun: how long the halving above lasts. Guns only —
-  // the server sets the timer in `fireWeapon`, which is typed to gun defs, so
-  // melee swings and thrown grenades never slow you down this way.
-  const WEAPON_FIRE_DELAY = {
-    ak47: 0.1, an94: 0.24, ash12: 0.1, awc: 1.5, bar: 0.12, barrett: 0.925,
-    blr: 0.8, bugle: 1, colt45: 0.12, colt45_dual: 0.13, deagle: 0.16, deagle_dual: 0.12,
-    dp28: 0.115, famas: 0.35, flare_gun: 0.4, flare_gun_dual: 0.3, garand: 0.23, glock: 0.06,
-    glock_dual: 0.03, groza: 0.078, grozas: 0.078, hk416: 0.075, imbel: 0.092, l86: 0.19,
-    m1014: 0.4, m1100: 0.3, m1911: 0.13, m1911_dual: 0.085, m1a1: 0.095, m249: 0.08,
-    m39: 0.23, m4a1: 0.082, m870: 0.9, m9: 0.12, m93r: 0.28, m93r_dual: 0.18,
-    m9_cursed: 0.12, m9_dual: 0.08, mac10: 0.045, mk12: 0.18, mkg45: 0.17, model94: 0.7,
-    mosin: 1.75, mp220: 0.2, mp5: 0.09, ot38: 0.4, ot38_dual: 0.2, ots38: 0.36,
-    ots38_dual: 0.18, p30l: 0.14, p30l_dual: 0.09, pkp: 0.1, potato_cannon: 1.2, potato_lmg: 0.07,
-    potato_smg: 0.09, qbb97: 0.1, saiga: 0.4, scar: 0.09, scarssr: 0.3, scorpion: 0.055,
-    scout_elite: 1, spas12: 0.75, spas16: 0.35, sv98: 1.5, svd: 0.25, sw500: 0.65,
-    ump9: 0.35, usas: 0.5, vector: 0.038, vector45: 0.044, vss: 0.16,
-  };
+  // How long the halving lasts is the fired gun's `fireDelay`, and that table
+  // already exists further down as GUN_FIRE_DELAY — the auto-swap logic reads
+  // the same numbers to decide what counts as a slow gun. Membership in it is
+  // also what "is a gun" means here, which is the same test the server makes
+  // by typing `fireWeapon` to gun defs: melee swings and thrown grenades never
+  // start the timer.
 
   const DODGE_SPEED_MAX = 24;       // above it, a teleport or a bad frame
   // The floor on how often the planner runs at all. It is a rate limiter and
@@ -8968,8 +8962,8 @@
   // Called per bullet, so a shotgun's nine pellets all restart the same timer
   // at the same value, which is what the server does too.
   function dodgeNoteOwnShot(weapon) {
-    if (!Object.prototype.hasOwnProperty.call(WEAPON_FIRE_DELAY, weapon)) return;
-    dodgeState.shotUntil = performance.now() + WEAPON_FIRE_DELAY[weapon] * 1000;
+    if (!Object.prototype.hasOwnProperty.call(GUN_FIRE_DELAY, weapon)) return;
+    dodgeState.shotUntil = performance.now() + GUN_FIRE_DELAY[weapon] * 1000;
     dodgeState.shotWeapon = weapon;
   }
 
@@ -9004,7 +8998,7 @@
 
     const weapon = getCurrentWeapon(me);
     st.weapon = weapon;
-    const isGun = Object.prototype.hasOwnProperty.call(WEAPON_FIRE_DELAY, weapon);
+    const isGun = Object.prototype.hasOwnProperty.call(GUN_FIRE_DELAY, weapon);
     const anim = NET_ANIM ? Number(net?.[NET_ANIM]) : 0;
 
     // A switch cancels the timer on the server, so it cancels ours. Checked

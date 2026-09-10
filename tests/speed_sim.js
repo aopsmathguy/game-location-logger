@@ -87,7 +87,7 @@ const elg = eval(`(function () {
   const SPEED_SHOT_HALVING = ${grabConst('SPEED_SHOT_HALVING')};
   ${grabBlock('WEAPON_EQUIP_SPEED', '};')}
   ${grabBlock('WEAPON_ATTACK_SPEED', '};')}
-  ${grabBlock('WEAPON_FIRE_DELAY', '};')}
+  ${grabBlock('GUN_FIRE_DELAY', '};')}
   // Only the four fields the speed model touches. The real one carries the
   // planner's whole world.
   const dodgeState = { speed: 0, speedWhy: '', shotUntil: 0, shotWeapon: '' };
@@ -98,7 +98,7 @@ const elg = eval(`(function () {
   ${extract('dodgeNoteOwnShot')}
   ${extract('dodgeComputeSpeed')}
   return { dodgeComputeSpeed, dodgeNoteOwnShot, dodgeState,
-           SPEED_CFG, WEAPON_FIRE_DELAY, WEAPON_EQUIP_SPEED, WEAPON_ATTACK_SPEED };
+           SPEED_CFG, GUN_FIRE_DELAY, WEAPON_EQUIP_SPEED, WEAPON_ATTACK_SPEED };
 })()`);
 
 // ---- The server, transcribed --------------------------------------------
@@ -404,7 +404,7 @@ function near(a, b) { return Math.abs(a - b) < 1e-9; }
   for (const [name, def] of Object.entries(DEFS)) {
     const equip = elg.WEAPON_EQUIP_SPEED[name] ?? 0;
     const attack = elg.WEAPON_ATTACK_SPEED[name] ?? 0;
-    const delay = elg.WEAPON_FIRE_DELAY[name];
+    const delay = elg.GUN_FIRE_DELAY[name];
     if (!near(equip, def.equip)) bad = `${name} equip ${equip} vs ${def.equip}`;
     else if (!near(attack, def.attack ?? 0)) bad = `${name} attack ${attack} vs ${def.attack}`;
     else if (def.type === 'gun' && !near(delay, def.fireDelay)) bad = `${name} fireDelay ${delay} vs ${def.fireDelay}`;
