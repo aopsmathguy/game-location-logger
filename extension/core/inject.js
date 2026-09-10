@@ -30,7 +30,17 @@
   const NET_DEAD     = M.netData.dead;
   const NET_DOWNED   = M.netData.downed;
   const NET_SCALE    = M.netData?.scale;
+  // The remaining inputs to the server's movement-speed formula, all off the
+  // same wire copy — see dodgeComputeSpeed. Optional-chained like the other
+  // late additions so a mangled.js predating them degrades to the terms it can
+  // still read rather than throwing on load.
+  const NET_ACTION   = M.netData?.actionType;
+  const NET_FROZEN   = M.netData?.frozen;
+  const NET_HASTE    = M.netData?.hasteType;
+  const NET_PERKS    = M.netData?.perks;
+  const PLAYER_ACT   = M.player?.action;
   const LOC_ZOOM     = M.localData.zoom;
+  const LOC_BOOST    = M.localData?.boost;
   const LOC_CURIDX   = M.localData.curWeapIdx;
   const LOC_SLOTS    = M.localData.weapons;
   const GAME_LOCAL   = M.game.localPlayer;
@@ -288,8 +298,17 @@
   const PROJ_DRAG = 2.3;
   const PROJ_DRAG_WATER = 5;
   // survev's Anim enum, and the two values that bracket a throw.
+  const ANIM_MELEE = 1;
   const ANIM_COOK = 2;
   const ANIM_THROW = 3;
+  // survev's Action enum. The speed model needs the two that change how fast
+  // we move: UseItem (healing or popping adren) and Revive.
+  const ACTION_USEITEM = 3;
+  const ACTION_REVIVE = 4;
+  // HasteType.None. Anything else — Windwalk, Takedown, Inspire — is a haste,
+  // and they are all worth the same bonus, so only the comparison to None
+  // matters here.
+  const HASTE_NONE = 0;
 
   function looksLikePlayer(obj) {
     // The Player class (`er`) declares many of its sprite fields with real
@@ -5127,10 +5146,91 @@
     { x: -1, y: 0 }, { x: -DODGE_K, y: -DODGE_K }, { x: 0, y: -1 }, { x: DODGE_K, y: -DODGE_K },
   ];
 
-  const DODGE_SPEED_FALLBACK = 12;  // GameConfig.player.moveSpeed
-  const DODGE_SPEED_MIN = 3;        // below this we assume we weren't moving
+  // ---- Movement speed ---------------------------------------------------
+  //
+  // The server recomputes our speed from scratch every tick we hold a
+  // movement key, in `Player.recalculateSpeed`. It is never transmitted: the
+  // player streams carry `pos` and `dir` and nothing about how fast we are
+  // allowed to move, so a client either measures the result after the fact or
+  // recomputes the cause. dodgeComputeSpeed recomputes it, and everything from
+  // here to WEAPON_FIRE_DELAY is the server's own constants, lifted verbatim.
+  //
+  // Same static-table caveat as GUN_BULLET_SPEED: these are read out of the
+  // bundle and the server repo offline, so they must be re-derived when survev
+  // changes them. Nothing here is discoverable at runtime.
+  const SPEED_CFG = {
+    // GameConfig.player — the movement half of it.
+    moveSpeed: 12,
+    downedMoveSpeed: 4,
+    downedRezMoveSpeed: 2,
+    waterSpeedPenalty: 3,
+    cookSpeedPenalty: 3,
+    frozenSpeedPenalty: 3,
+    hasteSpeedBonus: 4.8,
+    boostMoveSpeed: 1.85,
+    // Not a config field: the server tests `boost >= 50` inline.
+    boostThreshold: 50,
+    // Also not a config field. The server gives a player performing a revive
+    // `downedMoveSpeed + 2` with a comment saying the 2 is an estimate that
+    // GameConfig never specified. Carried here as its own number so that if
+    // survev ever does specify it, this is the one line that changes.
+    reviverBonus: 2,
+    // PerkProperties. tree_climbing turns the water penalty into a bonus
+    // outright — the server writes it as `-= -waterSpeedBoost` — rather than
+    // cancelling it.
+    treeClimbingWaterBoost: 2,
+    fieldMedicSpeedBoost: 1,
+    // small_arms pins a gun's equip modifier to +1 instead of whatever the
+    // gun's own def says, which for the heavy guns is a swing of up to 4.
+    smallArmsEquip: 1,
+    // The final clamp. The ceiling is not reachable by any combination of the
+    // terms above; the floor is, and routinely — see dodgeComputeSpeed.
+    min: 1,
+    max: 10000,
+  };
+  // Shooting halves the result, so this fires on every gun in the game and is
+  // the largest single term in the model. It runs for `fireDelay` seconds from
+  // the shot, and `weapons.speed.attack` is applied over the same window.
+  const SPEED_SHOT_HALVING = 0.5;
+
+  // `weapons.speed.equip` for every def that does not have it at 0, which is
+  // every melee (a knife in hand is faster than a gun) plus the four guns
+  // heavy enough to be slower. Anything absent is 0.
+  const WEAPON_EQUIP_SPEED = {
+    ash12: -1, barrett: -1, bayonet: 1, bowie: 1, crowbar: 1,
+    cutlass: 1, fireaxe: 1, fists: 1, hook: 1, huntsman: 1,
+    iceaxe: 1, karambit: 1, katana: 1, knuckles: 1, machete: 1,
+    naginata: 1, p30l: 1, pan: 1, potato_cannon: -3, potato_lmg: -1.5,
+    saw: 1, spade: 1, stonehammer: 1, sw500: 0.5, woodaxe: 1,
+  };
+  // `weapons.speed.attack`, likewise. Applied only while the shot timer is
+  // running, and on top of the halving rather than instead of it — an M249
+  // firing is (12 - 4) / 2 = 4 u/s, a third of the figure GameConfig advertises
+  // and the state this bot most needs to plan honestly from. scout_elite is the
+  // one weapon in the game that speeds you up for having fired.
+  const WEAPON_ATTACK_SPEED = {
+    bar: -1.5, barrett: -4, dp28: -2, imbel: -1, m249: -4, p30l: 1,
+    pkp: -5, potato_lmg: -6, qbb97: -2, scout_elite: 5, spas16: -1, usas: -1,
+  };
+  // `fireDelay` for every gun: how long the halving above lasts. Guns only —
+  // the server sets the timer in `fireWeapon`, which is typed to gun defs, so
+  // melee swings and thrown grenades never slow you down this way.
+  const WEAPON_FIRE_DELAY = {
+    ak47: 0.1, an94: 0.24, ash12: 0.1, awc: 1.5, bar: 0.12, barrett: 0.925,
+    blr: 0.8, bugle: 1, colt45: 0.12, colt45_dual: 0.13, deagle: 0.16, deagle_dual: 0.12,
+    dp28: 0.115, famas: 0.35, flare_gun: 0.4, flare_gun_dual: 0.3, garand: 0.23, glock: 0.06,
+    glock_dual: 0.03, groza: 0.078, grozas: 0.078, hk416: 0.075, imbel: 0.092, l86: 0.19,
+    m1014: 0.4, m1100: 0.3, m1911: 0.13, m1911_dual: 0.085, m1a1: 0.095, m249: 0.08,
+    m39: 0.23, m4a1: 0.082, m870: 0.9, m9: 0.12, m93r: 0.28, m93r_dual: 0.18,
+    m9_cursed: 0.12, m9_dual: 0.08, mac10: 0.045, mk12: 0.18, mkg45: 0.17, model94: 0.7,
+    mosin: 1.75, mp220: 0.2, mp5: 0.09, ot38: 0.4, ot38_dual: 0.2, ots38: 0.36,
+    ots38_dual: 0.18, p30l: 0.14, p30l_dual: 0.09, pkp: 0.1, potato_cannon: 1.2, potato_lmg: 0.07,
+    potato_smg: 0.09, qbb97: 0.1, saiga: 0.4, scar: 0.09, scarssr: 0.3, scorpion: 0.055,
+    scout_elite: 1, spas12: 0.75, spas16: 0.35, sv98: 1.5, svd: 0.25, sw500: 0.65,
+    ump9: 0.35, usas: 0.5, vector: 0.038, vector45: 0.044, vss: 0.16,
+  };
+
   const DODGE_SPEED_MAX = 24;       // above it, a teleport or a bad frame
-  const DODGE_SPEED_WINDOW = 10;    // moving deltas the estimate is the max of
   // The floor on how often the planner runs at all. It is a rate limiter and
   // no longer a cadence: a plan is made when the world it was made against has
   // changed and not otherwise — see dodgeStep. Two rAF callbacks inside one
@@ -5252,15 +5352,30 @@
     // which is a change of set, and a plan written against it has to be dropped
     // rather than played out against a blast that has already happened.
     blastKey: 0,
-    speed: DODGE_SPEED_FALLBACK,
+    // What the server would let us move at if we asked it to, this instant —
+    // recomputed every step by dodgeComputeSpeed, never measured. See there.
+    speed: SPEED_CFG.moveSpeed,
+    // The terms that produced it, for __dodge(). Kept because the model is a
+    // port of somebody else's function against inputs we infer: when it is
+    // wrong, the only way to see which term did it is to read them.
+    speedWhy: '',
     selfR: PLAYER_RADIUS,
-    // The last DODGE_SPEED_WINDOW packet deltas that showed movement, as a
-    // ring, and the running total of them. `speed` is the max over the live
-    // entries; `speedSamples` says how many there are, and so whether `speed`
-    // is a measurement at all or still the seed.
-    speedRing: new Float64Array(DODGE_SPEED_WINDOW),
-    speedRingIdx: 0,
-    speedSamples: 0,
+    // performance.now() at which our reconstruction of the server's
+    // `shotSlowdownTimer` runs out. See dodgeNoteOwnShot.
+    shotUntil: 0,
+    // The weapon the shot timer was started for. A switch cancels the timer on
+    // the server, so it has to cancel ours.
+    shotWeapon: '',
+    // Who we are and what we are holding, latched once a frame off the local
+    // player the step already had to find. Both exist so the addBullet hook
+    // can tell one of our own rounds from the other twenty in the air without
+    // going looking for the local player: that hook runs per bullet, and
+    // findLocalPlayerOnGame walks every own property of the Game object.
+    // Neither can change between the latch and the packet in a way that
+    // matters — an id is fixed for the round, and a weapon that changed inside
+    // one frame of the shot lands on the switch cancel below either way.
+    selfId: null,
+    weapon: '',
     threats: [],
     walls: [],
     userHitIn: Infinity,
@@ -5278,7 +5393,7 @@
   // radius. See PLAYER_RADIUS for where the scaling comes from and why the
   // constant on its own is the wrong number to collide against.
   //
-  // This is the same argument dodgeTrackSpeed makes for movement — GameConfig
+  // This is the same argument dodgeComputeSpeed makes for movement — GameConfig
   // says 12 and the player wades at 9 — one field over in the same config
   // block. A planner solving a 1.0 circle while the server tests 1.2 is wrong
   // in exactly the direction that gets us shot, and silently: there is no error
@@ -5602,10 +5717,14 @@
   // Water more than doubles the ground drag (5 against 2.3), which more than
   // halves the slide, so a grenade that lands in a river stops about where it
   // lands. The client's own map answers this under a readable method name — it
-  // is what the projectile barn calls for the ripple effect — and it is
-  // sampled per packet rather than per simulated step, so a grenade sliding out
-  // of a river is a tick late noticing. Worth what it costs: at the speeds a
-  // landing grenade still carries, the two drags disagree by several units.
+  // is what the projectile barn calls for the ripple effect — and it is the
+  // whole answer, decals and building surfaces included, rather than the river
+  // polygons alone.
+  //
+  // Sampled once per packet, at the position the packet left the grenade at.
+  // That is the *seed*: the simulation crosses shorelines on its own, against
+  // the river geometry, and uses this to decide whether the geometry is telling
+  // it the truth about this patch of map — see dodgeSimBlast.
   function dodgeProjInWater(pos, layer) {
     try {
       const map = findMapOnGame(capturedGame);
@@ -5741,11 +5860,90 @@
   }
   const dodgeThrowerOut = { id: 0, sure: false, throwN: -1 };
 
+  // ---- Measuring a grenade in flight ------------------------------------
+  //
+  // The wire's own resolution, which is the entire error budget on anything
+  // differenced from two packets. Positions ride as `readMapPos()` — 16 bits
+  // over the map's 1024 units — and posZ as 10 bits over [0, 5].
+  const DODGE_PROJ_POS_Q = 1024 / 65535;
+  const DODGE_PROJ_Z_Q = 5 / 1023;
+  // How far a single-packet velocity may sit from the leg's running average
+  // before it is read as a bounce rather than as quantisation. The measurement
+  // is worth ±q/dt per axis, so four of those is past the worst case two
+  // readings can produce between them — while a wall turning a 20u/s grenade
+  // changes it by an order of magnitude more, and a graze too shallow to trip
+  // this is a graze too shallow to move the landing point.
+  const DODGE_PROJ_BOUNCE_K = 4;
+
+  // Measure this grenade's horizontal velocity off the packet that just
+  // arrived, and say whether it is still flying and whether it has stopped.
+  //
+  // Differencing the last two positions is the obvious estimator and the worst
+  // one available: it divides a whole quantum of wire resolution by a single
+  // tick, which at a 33ms update is about half a unit per second — a sixth of a
+  // unit on where a one-second flight lands, out of the quantisation alone.
+  //
+  // **An airborne grenade holds its horizontal speed exactly** — drag is applied
+  // only on the ground — so every packet since it last touched something is a
+  // measurement of the same constant, and a baseline drawn across the whole leg
+  // divides that error by the length of the leg instead of by one tick. A second
+  // of flight is thirty packets, and the number that decides where the ring sits
+  // is steadier by that much for it.
+  //
+  // The leg restarts whenever the newest single-packet reading disagrees with
+  // the average by more than quantisation can explain, which is what a bounce
+  // looks like from out here, and it is not used at all once the grenade is
+  // down, where drag means there is no constant left to average.
+  function dodgeProjVel(rec, phys, x, y, z, n, dt, tickMs) {
+    const ivx = (x - rec.x) / dt, ivy = (y - rec.y) / dt;
+    // On the ground once posZ has stopped moving on the way down. The apex is
+    // the only other place the height holds still, and it is nowhere near a velZ
+    // of -1, so the two tests together cannot mistake the top of the arc for the
+    // bottom of it.
+    const vz = (phys ? phys.velZ : 5) - PROJ_GRAVITY * rec.age;
+    rec.grounded = Math.abs(z - rec.z) <= DODGE_PROJ_Z_Q * 1.5 && vz < -1;
+    // Stopped, to the only precision the wire has: two packets that put it in
+    // the same cell. What that gives up is the last `q/dt/drag` of slide, two
+    // tenths of a unit, and it gives it up to the grenade's *own position* —
+    // which goes on following the wire if it turns out to still be creeping,
+    // where a simulated answer would not.
+    rec.atRest = rec.grounded &&
+                 Math.abs(x - rec.x) <= DODGE_PROJ_POS_Q &&
+                 Math.abs(y - rec.y) <= DODGE_PROJ_POS_Q;
+    rec.haveVel = true;
+    if (rec.grounded) { rec.legN = -1; rec.vx = ivx; rec.vy = ivy; return; }
+    // A bounce, or the first airborne packet: the baseline starts at the
+    // position this reading was measured *from*, so this packet's answer is the
+    // single-packet one and the leg grows out of it. The packet a bounce lands
+    // on is itself part pre-bounce and part post-, which the next one disagrees
+    // with in turn and re-anchors past — two ticks of contamination, then a
+    // clean leg.
+    if (rec.legN < 0 ||
+        Math.hypot(ivx - rec.vx, ivy - rec.vy) > DODGE_PROJ_BOUNCE_K * DODGE_PROJ_POS_Q / dt) {
+      rec.legN = rec.n; rec.legX = rec.x; rec.legY = rec.y;
+    }
+    const legDt = (n - rec.legN) * tickMs / 1000;
+    if (!(legDt > 0)) { rec.vx = ivx; rec.vy = ivy; return; }
+    rec.vx = (x - rec.legX) / legDt;
+    rec.vy = (y - rec.legY) / legDt;
+  }
+
   // Where and when this grenade detonates, from the state the packet just
   // delivered. Run once per packet per grenade rather than on demand: it is
   // wanted by the overlay every frame and by the planner every step, and both
   // want the same answer, so computing it here is the cheapest place it can
   // live and the only one where the two cannot disagree.
+  //
+  // Re-solved on every packet, against the state that packet delivered. The
+  // simulation is exact enough that re-running it in a world which has not moved
+  // returns the same point to 0.000u — `tests/blast_sim.js` re-solves each
+  // scenario from a quarter, a half and three quarters of the way through the
+  // fuse and checks precisely that — so what the re-solve buys is everything the
+  // first packet could not know: a crate on the bounce path that has since been
+  // destroyed, a river the grenade has since fallen into, a cook attributed
+  // late, and above all the velocity, whose first reading is the noisiest one it
+  // will ever have. Solving once meant living with that first reading for the
+  // whole life of the grenade.
   //
   // Deliberately unclamped and unled — this is what the grenade is going to do,
   // not what the planner can see of it. dodgeAddBlasts applies its own horizon
@@ -5755,16 +5953,21 @@
     // The clock is cheap and has to stay current: it is just what is left of
     // the fuse, and it ticks down whether anything is simulated or not.
     rec.boomT = Math.max(0, phys.fuse - rec.cooked - rec.age);
-    if (rec.boomSolved) return;
     // Nothing to solve from yet. Velocity takes two snapshots to measure and
     // the whole trajectory is a function of it, so until then the honest answer
     // is where the grenade is — one packet of a ring in the wrong place, rather
     // than a whole flight predicted from a velocity of zero.
-    if (!rec.haveVel) { rec.boomX = rec.x; rec.boomY = rec.y; return; }
+    //
+    // The same answer at the other end and for the opposite reason: a grenade
+    // that has come to rest goes off where it lies and there is nothing left to
+    // integrate. That is also what keeps the cost of re-solving where it
+    // belongs — a frag lands inside its first second and spends the other three
+    // still, so the simulation runs over the part of the fuse that is actually
+    // in doubt and over none of the part that is not.
+    if (!rec.haveVel || rec.atRest) { rec.boomX = rec.x; rec.boomY = rec.y; return; }
     dodgeSimBlast(rec, phys, rec.boomT, layer, dodgeSimOut);
     rec.boomX = dodgeSimOut.x;
     rec.boomY = dodgeSimOut.y;
-    rec.boomSolved = true;
   }
 
   function snapshotProjectiles(game) {
@@ -5845,7 +6048,16 @@
           // does not have to go back to the pool to find out.
           type: p.type,
           x: pos.x, y: pos.y, z,
+          // Horizontal velocity, and the baseline it is averaged over — see
+          // dodgeProjVel. `legN` is the packet the current straight leg starts
+          // at, or -1 for a grenade that is not on one.
           vx: 0, vy: 0, haveVel: false,
+          legN: -1, legX: pos.x, legY: pos.y,
+          // Whether the grenade is down, and whether it has stopped. Both are
+          // read off the wire rather than inferred from the simulation, and both
+          // gate work: the first picks the velocity estimator, the second says
+          // the blast point is simply where the grenade already is.
+          grounded: false, atRest: false,
           // Whether we know which branch of the arc it is on. A named thrower
           // settles it; anything else waits for a posZ that moves.
           resolved: dodgeThrowerOut.sure,
@@ -5854,17 +6066,13 @@
           // grenade alone — no ping lead, no planning horizon — so the overlay
           // and the planner read one answer and cannot disagree.
           //
-          // Solved exactly once, on the first packet that can measure a
-          // velocity, and then never again. Not an optimisation: re-running it
-          // every packet is *redundant*, because simulating from a later state
-          // over a correspondingly shorter fuse lands in the same place, and
-          // the only thing re-running can add is the jitter of re-deriving the
-          // velocity from a fresh pair of quantised positions. Frozen, the
-          // blast point is a fixed spot on the ground, which is what it is.
-          boomT: 0, boomX: pos.x, boomY: pos.y, boomSolved: false,
-          // Whether the blast can see where we stand. Cached per packet rather
-          // than frozen with the rest: the blast point holds still, but we do
-          // not.
+          // Re-solved from every packet that arrives, so the answer standing at
+          // any moment is the one the newest state of the world supports — see
+          // dodgeProjBoom.
+          boomT: 0, boomX: pos.x, boomY: pos.y,
+          // Whether the blast can see where we stand, cached against the packet
+          // it was answered on. Both ends of that ray move now, ours and the
+          // blast's, and a packet is still the rate either of them moves at.
           simN: -1, simClear: false,
         };
         dodgeProj.set(id, rec);
@@ -5874,12 +6082,9 @@
 
       const dn = n - rec.n;
       if (dn <= 0) continue;
-      const dt = dn * (netClock.slope || 50) / 1000;
-      if (dt > 0) {
-        rec.vx = (pos.x - rec.x) / dt;
-        rec.vy = (pos.y - rec.y) / dt;
-        rec.haveVel = true;
-      }
+      const tickMs = netClock.slope || 50;
+      const dt = dn * tickMs / 1000;
+      if (dt > 0) dodgeProjVel(rec, phys, pos.x, pos.y, z, n, dt, tickMs);
       // The ascending branch, settled by the only thing that can settle it: a
       // posZ that went up. Done once, on the first delta after the grenade was
       // picked up mid-flight.
@@ -5972,6 +6177,17 @@
         try {
           const b = slot || (Array.isArray(list) ? list[list.length - 1] : null);
           if (b) b.__dodgeType = bullet?.bulletType ?? null;
+          // A round of ours arriving is the server telling us we fired, which
+          // is the only notice we get that it has started our slowdown timer.
+          // `shotSourceType` is the firing gun and rides the same message
+          // whenever the shot carries an fx; when it doesn't, the weapon we
+          // are holding now is the one that fired, because the server read the
+          // delay off that same field one packet ago.
+          const selfId = dodgeState.selfId;
+          if (selfId != null && Number(bullet?.playerId) === selfId) {
+            const src = bullet?.shotSourceType;
+            dodgeNoteOwnShot(typeof src === 'string' && src ? src : dodgeState.weapon);
+          }
         } catch {}
         return ret;
       };
@@ -6367,6 +6583,7 @@
   const dodgeSimOut = { x: 0, y: 0 };
   const dodgeSimHit = { nx: 0, ny: 0, pen: 0 };
   const dodgeSimObs = [];
+  const dodgeSimRiverList = [];
 
   // Port of coldet.intersectAabbCircle / intersectCircleCircle, which is what
   // the server's projectile collision calls, kept to its arithmetic so a bounce
@@ -6452,6 +6669,67 @@
   //   keeps almost everything and a head-on hit keeps a sixth. Obstacles below
   //   the grenade raise the floor instead of turning it, which is how a grenade
   //   comes to rest on a table.
+  // ---- The water under it ------------------------------------------------
+  //
+  // Drag is 5 in water against 2.3 on land, and the server picks between them
+  // **inside its own loop**, from `isOnWater(this.pos)` at whatever position the
+  // grenade has on that tick. Holding one flag for the whole simulation gets the
+  // shoreline wrong in the direction that matters: a frag that lands on the bank
+  // and slides into a river is predicted to slide `v/2.3` when it is going to
+  // slide `v/5`, which at a 20u/s touchdown is 4.6u long — and long by the full
+  // amount for the whole flight and the whole land half of the slide, because
+  // nothing about the grenade's own position has crossed anything yet.
+  //
+  // What a sliding grenade can cross is a river or a lake, and that test is
+  // cheap enough to run per step: an AABB reject against each river, then
+  // survev's own ray-casting `pointInsidePolygon` against the ones that survive.
+  // The full `getGroundSurface` is not — it walks the decal pool and the
+  // building pool before it ever reaches the rivers, and this loop would ask it
+  // a hundred and fifty times per solve.
+  //
+  // Rivers are `layer !== 1` on the server, so an underground grenade gathers
+  // none and keeps its flag.
+  function dodgeSimRivers(x, y, reach, layer) {
+    const out = dodgeSimRiverList;
+    out.length = 0;
+    if (layer === 1) return out;
+    try {
+      const rivers = findMapOnGame(capturedGame)?.terrain?.rivers;
+      if (!rivers) return out;
+      for (let i = 0; i < rivers.length; i++) {
+        const rv = rivers[i];
+        const poly = rv && rv.waterPoly;
+        if (!poly || poly.length < 3) continue;
+        const bb = rv.aabb;
+        if (bb && bb.min && bb.max &&
+            (bb.max.x < x - reach || bb.min.x > x + reach ||
+             bb.max.y < y - reach || bb.min.y > y + reach)) continue;
+        out.push(rv);
+      }
+    } catch { out.length = 0; }
+    return out;
+  }
+
+  // survev's math.pointInsidePolygon, which is pnpoly, against each river's
+  // `waterPoly` — the same polygon and the same test the server reaches for
+  // once the decals and the buildings have declined to answer.
+  function dodgeSimInWater(rivers, x, y) {
+    for (let i = 0; i < rivers.length; i++) {
+      const rv = rivers[i];
+      const bb = rv.aabb;
+      if (bb && bb.min && bb.max &&
+          (x < bb.min.x || x > bb.max.x || y < bb.min.y || y > bb.max.y)) continue;
+      const poly = rv.waterPoly;
+      let inside = false;
+      for (let a = 0, b = poly.length - 1; a < poly.length; b = a++) {
+        const xi = poly[a].x, yi = poly[a].y, xj = poly[b].x, yj = poly[b].y;
+        if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+      }
+      if (inside) return true;
+    }
+    return false;
+  }
+
   // `pre` is an obstacle list the caller has already filtered, for a caller that
   // is going to run this many times over the same patch of world. Without it
   // every call rebuilds the list by walking the entire obstacle pool — which is
@@ -6479,7 +6757,28 @@
     const step = dt || DODGE_SIM_DT;
     const steps = Math.min(Math.ceil(dur / step), DODGE_SIM_MAX_STEPS);
     const h = steps > 0 ? dur / steps : 0;
-    const drag = rec.water ? PROJ_DRAG_WATER : PROJ_DRAG;
+
+    // The rivers this grenade could reach, and whether they are allowed to
+    // answer for it.
+    //
+    // `rec.water` is the authoritative reading — the client's own
+    // getGroundSurface, decals and building surfaces included — but only at the
+    // one point the packet left the grenade at. The river polygons are the whole
+    // shoreline, and cheap, but they are only *part* of what decides the
+    // surface. So the two are checked against each other at the one place both
+    // can speak: if the rivers agree with getGroundSurface about the position we
+    // are starting from, they are describing this patch of map correctly and are
+    // trusted for the rest of the slide.
+    //
+    // When they disagree, something the polygons cannot see is deciding — a
+    // bridge deck over a river reads dry, a building's own water surface reads
+    // wet — and the flag stands for the whole simulation, exactly as before.
+    // That is the conservative half of the trade: the case we cannot track is
+    // left no worse than it was.
+    const rivers = dodgeSimRivers(x, y, reach, layer);
+    const perStepWater = rivers.length > 0 &&
+                         dodgeSimInWater(rivers, x, y) === !!rec.water;
+    let wet = !!rec.water;
 
     // The floor under the grenade, carried across steps exactly as the server
     // carries `obstacleBellowHeight`: it is what posZ is clamped to, and it is
@@ -6499,7 +6798,14 @@
     }
 
     for (let s = 0; s < steps; s++) {
-      if (z <= floor) { vx /= 1 + h * drag; vy /= 1 + h * drag; }
+      // Asked only on the steps the answer is used on. The server's own
+      // isOnWater call sits inside the same test, so an airborne grenade costs
+      // nothing here however far it flies over a river.
+      if (z <= floor) {
+        if (perStepWater) wet = dodgeSimInWater(rivers, x, y);
+        const drag = wet ? PROJ_DRAG_WATER : PROJ_DRAG;
+        vx /= 1 + h * drag; vy /= 1 + h * drag;
+      }
       x += vx * h; y += vy * h;
       vz -= PROJ_GRAVITY * h;
       z = Math.min(Math.max(z + vz * h, floor), 5);
@@ -6998,9 +7304,9 @@
       // so it should not be guessed as well.
       //
       // Which also means the second simulation this used to run is gone. The
-      // blast point is solved once for the whole life of the grenade — see
-      // dodgeProjBoom — and only the line of sight is still per packet, because
-      // our own position moves and the blast's does not.
+      // blast point is solved in one place, on the packet path — see
+      // dodgeProjBoom — and only read here, so the planner and the overlay
+      // cannot come to two different answers about the same grenade.
       const bx = rec.boomX, by = rec.boomY;
       if (tBoom > horizon) tBoom = horizon - 1e-4;
       const pkt = netStats.updates;
@@ -8577,84 +8883,220 @@
     dodgePlan.packet = -1;
   }
 
-  // Our real speed, measured rather than assumed. GameConfig says 12, but
-  // water, being downed and a heavy weapon all scale it, and a planner that
-  // believes in 12 while the player wades at 9 plans escapes it cannot make.
+  // Our real speed, computed the way the server computes it.
   //
-  // Driven by the packet clock, not by requestAnimationFrame. Position is a
-  // step function: it changes once per server update and holds. Polling it on
-  // a render frame samples that step at a rate with no relation to the rate it
-  // steps at, so the delta and the interval it is divided by come from
-  // different packets' worth of time — at 60Hz that read 20 u/s for a player
-  // moving 12, and at 144Hz it never cleared the frame-time floor at all and
-  // the estimate stayed on its seed forever. One packet's movement over one
-  // packet's duration is the speed, with nothing left to alias.
+  // This is a port of `Player.recalculateSpeed` from the survev server, term
+  // for term and in the server's order — the order matters, because the last
+  // thing it does before clamping is halve everything accumulated so far.
+  // GameConfig says 12; the value that actually moves the player is 12 only
+  // when nothing at all is happening to them, and a planner that believes in
+  // 12 while the player wades at 9, or fires an M249 at 4, plans escapes it
+  // cannot make.
   //
-  // The interval is pseudotime — the fitted tick length, `netClock.slope` —
-  // and not the wall-clock gap between the two arrivals. Jitter is exactly
-  // what the fit exists to remove, and a max estimator has no defence against
-  // it: an early packet is a short gap is an inflated sample, and the max then
-  // holds that sample for the whole window. Against the fitted clock an early
-  // arrival is not a fast player, which is the truth of it.
+  // It used to be measured instead: the max of the last ten packet-to-packet
+  // displacements. That reads the truth eventually, and the max was there
+  // because individual deltas only ever under-report — a tick spent grinding
+  // along a wall covers less ground than the surface allows. But "eventually"
+  // is the problem. A max over ten ticks holds the *pre-slowdown* speed for
+  // the whole window, about half a second, and every term below arrives
+  // exactly when the bot is needed: you step into water, you start shooting,
+  // somebody downs you. The estimator was slowest precisely where being wrong
+  // costs a hit, and it was wrong high, which is the direction that invents
+  // escapes. Recomputing has no such lag — every input is a field we already
+  // read off the wire, and the answer is right on the first frame it changes.
   //
-  // The deltas come from the snapshot ring snapshotPlayers already fills for
-  // every player, so this inherits its guards for free — a pooled Player
-  // recycled onto a new entity, or a ring straddling a gap, has already had
-  // its history cleared and cannot be read here as one tick of movement.
+  // Two deliberate divergences from the server:
   //
-  // Only packets where we were plainly moving teach it anything; a standing
-  // player would otherwise drag the estimate to zero.
+  //   - The server sets `speed = 0` outright on any tick with no movement
+  //     input, and only calls recalculateSpeed on the ticks that have one.
+  //     We always compute the moving value. The planner is asking what we
+  //     could do if we moved, and standing still is a plan, not a speed.
+  //   - `meleeAttacks.length == 0`, which gates the equip bonus, is a
+  //     server-side queue of scheduled swings that the wire does not carry.
+  //     Anim.Melee is what the server plays for the same window, so that is
+  //     what stands in for it. It is worth at most the 1 u/s a knife gives,
+  //     for the fraction of a second a swing lasts.
   //
-  // The estimate is the MAX of the last DODGE_SPEED_WINDOW moving deltas, not
-  // their average. Individual deltas only ever under-report: a tick spent
-  // grinding along a wall, or one where a key went down partway through,
-  // covers less ground than the surface actually allows, and on this clock
-  // nothing makes one cover more. Averaging folds that floor-noise into the
-  // number; the max reads through it. The cost is that a genuine slowdown —
-  // stepping into water — takes a full window to show, about half a second.
-  function dodgeTrackSpeed(game) {
-    const st = dodgeState;
-    // Before the fit is up there is no tick length to divide by, and a slope
-    // outside the plausible update range means it is fitting noise.
-    if (!netClock.ready) return;
-    const tickMs = netClock.slope;
-    if (!(tickMs >= NET_MIN_UPDATE_MS && tickMs <= NET_MAX_UPDATE_MS)) return;
+  // Everything else is exact, subject to the tables above still matching the
+  // build and to the one reconstructed input, the shot timer — see
+  // dodgeNoteOwnShot for what that costs.
 
-    const me = findLocalPlayerOnGame(game);
-    const snaps = me ? netSmoothState.get(me)?.snaps : null;
-    if (!snaps || snaps.length < 2) return;
-    const p2 = snaps[snaps.length - 1];
-    const p1 = snaps[snaps.length - 2];
-    const dn = p2.n - p1.n;
-    if (dn < 1) return;
-    // pseudotimeOf(p2.n) - pseudotimeOf(p1.n), with the centroid terms both
-    // sides share cancelled off: the fitted tick length times the ticks
-    // between them. `dn` is normally 1 — it is larger only where the ring kept
-    // a pair across ticks that produced no snapshot, and the span is still
-    // right for those.
-    const dt = (tickMs * dn) / 1000;
-    const v = Math.hypot(p2.x - p1.x, p2.y - p1.y) / dt;
-    if (v < DODGE_SPEED_MIN || v > DODGE_SPEED_MAX) return;
-    st.speedRing[st.speedRingIdx] = v;
-    st.speedRingIdx = (st.speedRingIdx + 1) % DODGE_SPEED_WINDOW;
-    st.speedSamples++;
-    // Rescanned rather than tracked incrementally: the window is 10 wide, and
-    // a running max still has to rescan whenever the entry holding it is the
-    // one being overwritten.
-    const n = Math.min(st.speedSamples, DODGE_SPEED_WINDOW);
-    let max = 0;
-    for (let i = 0; i < n; i++) if (st.speedRing[i] > max) max = st.speedRing[i];
-    st.speed = max;
+  // survev keeps `perks` readable on the wire as `[{ type, ... }]`, so the
+  // element's type is a plain string compare. netData is the verbatim copy and
+  // nothing local writes to it; `player.perks` is the render-side mirror and
+  // carries isNew bookkeeping we don't want.
+  function dodgeHasPerk(me, type) {
+    if (!NET_PERKS) return false;
+    const perks = me?.[PLAYER_NET]?.[NET_PERKS];
+    if (!Array.isArray(perks)) return false;
+    for (let i = 0; i < perks.length; i++) {
+      if (perks[i] && perks[i].type === type) return true;
+    }
+    return false;
   }
 
-  // A new round renumbers the packets and swaps the camera, so every sample in
-  // the ring was taken against a clock that no longer exists — and against a
-  // surface and a loadout that no longer do either. Back to the seed.
+  // `surface` is one of the fields survev leaves readable on the Player, and
+  // the client fills it every frame from the same decals-then-buildings-then-
+  // terrain walk the server's `map.isOnWater` does. The one difference is the
+  // position each is asked about: the server tests where it has us, this tests
+  // where the client is drawing us. Those separate by at most the render lag,
+  // and a river bank is not a line you can straddle for long enough to matter.
+  function dodgeIsOnWater(me) {
+    return me?.surface?.type === 'water';
+  }
+
+  function speedTerm(table, weapon) {
+    return weapon && Object.prototype.hasOwnProperty.call(table, weapon)
+      ? table[weapon] : 0;
+  }
+
+  // The one input to the model that is not on the wire.
+  //
+  // The server starts `shotSlowdownTimer` at the fired gun's `fireDelay` and
+  // counts it down; while it runs, the gun's attack modifier applies and the
+  // whole result is halved. The client is never told about it, so we run our
+  // own copy — started when a round of ours turns up in the bullet barn, which
+  // is the server telling us we fired, one packet late.
+  //
+  // Late by half the round trip, therefore: our window opens after the
+  // server's did and closes after it closed. On a 50ms link the error is 25ms
+  // at each end against a window that is 80ms for an AK and 900ms for an M870.
+  // The tail is the harmless end — we keep planning at the slower speed for a
+  // moment after the server has let go of it — and the head is bounded by the
+  // same lead the rest of the planner already applies to everything else.
+  //
+  // Called per bullet, so a shotgun's nine pellets all restart the same timer
+  // at the same value, which is what the server does too.
+  function dodgeNoteOwnShot(weapon) {
+    if (!Object.prototype.hasOwnProperty.call(WEAPON_FIRE_DELAY, weapon)) return;
+    dodgeState.shotUntil = performance.now() + WEAPON_FIRE_DELAY[weapon] * 1000;
+    dodgeState.shotWeapon = weapon;
+  }
+
+  function dodgeComputeSpeed(me) {
+    const st = dodgeState;
+    const net = me?.[PLAYER_NET];
+    const why = [];
+
+    const downed = !!(net?.[NET_DOWNED]);
+    const action = NET_ACTION ? Number(net?.[NET_ACTION]) : 0;
+
+    // The base, from the four mutually exclusive states the server checks in
+    // this order. Reviving splits on whether we are the one holding the
+    // syringe: a target means we are, unless we are down and self-reviving,
+    // in which case we are also the patient.
+    let speed;
+    if (action === ACTION_REVIVE) {
+      const targetId = PLAYER_ACT ? Number(me?.[PLAYER_ACT]?.targetId) : 0;
+      if (targetId && !(downed && dodgeHasPerk(me, 'self_revive'))) {
+        speed = SPEED_CFG.downedMoveSpeed + SPEED_CFG.reviverBonus;
+        why.push('reviving');
+      } else {
+        speed = SPEED_CFG.downedRezMoveSpeed;
+        why.push('being revived');
+      }
+    } else if (downed) {
+      speed = SPEED_CFG.downedMoveSpeed;
+      why.push('downed');
+    } else {
+      speed = SPEED_CFG.moveSpeed;
+    }
+
+    const weapon = getCurrentWeapon(me);
+    st.weapon = weapon;
+    const isGun = Object.prototype.hasOwnProperty.call(WEAPON_FIRE_DELAY, weapon);
+    const anim = NET_ANIM ? Number(net?.[NET_ANIM]) : 0;
+
+    // A switch cancels the timer on the server, so it cancels ours. Checked
+    // before the timer is read, not after, so the frame we switch on is
+    // already clean. Gated on having actually read a weapon: getCurrentWeapon
+    // returns '' when neither the wire copy nor the slot array can be read,
+    // and treating that as a switch would clear the timer early — which is an
+    // error in the direction that reads fast, the one that invents escapes.
+    const now = performance.now();
+    if (weapon && st.shotWeapon && st.shotWeapon !== weapon) {
+      st.shotUntil = 0;
+      st.shotWeapon = '';
+    }
+    const shooting = st.shotUntil > now;
+
+    if (anim !== ANIM_MELEE) {
+      const equip = (isGun && dodgeHasPerk(me, 'small_arms'))
+        ? SPEED_CFG.smallArmsEquip
+        : speedTerm(WEAPON_EQUIP_SPEED, weapon);
+      if (equip) why.push(`${weapon} ${equip > 0 ? '+' : ''}${equip}`);
+      speed += equip;
+    }
+
+    // The server guards this on the def declaring an `attack` at all; the defs
+    // that omit it are exactly the ones that would add zero, so the lookup's
+    // own default covers both cases.
+    if (shooting) {
+      const attack = speedTerm(WEAPON_ATTACK_SPEED, weapon);
+      if (attack) why.push(`firing ${attack > 0 ? '+' : ''}${attack}`);
+      speed += attack;
+    }
+
+    if (dodgeIsOnWater(me)) {
+      if (dodgeHasPerk(me, 'tree_climbing')) {
+        speed += SPEED_CFG.treeClimbingWaterBoost;
+        why.push('water +2 (tree climbing)');
+      } else {
+        speed -= SPEED_CFG.waterSpeedPenalty;
+        why.push('water');
+      }
+    }
+
+    const boost = LOC_BOOST ? Number(me?.[PLAYER_LOC]?.[LOC_BOOST]) : NaN;
+    if (boost >= SPEED_CFG.boostThreshold) {
+      speed += SPEED_CFG.boostMoveSpeed;
+      why.push('adren');
+    }
+
+    if (anim === ANIM_COOK) {
+      speed -= SPEED_CFG.cookSpeedPenalty;
+      why.push('cooking');
+    }
+
+    const haste = NET_HASTE ? Number(net?.[NET_HASTE]) : HASTE_NONE;
+    if (Number.isFinite(haste) && haste !== HASTE_NONE) {
+      speed += SPEED_CFG.hasteSpeedBonus;
+      why.push('haste');
+    }
+
+    if (NET_FROZEN && net?.[NET_FROZEN]) {
+      speed -= SPEED_CFG.frozenSpeedPenalty;
+      why.push('frozen');
+    }
+
+    // The halving, and the one perk that buys its way out of half of it.
+    // Applies to the total, which is why it is worth more than every additive
+    // term in the model put together.
+    const fieldMedic = dodgeHasPerk(me, 'field_medic');
+    const usingItem = action === ACTION_USEITEM;
+    if (shooting || (!fieldMedic && usingItem)) {
+      speed *= SPEED_SHOT_HALVING;
+      why.push(shooting ? 'shooting (halved)' : 'using item (halved)');
+    }
+    if (fieldMedic && usingItem) {
+      speed += SPEED_CFG.fieldMedicSpeedBoost;
+      why.push('field medic');
+    }
+
+    st.speed = Math.min(SPEED_CFG.max, Math.max(SPEED_CFG.min, speed));
+    st.speedWhy = why.join(', ');
+    return st.speed;
+  }
+
+  // A new round is a new loadout on a new surface, and the shot timer is the
+  // only thing carried between frames here. Back to the config figure.
   function dodgeResetSpeed() {
-    dodgeState.speedRing.fill(0);
-    dodgeState.speedRingIdx = 0;
-    dodgeState.speedSamples = 0;
-    dodgeState.speed = DODGE_SPEED_FALLBACK;
+    dodgeState.speed = SPEED_CFG.moveSpeed;
+    dodgeState.speedWhy = '';
+    dodgeState.shotUntil = 0;
+    dodgeState.shotWeapon = '';
+    dodgeState.selfId = null;
+    dodgeState.weapon = '';
   }
 
   // ---- Holding a plan, and knowing when to drop it ---------------------
@@ -8786,11 +9228,23 @@
     const alive = !!pos && !me[PLAYER_NET]?.[NET_DEAD];
     const now = Date.now();
 
-    // Sampled whether or not the bot is on: this is what the debug HUD reads,
-    // and a radius sampled only while dodging would be a stale number from the
-    // last firefight every time anyone looked at it. Speed is not measured
-    // here at all any more — it rides the packet clock, in dodgeTrackSpeed.
-    if (alive) dodgeState.selfR = dodgeSelfRadius(me);
+    // Both sampled whether or not the bot is on: this is what the debug HUD
+    // reads, and figures sampled only while dodging would be stale numbers
+    // from the last firefight every time anyone looked at them.
+    //
+    // Speed is recomputed here rather than on the packet clock because it is a
+    // function of state and not of elapsed time — every input to it is a field
+    // already sitting on the player, and reading them costs a handful of
+    // property loads. There is nothing to gain by waiting for a packet and one
+    // thing to lose: the two terms we infer locally rather than read (the shot
+    // timer, and the melee-swing gate on the equip bonus) change between
+    // packets, and a value refreshed only on arrival would quantise them to
+    // the tick.
+    if (alive) {
+      dodgeState.selfR = dodgeSelfRadius(me);
+      dodgeState.selfId = Number(me.__id ?? me.playerId ?? 0) || null;
+      dodgeComputeSpeed(me);
+    }
 
     if (!DODGE.enabled || !binds || !alive) {
       if (dodgeState.engaged) dodgeRelease();
@@ -9124,7 +9578,14 @@
     enabled: !!DODGE.enabled,
     engaged: dodgeState.engaged,
     heading: ['stand', 'E', 'NE', 'N', 'NW', 'W', 'SW', 'S', 'SE'][dodgeState.dirIdx],
+    // What the server would move us at right now, recomputed from its own
+    // formula rather than measured — see dodgeComputeSpeed. `speedWhy` lists
+    // the terms that are not the plain GameConfig 12, and is empty when none
+    // are; `shotIn` is what is left of our copy of the server's shot timer,
+    // the only input to the model we infer rather than read off the wire.
     speed: Number(dodgeState.speed.toFixed(2)),
+    speedWhy: dodgeState.speedWhy,
+    shotIn: Number(Math.max(0, (dodgeState.shotUntil - performance.now()) / 1000).toFixed(3)),
     // Our hitbox as the game tests it. 1 means either scale is 1 or the field
     // could not be read; `scaled` says which.
     radius: Number(dodgeState.selfR.toFixed(3)),
@@ -9230,8 +9691,8 @@
   // of, which is the whole reason they are worth a panel. GameConfig says the
   // player moves at 12 and collides at radius 1; neither is what happens.
   // Speed is whatever the current surface, weapon and stance leave of it, so
-  // it is measured off our own per-packet position deltas, on the recovered
-  // tick clock (dodgeTrackSpeed). Radius is
+  // it is recomputed from those every frame the way the server recomputes it
+  // (dodgeComputeSpeed), and the panel shows the terms it used. Radius is
   // `scale * cfg.player.radius` off the wire, so it is 1 only until someone
   // is scaled (dodgeSelfRadius). If either drifts from what the eye says,
   // every distance the planner solves is wrong by the same factor and there
@@ -9287,13 +9748,15 @@
     const el = ensureDebugHudEl();
     if (el) {
       const live = !!findLocalPlayerOnGame(capturedGame);
-      // Until a packet delta has actually landed in the ring, `speed` is still
-      // the GameConfig figure it was seeded with, and saying so is the point
-      // of the panel.
-      const measured = live && dodgeState.speedSamples > 0;
-      debugHud.speed.textContent = measured
-        ? `${dodgeState.speed.toFixed(2)} u/s`
-        : `${DODGE_SPEED_FALLBACK.toFixed(2)} u/s (default)`;
+      // The terms alongside the number, because the number alone cannot be
+      // checked against anything: 9 u/s is correct in water and wrong on
+      // grass, and the panel exists to catch exactly that kind of wrong. An
+      // empty `speedWhy` means nothing is modifying us and the figure should
+      // read the GameConfig 12.
+      const why = live ? dodgeState.speedWhy : '';
+      debugHud.speed.textContent = !live
+        ? '—'
+        : `${dodgeState.speed.toFixed(2)} u/s${why ? ` (${why})` : ''}`;
       debugHud.radius.textContent = !live
         ? '—'
         : NET_SCALE
@@ -9863,9 +10326,6 @@
             // slope it has just refit.
             trackCookAnims(game);
             snapshotProjectiles(game);
-            // Strictly after both: it reads the pair snapshotPlayers has just
-            // pushed, against the tick length clockOnPacket has just refit.
-            dodgeTrackSpeed(game);
             debugLogSelfDisplacement(game);
           } catch {}
         },

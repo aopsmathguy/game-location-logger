@@ -24,6 +24,7 @@ window.__SURVEV_MANGLED__ = {
     dir:          'Npmmxm',
     posAlt:       'lnPgk',
     dirAlt:       'Mpt',
+    action:       'guS',
   },
 
   // ---- Player.netData (the sub-object named by player.netData above) ----
@@ -34,11 +35,16 @@ window.__SURVEV_MANGLED__ = {
     scale:        'MQCs',
     animType:     'gPDsSd',
     animSeq:      'qCu',
+    actionType:   'BeLl',
+    frozen:       'qKe',
+    hasteType:    'kSPlXj',
+    perks:        'geXAhO',
   },
 
   // ---- Player.localData (the sub-object named by player.localData above) ----
   localData: {
     zoom:       'XgYNX',
+    boost:      'dmXqBk',
     curWeapIdx: 'sEntIp',
     weapons:    'tcS',
   },

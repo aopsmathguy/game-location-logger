@@ -396,11 +396,61 @@ wall-ward heading as blocked the moment we touched a wall, and the bot would
 stand against it and eat the shot instead of sliding along it, which is the
 one thing it most needs to do while cornered.
 
-Speed is measured rather than assumed. `GameConfig` says 12, but water, being
-downed and a heavy weapon all scale it, and a planner that believes in 12
-while the player wades at 9 plans escapes it cannot make. Only frames where
-we were plainly moving update the estimate; a standing player would otherwise
-drag it to zero.
+Speed is computed the same way the server computes it. `GameConfig` says 12,
+but that is the figure for a player nothing is happening to, and a planner that
+believes in 12 while the player wades at 9 — or fires an M249 at 4 — plans
+escapes it cannot make. `dodgeComputeSpeed` is a port of the server's
+`Player.recalculateSpeed`, term for term and in its order:
+
+| | |
+| --- | --- |
+| base | 12, or 4 downed, or 2 being revived, or 6 performing one |
+| weapon | `speed.equip` while not mid-swing; `speed.attack` while the shot timer runs |
+| water | −3, or **+2** with `tree_climbing` — the perk replaces the penalty, it does not cancel it |
+| adrenaline | +1.85 at 50 or above |
+| cooking | −3 |
+| haste | +4.8 |
+| frozen | −3 |
+| **halved** | while shooting, or using an item without `field_medic` |
+| field medic | +1, after the halving it exempts you from |
+| clamp | to `[1, 10000]`, and the floor is reachable |
+
+The halving is the whole reason this is worth doing. It applies to the total,
+so it is worth more than every additive term put together, and it is running
+for `fireDelay` seconds after every single round — which is to say, during
+exactly the fight the bot exists for.
+
+Every input is a field already on the player: `downed`, `animType`,
+`actionType`, `frozen`, `hasteType` and `perks` off the wire, `boost` off the
+local stream, and `surface` off the client's own ground lookup, which walks the
+same decals-then-buildings-then-terrain order the server's `isOnWater` does.
+
+There are two divergences, both deliberate. The server zeroes the speed on any
+tick with no movement input; we always compute the moving value, because the
+planner is asking what we could do if we moved and standing still is a plan
+rather than a speed. And the equip bonus is gated on the server's queue of
+scheduled melee swings, which is not on the wire — `Anim.Melee` stands in for
+it, worth at most the 1 u/s a knife gives for the length of a swing.
+
+One input is reconstructed rather than read: the shot timer. The server starts
+`shotSlowdownTimer` at the fired gun's `fireDelay` and never transmits it, so
+we start our own when a round of ours turns up in the bullet barn — the server
+telling us we fired, one packet late. The window therefore opens and closes
+about half a round trip after the server's. A weapon switch cancels it, as it
+does there.
+
+This used to be measured instead — the max of the last ten packet-to-packet
+displacements, the max because individual deltas only ever under-report, a tick
+spent grinding along a wall covering less ground than the surface allows. It
+read the truth eventually. But a max over ten ticks holds the *pre-slowdown*
+figure for the whole window, about half a second, and every term above arrives
+exactly when the bot is needed: you step into water, you start shooting,
+somebody downs you. It was slowest where being wrong costs a hit, and wrong
+high, which is the direction that invents escapes.
+
+`tests/speed_sim.js` drives the shipped model against a second transcription of
+the server's function, written from the source rather than from the port, over
+every combination of the states that feed it.
 
 # Taking the keys, and giving them back
 
@@ -543,8 +593,8 @@ and the river it falls in without any of them being a case anyone has to write,
 and it costs a few hundred multiplies for a threat that appears a handful of
 times a match.
 
-Three things about that loop are easy to write plausibly and get backwards, and
-all three change the answer by units:
+Four things about that loop are easy to write plausibly and get backwards, and
+all four change the answer by units:
 
 - **Drag applies only while it is resting.** `posZ <= obstacleBellowHeight` is
   the server's test. An airborne grenade holds its horizontal speed *exactly*,
@@ -556,6 +606,9 @@ all three change the answer by units:
 - **A bounce keeps `max(1 + d·n, 0.15)` of its speed**, so a graze keeps almost
   everything and a head-on hit keeps a sixth. Obstacles *below* it raise the
   floor instead of turning it, which is how a grenade comes to rest on a crate.
+- **The surface is chosen inside the loop, not before it.** Drag is 5 in water
+  against 2.3 on land, and `isOnWater(this.pos)` is called on every tick, from
+  wherever the grenade is on that tick — see [Shorelines](#shorelines).
 
 `tests/blast_sim.js` drives the shipped simulator against an independent
 transcription of `server/src/game/objects/projectile.ts` over open ground, a
@@ -565,33 +618,153 @@ two independently derivable numbers — the air time and the `v/drag` slide —
 which agree with the loop to 0.083u, the whole of which is Euler at 100Hz
 against the exact parabola.
 
-## Solved once
+## Shorelines
 
-The detonation point is solved on the first packet that can measure a velocity —
-the second one, since velocity takes two snapshots — and then **frozen for the
-life of the grenade**.
+Water more than doubles the ground drag — 5 against 2.3 — which more than halves
+the `v/drag` slide, and the server picks between the two **inside its own loop**:
+`isOnWater(this.pos)` on every tick, at the position the grenade has on that
+tick, under the same `posZ <= obstacleBellowHeight` test that gates the drag at
+all.
 
-That is not an optimisation, though it is one. Re-running the simulation every
-packet is *redundant*: simulating from a later state over a correspondingly
+Sampling that once, from where the last packet left the grenade, gets every
+shoreline wrong for exactly as long as the grenade has not reached it yet. The
+case that matters is a frag that lands on the bank and **slides into** a river:
+nothing about its position has crossed anything while it is in the air or on the
+dry half of the slide, so a per-packet flag reads "land" throughout and predicts
+a `v/2.3` slide where the server is going to give `v/5`.
+
+| river edge past the touchdown | true stop | one flag held | error |
+| --- | --- | --- | --- |
+| 0u | 24.91u | 29.49u | **4.58u** |
+| 4u | 27.12u | 29.49u | 2.37u |
+| 8u | 28.70u | 29.49u | 0.79u |
+
+Worst when the shoreline sits right where the grenade lands, because then the
+whole slide is on the wrong side of it. On the throw that motivated this the ring
+sat 2.4u long from the throw until `t=1.35s` of a 4s fuse and then jumped — a
+third of the fuse spent describing a slide that was not going to happen, which
+for someone standing at the plateau edge is up to 100HP of mispricing. Re-solving
+every packet does not help here and cannot: the flag has nothing new to say until
+the grenade is already in the water.
+
+**So the simulation crosses shorelines itself.** What a sliding grenade can cross
+is a river or a lake, and that test is cheap enough to run per step — an AABB
+reject against each river, then survev's own ray-casting `pointInsidePolygon`
+against the `waterPoly` of the ones that survive. The full `getGroundSurface` is
+not: it walks the decal pool and the building pool before it ever reaches the
+rivers, and this loop would ask it a hundred and fifty times per solve. Measured
+against a 3000-obstacle pool with six 40-point river polygons and the point test
+running on every ground step, it costs **0.028ms** per re-solve.
+
+### When the polygons are not the whole answer
+
+`isOnWater` consults decals and building surfaces *before* the rivers, and both
+can overrule them — a bridge deck across a river reads dry, and a building's own
+water surface reads wet with no river anywhere. The polygons cannot see either.
+
+So they are only trusted when they agree with the authoritative reading at the
+one point that has one: `rec.water`, the client's own `getGroundSurface` at the
+position the packet left the grenade at. Agreement means the geometry is
+describing this patch of map correctly and is trusted for the rest of the slide.
+Disagreement means something the polygons cannot see is deciding, and the flag
+stands for the whole simulation — exactly as it used to. That is the conservative
+half of the trade: the case that cannot be tracked is left no worse than it was.
+
+`tests/blast_sim.js` checks six crossings against a transcription that tests the
+water where the server tests it — land→water, water→land, wholly wet, wholly dry,
+a throw that flies over a river and lands beyond it, and one that stops short of
+the bank — at **0.000u** worst. Both overrule cases are checked to come out
+exactly as the seed flag alone would give. And the reported throw is walked
+packet by packet: worst ring error **0.18u**, against **2.81u** for the same
+throw with one flag held, and against **0.45u** for the identical throw with no
+river in it at all. Crossing a shoreline now costs less than the wire's own
+quantisation noise.
+
+## Re-solved every packet
+
+The detonation point is solved from scratch on **every update packet**, against
+the state that packet delivered.
+
+It used to be solved once — on the second packet, the first that can measure a
+velocity — and then frozen for the life of the grenade, on the argument that
+re-running is redundant: simulating from a later state over a correspondingly
 shorter fuse lands in the same place, because the later state is on the
-trajectory the earlier run computed. All re-running can add is the jitter of
-re-deriving velocity from a fresh pair of quantised positions, which makes the
-blast point wander when it is a fixed spot on the ground. The same test file
-checks the invariant directly, re-solving each scenario from a quarter, a half
-and three quarters of the way through its fuse: **0.000u** of drift in every
-one, bounces and tables included.
+trajectory the earlier run computed. That argument is sound, and the test file
+checks it directly, re-solving each scenario from a quarter, a half and three
+quarters of the way through its fuse: **0.000u** of drift in every one, bounces
+and tables included.
 
-Getting that clean took a real fix. The simulation used to start with its floor
-at zero and build up from there, which is right for a grenade in the air and
-wrong for one already resting on a table — it would believe itself airborne,
-skip the drag it should have been under, fall to the ground and be put back.
-Handing it a state mid-slide diverged by 11u. The floor is now derived from the
-state the simulation is given, the way `obstacleBellowHeight` is carried across
-ticks on the server.
+It is sound about the simulation and wrong about the inputs. Freezing does not
+preserve the answer; it preserves *the first packet's guess at the answer*, and
+the first packet is the worst-informed one there will ever be:
 
-Freezing has one cost worth naming: if the world changes under the prediction —
-a crate the grenade would have bounced off is destroyed mid-flight — the frozen
-point is stale and nothing re-checks it.
+- **The velocity is a single differenced pair, and the noisiest one available.**
+  Positions ride the wire as 16 bits over the map's 1024 units, so a coordinate
+  is good to 0.0156u and a velocity differenced across one 33ms tick carries
+  that over the tick — about half a unit per second. Multiplied by the flight
+  time plus the `v/drag` slide, that is **0.46u** of error on where the ring
+  sits, locked in for the whole fuse.
+- **The world it simulated against is the world as it was.** Shoot the crate the
+  grenade was going to bounce off and the frozen point goes on describing a
+  bounce that will not happen — **18u** out, in the test that does exactly that.
+- **The cook may be attributed late**, and the grenade may since have fallen in
+  a river, which halves the slide.
+
+None of those re-derive from anything. They only get better when the prediction
+is asked again.
+
+Getting the re-solve clean took a real fix, back when this was about handing the
+simulation a mid-flight state at all. It used to start with its floor at zero and
+build up from there, which is right for a grenade in the air and wrong for one
+already resting on a table — it would believe itself airborne, skip the drag it
+should have been under, fall to the ground and be put back. Handing it a state
+mid-slide diverged by 11u. The floor is now derived from the state the
+simulation is given, the way `obstacleBellowHeight` is carried across ticks on
+the server.
+
+### Averaging the leg, not the pair
+
+The one real objection to re-solving is the one the freeze was defending against:
+re-derive the velocity from a fresh pair of quantised positions every packet and
+the blast point wanders, which on a ring drawn on the ground reads as shimmer.
+
+So the velocity is not a fresh pair. **An airborne grenade holds its horizontal
+speed exactly** — drag applies only on the ground — so every packet since it
+last touched something is a measurement of the same constant, and `dodgeProjVel`
+draws its baseline across the whole leg. The quantisation error is then divided
+by the length of the leg rather than by one tick, and a second of flight is
+thirty packets.
+
+The leg is restarted when the newest single-packet reading disagrees with the
+running average by more than quantisation can explain — four times the ±q/dt the
+measurement is worth, which a wall turning a 20u/s grenade clears by an order of
+magnitude and a graze too shallow to trip does not move the landing point by
+either. The packet a bounce lands on is part pre-bounce and part post-, so the
+next one disagrees with it in turn and re-anchors past it: two ticks of
+contamination, then a clean leg.
+
+Once the grenade is down the leg is dropped — drag means there is no constant
+left to average — and once two packets put it in the same 0.0156u cell it counts
+as at rest, and the blast point is simply *where the grenade is*. That is not an
+approximation of the simulation so much as a better answer than it: a point that
+goes on tracking the wire if the grenade turns out to still be creeping. It is
+also what keeps the cost honest — a frag lands inside its first second and spends
+the other three still, so the loop runs over the part of the fuse that is in
+doubt and over none of the part that is not.
+
+`tests/blast_sim.js` drives a quantised packet stream — the server loop sampled
+at the update rate and rounded the way the wire rounds it — through all three
+schemes, over twelve headings of open-ground throw:
+
+| scheme | mean error | error on the last packet | movement per packet |
+| --- | --- | --- | --- |
+| frozen off the first pair | 0.462u | 0.462u | 0.000u |
+| re-solved from a fresh pair | 0.137u | 0.006u | 0.206u |
+| re-solved from the leg | **0.091u** | **0.006u** | **0.089u** |
+
+Re-solving is five times closer than freezing, and the leg baseline is both
+closer and steadier than the fresh pair it replaces — so the thing freezing was
+protecting is not given up to get it.
 
 ## When it goes off
 
@@ -965,7 +1138,7 @@ short because almost all of them arrive together:
 
 | | what it covers |
 | --- | --- |
-| `netStats.updates` | our position, everyone else's, their aim, their weapon, the layer, the walls, the measured speed — one comparison for all of it |
+| `netStats.updates` | our position, everyone else's, their aim, their weapon, the layer, the walls, our speed — one comparison for all of it |
 | `dodgeBulletAdds` | a round fired, off the `addBullet` hook |
 | `dodgeState.liveKey` | a round gone, as the identity of the live set |
 | the user's heading | the whole of the alignment term, and so of what they are asking for |
@@ -1018,7 +1191,7 @@ It holds only while the plan does. A lead that moves far enough to slide the
 plan's own start off the cell the search rounded it to is a different start
 state, not a different index into this one, so past `DODGE_LEAD_SLACK_CELLS`
 of it the plan is dropped instead of re-indexed. As a distance rather than a
-time it tracks `Grid` and the measured speed on its own; at the defaults it is
+time it tracks `Grid` and our current speed on its own; at the defaults it is
 about 29ms of ping.
 
 A negative `t` — the link speeding up, so our press now lands before the plan's
@@ -1150,7 +1323,8 @@ the point count.
 | Frag aim | off | aim the throw at the instant it is released (see [Frag aim](#frag-aim)) |
 
 `window.__dodge()` reports the live state — engaged or not, current heading,
-measured speed, wall count, the lead actually being applied, and time-to-impact
+speed with the terms that produced it (`speedWhy`) and what is left of the shot
+timer (`shotIn`), wall count, the lead actually being applied, and time-to-impact
 both on the user's course and on the plan's. The threat count is split three
 ways: `threats` is everything being solved against, `live` is rounds genuinely
 in the air and `phantoms` is hostiles currently aimed near us, one apiece.

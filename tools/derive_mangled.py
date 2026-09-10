@@ -355,6 +355,23 @@ def derive_field_on(text: str, parent: str, readable: str, label: str, start: in
     return must_match(label, text, pat, start=start)
 
 
+def derive_player_action(text: str, player_start: int) -> str:
+    """Player.action — the action the server last put us in, as
+    `{type, seq, item, time, duration, targetId}`. The object itself is
+    mangled but every field on it keeps its readable name, so one anchor is
+    enough:  this.<action>.targetId = <p>.action.targetId.
+
+    Only `targetId` is read by inject.js, and only to split the two Revive
+    speeds apart: the server gives a player performing a revive
+    `downedMoveSpeed + 2` and the player being revived `downedRezMoveSpeed`,
+    and the presence of a target is what tells those apart. targetId is
+    written from the LOCAL data stream, so it is populated for us and nobody
+    else — which is all the speed model needs.
+    """
+    pat = rf"this\.({IDENT})\.targetId\s*=\s*[a-z]\.action\.targetId\b"
+    return must_match("player.action", text, pat, start=player_start)
+
+
 def derive_local_weapons(text: str, local_field: str, player_start: int) -> str:
     """The weapons slot array on localData. The local-update method does:
         this.<localData>.<weapons> = [];
@@ -485,6 +502,7 @@ window.__SURVEV_MANGLED__ = {{
     dir:          {q("player.dir")},
     posAlt:       {q("player.posAlt")},
     dirAlt:       {q("player.dirAlt")},
+    action:       {q("player.action")},
   }},
 
   // ---- Player.netData (the sub-object named by player.netData above) ----
@@ -495,11 +513,16 @@ window.__SURVEV_MANGLED__ = {{
     scale:        {q("netData.scale")},
     animType:     {q("netData.animType")},
     animSeq:      {q("netData.animSeq")},
+    actionType:   {q("netData.actionType")},
+    frozen:       {q("netData.frozen")},
+    hasteType:    {q("netData.hasteType")},
+    perks:        {q("netData.perks")},
   }},
 
   // ---- Player.localData (the sub-object named by player.localData above) ----
   localData: {{
     zoom:       {q("localData.zoom")},
+    boost:      {q("localData.boost")},
     curWeapIdx: {q("localData.curWeapIdx")},
     weapons:    {q("localData.weapons")},
   }},
@@ -647,7 +670,25 @@ def main() -> None:
         # copy and nothing local writes to it.
         ("netData.animType",      lambda: derive_field_on(text, values["player.netData"], "animType",     "netData.animType",     start=p_start)),
         ("netData.animSeq",       lambda: derive_field_on(text, values["player.netData"], "animSeq",      "netData.animSeq",      start=p_start)),
+        # The four terms of the server's movement-speed formula that are not
+        # already covered above — see dodgeComputeSpeed in inject.js, which is
+        # a port of Player.recalculateSpeed and needs every input it reads.
+        # All four are written in the same assignment run as activeWeapon and
+        # friends, off the readable payload names.
+        ("netData.actionType",    lambda: derive_field_on(text, values["player.netData"], "actionType",   "netData.actionType",   start=p_start)),
+        ("netData.frozen",        lambda: derive_field_on(text, values["player.netData"], "frozen",       "netData.frozen",       start=p_start)),
+        ("netData.hasteType",     lambda: derive_field_on(text, values["player.netData"], "hasteType",    "netData.hasteType",    start=p_start)),
+        # `perks` is an array of `{type, ...}` — the element's `type` keeps its
+        # readable name, so only the array field needs deriving. Matched on the
+        # plain assignment; the dirty-check a few tokens earlier reads the same
+        # field but does not assign to it, so it cannot be picked up instead.
+        ("netData.perks",         lambda: derive_field_on(text, values["player.netData"], "perks",        "netData.perks",        start=p_start)),
+        ("player.action",         lambda: derive_player_action(text, p_start)),
         ("localData.zoom",        lambda: derive_field_on(text, values["player.localData"], "zoom",       "localData.zoom",       start=p_start)),
+        # Adrenaline. The speed formula steps at >= 50, and this is the only
+        # place the number is available — it rides the local stream, so it
+        # exists for us and for nobody else.
+        ("localData.boost",       lambda: derive_field_on(text, values["player.localData"], "boost",      "localData.boost",      start=p_start)),
         ("localData.curWeapIdx",  lambda: derive_field_on(text, values["player.localData"], "curWeapIdx", "localData.curWeapIdx", start=p_start)),
         ("localData.weapons",     lambda: derive_local_weapons(text, values["player.localData"], p_start)),
         ("game.localPlayer",      lambda: derive_game_local_player(text, g_start)),

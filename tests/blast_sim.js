@@ -50,7 +50,12 @@ function extract(name) {
 function grabConst(name) {
   const m = new RegExp(`const ${name} = ([^;]+);`).exec(src);
   if (!m) throw new Error(`could not find const ${name} in inject.js`);
-  return Number(m[1]);
+  // Some of these are written as the derivation they are — the wire's position
+  // quantum is `1024 / 65535` and says so — so the expression is evaluated
+  // rather than parsed, and the test reads the same number for the same reason.
+  const v = Number(eval(m[1]));
+  if (!Number.isFinite(v)) throw new Error(`const ${name} is not a number: ${m[1]}`);
+  return v;
 }
 
 const PROJ_GRAVITY = grabConst('PROJ_GRAVITY');
@@ -61,13 +66,20 @@ const DODGE_SIM_DT = grabConst('DODGE_SIM_DT');
 const DODGE_SIM_MAX_STEPS = grabConst('DODGE_SIM_MAX_STEPS');
 const COLLIDER_CIRCLE = grabConst('COLLIDER_CIRCLE');
 const COLLIDER_AABB = grabConst('COLLIDER_AABB');
+const DODGE_PROJ_POS_Q = grabConst('DODGE_PROJ_POS_Q');
+const DODGE_PROJ_Z_Q = grabConst('DODGE_PROJ_Z_Q');
+const DODGE_PROJ_BOUNCE_K = grabConst('DODGE_PROJ_BOUNCE_K');
 
 // The shipped simulator, plus the two helpers it calls. `getObstacles` and
 // `sameLayerAs` are the only things it reaches outside itself, and both are
 // stubbed to the scenario.
 let SCENE = [];
+let RIVERS = [];
 const bundle = eval(`(function () {
   const PROJ_GRAVITY = ${PROJ_GRAVITY};
+  const DODGE_PROJ_POS_Q = ${DODGE_PROJ_POS_Q};
+  const DODGE_PROJ_Z_Q = ${DODGE_PROJ_Z_Q};
+  const DODGE_PROJ_BOUNCE_K = ${DODGE_PROJ_BOUNCE_K};
   const PROJ_DRAG = ${PROJ_DRAG};
   const PROJ_DRAG_WATER = ${PROJ_DRAG_WATER};
   const DODGE_SIM_DT = ${DODGE_SIM_DT};
@@ -77,14 +89,24 @@ const bundle = eval(`(function () {
   const dodgeSimOut = { x: 0, y: 0 };
   const dodgeSimHit = { nx: 0, ny: 0, pen: 0 };
   const dodgeSimObs = [];
+  const dodgeSimRiverList = [];
   const sameLayerAs = () => true;
   const getObstacles = () => SCENE;
+  // dodgeSimRivers reaches the live client map for its river polygons; the
+  // scenario stands in for it, so the shipped gather and point test are the ones
+  // under examination and only the map handle is fake.
+  const capturedGame = null;
+  const findMapOnGame = () => ({ terrain: { rivers: RIVERS } });
+  ${extract('dodgeSimRivers')}
+  ${extract('dodgeSimInWater')}
   ${extract('dodgeSimPen')}
   ${extract('dodgeSimObstacles')}
   ${extract('dodgeSimBlast')}
   ${extract('dodgeProjAge')}
+  ${extract('dodgeProjVel')}
   ${extract('dodgeBlastFactor')}
-  return { dodgeSimBlast, dodgeSimOut, dodgeProjAge, dodgeBlastFactor };
+  return { dodgeSimBlast, dodgeSimOut, dodgeProjAge, dodgeProjVel, dodgeBlastFactor,
+           dodgeSimInWater, dodgeSimRivers };
 })()`);
 
 // ---- Ground truth -------------------------------------------------------
@@ -123,17 +145,25 @@ function serverPen(c, x, y, r) {
   return { dir, pen: r - d };
 }
 
+// `water` is a boolean for the cases that never leave one surface, or a
+// predicate for the ones that cross. The predicate is the honest shape: the
+// server calls `isOnWater(this.pos)` from *inside* the tick, under the same
+// `posZ <= obstacleBellowHeight` test that gates the drag, so the surface it
+// uses is the one under the grenade on that tick and not the one it was made on.
 function serverSim(init, dur, obstacles, water) {
   let x = init.x, y = init.y, z = init.z;
   let vx = init.vx, vy = init.vy, vz = init.vz;
   let below = 0;
   const rad = init.rad * 0.5;          // Projectile.rad = def.rad * 0.5
   const r = rad / 2;                   // the collision site halves it again
-  const drag = water ? PROJ_DRAG_WATER : PROJ_DRAG;
+  const wetAt = typeof water === 'function' ? water : () => !!water;
   const n = Math.round(dur / SERVER_DT);
 
   for (let i = 0; i < n; i++) {
-    if (z <= below) { vx = vx / (1 + SERVER_DT * drag); vy = vy / (1 + SERVER_DT * drag); }
+    if (z <= below) {
+      const drag = wetAt(x, y) ? PROJ_DRAG_WATER : PROJ_DRAG;
+      vx = vx / (1 + SERVER_DT * drag); vy = vy / (1 + SERVER_DT * drag);
+    }
     x += vx * SERVER_DT; y += vy * SERVER_DT;
     vz -= PROJ_GRAVITY * SERVER_DT;
     z = Math.min(Math.max(z + vz * SERVER_DT, below), 5);
@@ -226,6 +256,221 @@ for (const c of CASES) {
     `(${truth.x.toFixed(2).padStart(7)}, ${truth.y.toFixed(2).padStart(6)})     ` +
     `(${got.x.toFixed(2).padStart(7)}, ${got.y.toFixed(2).padStart(6)})    ` +
     `${err.toFixed(3).padStart(6)}  ${ok ? 'ok' : 'FAIL'}`);
+}
+
+// ---- Crossing a shoreline -----------------------------------------------
+//
+// Drag is 5 in water and 2.3 on land, and the server picks between them inside
+// its own loop — `isOnWater(this.pos)`, every tick, at the position it has then
+// (projectile.ts, under the same `posZ <= obstacleBellowHeight` test that gates
+// the drag at all). A simulation that picks once, from where the last packet
+// left the grenade, gets every shoreline wrong for as long as the grenade has
+// not reached it yet.
+//
+// The case that motivated this: a frag lands on the bank and *slides into* a
+// river. Nothing about its position has crossed anything while it is in the air
+// or on the dry half of the slide, so a per-packet flag says "land" throughout
+// and predicts a `v/2.3` slide where the server is going to give `v/5`. That is
+// 4.6u long at a 20u/s touchdown, held for the whole flight, and only corrected
+// when the grenade is physically in the water — by which point the prediction
+// had a third of the fuse to be wrong in.
+//
+// So dodgeSimBlast tests the river polygons per step. These check it against a
+// transcription that tests the water where the server tests it.
+console.log('\nshorelines (drag chosen per step, as the server chooses it)');
+
+// A river as the client holds one: an `aabb` for the broad reject and a
+// `waterPoly` for the real answer. Rectangles here — the polygon test is
+// survev's own pnpoly either way, and a rectangle is the shape whose crossing
+// point is arithmetic rather than a fixture.
+const river = (x0, y0, x1, y1) => ({
+  aabb: { min: { x: x0, y: y0 }, max: { x: x1, y: y1 } },
+  waterPoly: [{ x: x0, y: y0 }, { x: x1, y: y0 }, { x: x1, y: y1 }, { x: x0, y: y1 }],
+});
+// The transcription's own water test, written from map.ts rather than from the
+// helper under test: an AABB reject, then pnpoly against the water polygon.
+function truthWet(rivers, x, y) {
+  for (const rv of rivers) {
+    const { min, max } = rv.aabb;
+    if (x < min.x || x > max.x || y < min.y || y > max.y) continue;
+    const poly = rv.waterPoly;
+    let inside = false;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      const xi = poly[i].x, yi = poly[i].y, xj = poly[j].x, yj = poly[j].y;
+      if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+    }
+    if (inside) return true;
+  }
+  return false;
+}
+
+const WIDE = river(25, -60, 200, 60);        // everything past x=25 is water
+const SHORE = [
+  // The reported case. Lands dry at 20.87 and slides across x=25.
+  { name: 'land→water', rivers: [WIDE], seed: false, fuse: 4, speed: 20 },
+  // The mirror: thrown from in the river, slides out onto dry land.
+  { name: 'water→land', rivers: [river(-60, -60, 25, 60)], seed: true, fuse: 4, speed: 20 },
+  // Neither leaves its surface. These are the regression: the per-step test must
+  // return exactly what the flag used to.
+  { name: 'all water',  rivers: [river(-60, -60, 200, 60)], seed: true, fuse: 4, speed: 20 },
+  { name: 'all land',   rivers: [river(60, -60, 200, 60)], seed: false, fuse: 4, speed: 20 },
+  // Over a river and down on the far bank: airborne over water costs nothing,
+  // because the server's own water test is inside the on-the-ground branch.
+  { name: 'flies over', rivers: [river(8, -60, 16, 60)], seed: false, fuse: 4, speed: 20 },
+  // A short lob that stops before it ever gets to the bank.
+  { name: 'stops short', rivers: [river(40, -60, 200, 60)], seed: false, fuse: 4, speed: 20 },
+];
+
+let shoreWorst = 0, shoreFail = 0;
+console.log('  case          truth (x)    predicted    err');
+for (const c of SHORE) {
+  SCENE = [];
+  RIVERS = c.rivers;
+  const init = throwState(c.speed);
+  const truth = serverSim(init, c.fuse, [], (x, y) => truthWet(c.rivers, x, y));
+  const rec = {
+    x: init.x, y: init.y, z: init.z, vx: init.vx, vy: init.vy,
+    haveVel: true, age: 0, water: c.seed,
+  };
+  bundle.dodgeSimBlast(rec, { velZ: FRAG.velZ, rad: FRAG.rad }, c.fuse, 0, bundle.dodgeSimOut);
+  const err = Math.hypot(bundle.dodgeSimOut.x - truth.x, bundle.dodgeSimOut.y - truth.y);
+  if (err > shoreWorst) shoreWorst = err;
+  const ok = err <= TOL;
+  if (!ok) { shoreFail++; failed++; }
+  console.log(`  ${c.name.padEnd(13)} ${truth.x.toFixed(2).padStart(7)}u   ` +
+              `${bundle.dodgeSimOut.x.toFixed(2).padStart(8)}u   ${err.toFixed(3).padStart(6)}  ${ok ? 'ok' : 'FAIL'}`);
+}
+console.log(`  ${shoreFail === 0 ? 'ok' : 'FAIL'}  worst ${shoreWorst.toFixed(3)}u across the six`);
+
+// What it was worth. The same land→water throw with the flag held for the whole
+// simulation — which is what the old code did, and what the code still does when
+// the polygons are not allowed to answer.
+{
+  RIVERS = [];                                  // no geometry: fall back to the flag
+  SCENE = [];
+  const init = throwState(20);
+  const truth = serverSim(init, 4, [], (x, y) => truthWet([WIDE], x, y));
+  const rec = { x: init.x, y: init.y, z: init.z, vx: init.vx, vy: init.vy,
+                haveVel: true, age: 0, water: false };
+  bundle.dodgeSimBlast(rec, { velZ: FRAG.velZ, rad: FRAG.rad }, 4, 0, bundle.dodgeSimOut);
+  const was = Math.abs(bundle.dodgeSimOut.x - truth.x);
+  console.log(`  ${was > 2 ? 'ok' : 'FAIL'}  holding one flag instead puts it ${was.toFixed(2)}u long ` +
+              `— what the per-step test is worth`);
+  if (!(was > 2)) failed++;
+}
+
+// ---- When the polygons are not the whole answer -------------------------
+//
+// `isOnWater` consults decals and building surfaces before it ever reaches the
+// rivers, and both can overrule them: a bridge deck across a river reads dry,
+// and a building's own water surface reads wet with no river anywhere. The
+// river polygons cannot see either, so they are only trusted when they agree
+// with the authoritative reading at the one point that has one — the position
+// the packet left the grenade at. Disagreement means something else is
+// deciding, and the flag stands for the whole simulation.
+console.log('\n  where the rivers are overruled (the seed flag has to win)');
+{
+  const cases = [
+    // Standing on a bridge over a river: polygons say wet, getGroundSurface said
+    // dry. The whole slide must be simulated dry.
+    { name: 'bridge over a river', rivers: [river(-60, -60, 200, 60)], seed: false, want: false },
+    // A building's water surface with no river under it: polygons say dry,
+    // getGroundSurface said wet. The whole slide must be simulated wet.
+    { name: 'water floor, no river', rivers: [river(300, -60, 400, 60)], seed: true, want: true },
+  ];
+  for (const c of cases) {
+    SCENE = [];
+    RIVERS = c.rivers;
+    const init = throwState(20);
+    const rec = { x: init.x, y: init.y, z: init.z, vx: init.vx, vy: init.vy,
+                  haveVel: true, age: 0, water: c.seed };
+    bundle.dodgeSimBlast(rec, { velZ: FRAG.velZ, rad: FRAG.rad }, 4, 0, bundle.dodgeSimOut);
+    const got = bundle.dodgeSimOut.x;
+    // What the flag alone gives, which is what the answer has to be.
+    const want = serverSim(init, 4, [], c.want).x;
+    const ok = Math.abs(got - want) <= TOL;
+    if (!ok) failed++;
+    console.log(`    ${c.name.padEnd(21)} simulated ${c.want ? 'wet' : 'dry'} throughout: ` +
+                `${got.toFixed(2)}u vs ${want.toFixed(2)}u  ${ok ? 'ok' : 'FAIL'}`);
+  }
+}
+
+// ---- The ring, packet by packet -----------------------------------------
+//
+// The bug as it was actually seen: not a number in a table but a ring that sat
+// several units long for a third of the fuse and then jumped. This walks the
+// reported throw one update at a time and reports the worst the prediction ever
+// gets, which is the thing that has to be small.
+console.log('\n  the reported throw, packet by packet');
+{
+  RIVERS = [WIDE];
+  SCENE = [];
+  const FUSE = 4, TICK = 0.03;
+  const init = throwState(20);
+  const wet = (x, y) => truthWet([WIDE], x, y);
+  const truth = serverSim(init, FUSE, [], wet).x;
+  const qMap = (v) => Math.round(v / 1024 * 65535) / 65535 * 1024;
+  const qZ = (v) => Math.round(v / 5 * 1023) / 1023 * 5;
+  const phys = { velZ: FRAG.velZ, rad: FRAG.rad, fuse: FUSE };
+
+  let rec = null, worstNow = 0, worstFlag = 0, crossedAt = null;
+  for (let k = 1; k * TICK < FUSE; k++) {
+    const t = k * TICK;
+    const st = serverSim(init, t, [], wet);
+    const x = qMap(st.x), z = qZ(st.z);
+    if (!rec) {
+      rec = { x, y: 0, z, age: t, n: k, vx: 0, vy: 0, haveVel: false,
+              legN: -1, legX: x, legY: 0, grounded: false, atRest: false, water: wet(x, 0) };
+      continue;
+    }
+    bundle.dodgeProjVel(rec, phys, x, 0, z, k, TICK, TICK * 1000);
+    rec.age = t; rec.n = k; rec.x = x; rec.y = 0; rec.z = z;
+    rec.water = wet(x, 0);                       // what snapshotProjectiles stores
+    if (rec.water && crossedAt === null) crossedAt = t;
+
+    let px;
+    if (rec.atRest) px = rec.x;
+    else { bundle.dodgeSimBlast(rec, phys, FUSE - t, 0, bundle.dodgeSimOut); px = bundle.dodgeSimOut.x; }
+    worstNow = Math.max(worstNow, Math.abs(px - truth));
+
+    // The same packet, simulated the old way: one flag for the whole run.
+    RIVERS = [];
+    bundle.dodgeSimBlast(rec, phys, FUSE - t, 0, bundle.dodgeSimOut);
+    worstFlag = Math.max(worstFlag, Math.abs(bundle.dodgeSimOut.x - truth));
+    RIVERS = [WIDE];
+  }
+  // The same throw with no shoreline in it at all, which is the floor this can
+  // possibly reach: a quantised packet stream carries velocity noise whatever
+  // the surface, and the section above already prices that. What has to be true
+  // is that crossing a shoreline costs nothing *on top* of it.
+  RIVERS = [];
+  const dryTruth = serverSim(init, FUSE, [], false).x;
+  let worstDry = 0, dry = null;
+  for (let k = 1; k * TICK < FUSE; k++) {
+    const t = k * TICK;
+    const st = serverSim(init, t, [], false);
+    const x = qMap(st.x), z = qZ(st.z);
+    if (!dry) {
+      dry = { x, y: 0, z, age: t, n: k, vx: 0, vy: 0, haveVel: false,
+              legN: -1, legX: x, legY: 0, grounded: false, atRest: false, water: false };
+      continue;
+    }
+    bundle.dodgeProjVel(dry, phys, x, 0, z, k, TICK, TICK * 1000);
+    dry.age = t; dry.n = k; dry.x = x; dry.y = 0; dry.z = z;
+    let px;
+    if (dry.atRest) px = dry.x;
+    else { bundle.dodgeSimBlast(dry, phys, FUSE - t, 0, bundle.dodgeSimOut); px = bundle.dodgeSimOut.x; }
+    worstDry = Math.max(worstDry, Math.abs(px - dryTruth));
+  }
+
+  console.log(`    the grenade reaches the water at t=${crossedAt.toFixed(2)}s of a ${FUSE}s fuse`);
+  console.log(`    worst ring error, one flag held:   ${worstFlag.toFixed(2)}u`);
+  console.log(`    worst ring error, tested per step: ${worstNow.toFixed(2)}u`);
+  console.log(`    the same throw with no river in it: ${worstDry.toFixed(2)}u — the wire's own noise`);
+  const ok = worstNow <= worstDry + 0.01 && worstFlag > 2;
+  if (!ok) failed++;
+  console.log(`    ${ok ? 'ok' : 'FAIL'}  the shoreline costs nothing over a throw that never meets one`);
+  RIVERS = [];
 }
 
 // ---- The closed forms ---------------------------------------------------
@@ -570,18 +815,19 @@ console.log(`  ${carryOk ? 'ok' : 'FAIL'}  a 2s cook leaves ~2s, and losing it w
 if (!carryOk) cookFail++;
 failed += cookFail;
 
-// ---- Solving the blast point once ---------------------------------------
+// ---- Re-solving the blast point -----------------------------------------
 //
-// The detonation point is solved on the first packet that can measure a
-// velocity and then frozen for the life of the grenade. That is only sound if
-// re-solving would return the same answer — if simulating from a later state
-// over a correspondingly shorter fuse lands where simulating from an earlier
-// one did. It has to, because the state at the later moment is *on* the
-// trajectory computed from the earlier one, but "has to" is exactly the sort of
-// reasoning worth checking against a wall and a table.
+// The detonation point is re-solved on every packet, against the state that
+// packet delivered. Three things have to hold for that to beat solving it once
+// and freezing it, and the first of them is what the freeze was defending.
 //
-// If this ever fails, freezing is wrong and the point has to be re-solved.
-console.log('\nfreezing the blast point (re-solving from later states)');
+// **Re-solving must not move the answer in a world that has not moved.**
+// Simulating from a later state over a correspondingly shorter fuse has to land
+// where simulating from an earlier one did — it has to, because the later state
+// is *on* the trajectory computed from the earlier one, but "has to" is exactly
+// the sort of reasoning worth checking against a wall and a table. If this
+// fails, re-solving is noise and freezing was right.
+console.log('\nre-solving from later states (the answer must not move)');
 
 let freezeWorst = 0;
 for (const c of CASES) {
@@ -615,7 +861,182 @@ for (const c of CASES) {
   console.log(`  ${c.name.padEnd(9)} re-solve drifts ${worstHere.toFixed(3)}u  ${ok ? 'ok' : 'FAIL'}`);
 }
 console.log(`  ${freezeWorst <= TOL ? 'ok' : 'FAIL'}  worst ${freezeWorst.toFixed(3)}u — ` +
-            `re-solving buys nothing, so solving once is not an approximation`);
+            `the exact state re-solves to the same point`);
+
+// ---- What the wire actually delivers ------------------------------------
+//
+// The exact state is not what arrives. Positions ride as 16 bits over the map's
+// 1024 units and posZ as 10 bits over [0, 5], so every packet is a rounded
+// reading and a velocity differenced from two of them carries a whole quantum
+// divided by one tick — about half a unit per second. That noise is the entire
+// case the freeze had: locked in, the blast point holds still; re-solved from a
+// fresh pair every packet, it wanders.
+//
+// So the second thing that has to hold is that **the velocity fed to the
+// re-solve is not a fresh pair**. An airborne grenade holds its horizontal
+// speed exactly, so dodgeProjVel averages across the whole leg since it last
+// touched something, and the error falls off with the length of the baseline.
+//
+// This drives a quantised packet stream — the server loop sampled at the update
+// rate and rounded the way the wire rounds it — through three schemes:
+//
+//   frozen   solved once on the first packet that can measure a velocity, from
+//            that single noisiest-available pair, and never again
+//   pair     re-solved every packet from the newest pair of positions
+//   leg      re-solved every packet from the shipped estimator
+//
+// and asks each of them where the grenade is going to go off.
+console.log('\nagainst the wire (16-bit positions, 10-bit posZ)');
+
+const TICK_MS = 30;                    // an update, and a whole number of server ticks
+const TICK_S = TICK_MS / 1000;
+// The wire's own rounding: readFloat is `lo + readBits(n)/(2^n - 1) * (hi - lo)`.
+const qMap = (v) => Math.round(v / 1024 * 65535) / 65535 * 1024;
+const qZ = (v) => Math.round(v / 5 * 1023) / 1023 * 5;
+// Off the map's origin, so nothing lands on a grid line by construction.
+const OX = 137.317, OY = 208.941;
+const FRAG_PHYS = { velZ: FRAG.velZ, rad: FRAG.rad, fuse: 4 };
+
+// One grenade's life as the mod sees it, scored against where it truly goes off.
+// `mutate(t)` is the world changing under the prediction; it returns the scene
+// in force at time t.
+function packetRun(speed, ang, fuse, scene, mutate) {
+  const init = {
+    x: OX, y: OY, z: PROJ_SPAWN_Z, rad: FRAG.rad, vz: FRAG.velZ,
+    vx: speed * Math.cos(ang), vy: speed * Math.sin(ang),
+  };
+  const truthScene = mutate ? mutate(fuse) : scene;
+  const truth = serverSim(init, fuse, truthScene, false);
+
+  const mk = (x, y, z, t) => ({
+    x, y, z, age: t, n: 1, vx: 0, vy: 0, haveVel: false,
+    legN: -1, legX: x, legY: y, grounded: false, atRest: false, water: false,
+  });
+  let legRec = null, pairRec = null;
+  let frozen = null;
+  const errs = { frozen: [], pair: [], leg: [] };
+  const last = { pair: null, leg: null };
+  const jit = { pair: 0, leg: 0, n: 0 };
+
+  const solve = (rec, left) => {
+    if (rec.atRest || !rec.haveVel) return { x: rec.x, y: rec.y };
+    SCENE = mutate ? mutate(fuse - left) : scene;
+    bundle.dodgeSimBlast(rec, FRAG_PHYS, left, 0, bundle.dodgeSimOut);
+    return { x: bundle.dodgeSimOut.x, y: bundle.dodgeSimOut.y };
+  };
+  const miss = (p) => Math.hypot(p.x - truth.x, p.y - truth.y);
+
+  for (let k = 1; k * TICK_S < fuse; k++) {
+    const t = k * TICK_S;
+    const st = serverSim(init, t, mutate ? mutate(t) : scene, false);
+    const x = qMap(st.x), y = qMap(st.y), z = qZ(st.z);
+    if (!legRec) { legRec = mk(x, y, z, t); pairRec = mk(x, y, z, t); continue; }
+
+    bundle.dodgeProjVel(legRec, FRAG_PHYS, x, y, z, k, TICK_S, TICK_MS);
+    // The estimator the freeze locked in, and the one `pair` keeps using: the
+    // newest two positions, differenced.
+    pairRec.vx = (x - pairRec.x) / TICK_S;
+    pairRec.vy = (y - pairRec.y) / TICK_S;
+    pairRec.haveVel = true;
+    for (const r of [legRec, pairRec]) {
+      r.age = t; r.n = k; r.x = x; r.y = y; r.z = z;
+    }
+
+    const left = fuse - t;
+    const pLeg = solve(legRec, left);
+    const pPair = solve(pairRec, left);
+    if (!frozen) frozen = pLeg;        // both schemes agree on the first pair
+    errs.frozen.push(miss(frozen));
+    errs.pair.push(miss(pPair));
+    errs.leg.push(miss(pLeg));
+    if (last.leg) {
+      jit.leg += Math.hypot(pLeg.x - last.leg.x, pLeg.y - last.leg.y);
+      jit.pair += Math.hypot(pPair.x - last.pair.x, pPair.y - last.pair.y);
+      jit.n++;
+    }
+    last.leg = pLeg; last.pair = pPair;
+  }
+  const mean = (a) => a.reduce((u, v) => u + v, 0) / Math.max(a.length, 1);
+  return {
+    frozen: mean(errs.frozen), pair: mean(errs.pair), leg: mean(errs.leg),
+    finalLeg: errs.leg[errs.leg.length - 1], finalPair: errs.pair[errs.pair.length - 1],
+    jitLeg: jit.leg / Math.max(jit.n, 1), jitPair: jit.pair / Math.max(jit.n, 1),
+  };
+}
+
+// Twelve headings of open-ground throw, so the answer is a property of the
+// estimator and not of one lucky trajectory.
+let agg = { frozen: 0, pair: 0, leg: 0, jitPair: 0, jitLeg: 0, finalLeg: 0, finalPair: 0, n: 0 };
+for (let i = 0; i < 12; i++) {
+  const r = packetRun(20, i * Math.PI / 6, 4, [], null);
+  for (const k of Object.keys(agg)) if (k !== 'n') agg[k] += r[k];
+  agg.n++;
+}
+for (const k of Object.keys(agg)) if (k !== 'n') agg[k] /= agg.n;
+console.log('  scheme   mean err   final err   packet-to-packet move');
+console.log(`  frozen   ${agg.frozen.toFixed(3)}u     ${agg.frozen.toFixed(3)}u      0.000u`);
+console.log(`  pair     ${agg.pair.toFixed(3)}u     ${agg.finalPair.toFixed(3)}u      ${agg.jitPair.toFixed(3)}u`);
+console.log(`  leg      ${agg.leg.toFixed(3)}u     ${agg.finalLeg.toFixed(3)}u      ${agg.jitLeg.toFixed(3)}u`);
+
+// The three claims, in the order they matter. Re-solving has to be worth
+// something at all; the leg has to be the reason it is worth something rather
+// than a wash against the noise it adds; and the ring has to sit still enough
+// to read while it does it.
+const beatsFrozen = agg.leg < agg.frozen;
+console.log(`  ${beatsFrozen ? 'ok' : 'FAIL'}  re-solving is closer than the answer frozen off the ` +
+            `first pair (${agg.leg.toFixed(3)}u vs ${agg.frozen.toFixed(3)}u)`);
+if (!beatsFrozen) failed++;
+const beatsPair = agg.leg < agg.pair && agg.jitLeg < agg.jitPair;
+console.log(`  ${beatsPair ? 'ok' : 'FAIL'}  the leg baseline beats a fresh pair on both ` +
+            `(${agg.leg.toFixed(3)}u vs ${agg.pair.toFixed(3)}u, moving ` +
+            `${agg.jitLeg.toFixed(3)}u a packet vs ${agg.jitPair.toFixed(3)}u)`);
+if (!beatsPair) failed++;
+const settles = agg.finalLeg <= TOL;
+console.log(`  ${settles ? 'ok' : 'FAIL'}  and it converges: ${agg.finalLeg.toFixed(3)}u ` +
+            `left on the last packet before the fuse`);
+if (!settles) failed++;
+
+// A bounce is what the leg has to survive: the average is only meaningful over
+// a stretch of flight the grenade did not turn during, so the estimator watches
+// for a reading it cannot explain as quantisation and starts again there.
+{
+  const wall = [aabb(OX + 14, OY - 5, OX + 15, OY + 5, 2)];
+  const r = packetRun(20, 0, 4, wall, null);
+  // What is checked here is that the turn does not poison the average — that a
+  // leg spanning the bounce is noticed and abandoned. Not that it beats the
+  // freeze on this particular throw: a frozen point is a coin toss on one
+  // trajectory, and on this one the coin came up well.
+  const ok = r.finalLeg <= TOL && r.leg <= TOL;
+  console.log(`  ${ok ? 'ok' : 'FAIL'}  through a wall bounce the leg re-anchors: mean ` +
+              `${r.leg.toFixed(3)}u, final ${r.finalLeg.toFixed(3)}u ` +
+              `(a fresh pair: ${r.pair.toFixed(3)}u / ${r.finalPair.toFixed(3)}u)`);
+  if (!ok) failed++;
+}
+
+// ---- And the third thing: a world that does move ------------------------
+//
+// The one cost of freezing that no amount of arithmetic could recover. The
+// prediction bounces the grenade off a crate, and half a second into the flight
+// somebody shoots the crate. Nothing about the grenade has changed, so nothing
+// re-derives; the frozen point simply describes a bounce that is not going to
+// happen. Re-solving reads the obstacle list the packet left behind.
+console.log('\na crate destroyed under the prediction');
+{
+  const crate = aabb(OX + 14, OY - 5, OX + 15, OY + 5, 2);
+  const DIES_AT = 0.5;
+  const withCrate = [crate], without = [];
+  const r = packetRun(20, 0, 4, null, (t) => (t < DIES_AT ? withCrate : without));
+  const ok = r.finalLeg <= TOL;
+  console.log(`  frozen off the first packet: ${r.frozen.toFixed(2)}u out — it is still ` +
+              `predicting the bounce`);
+  console.log(`  ${ok ? 'ok' : 'FAIL'}  re-solved: ${r.finalLeg.toFixed(3)}u out by the ` +
+              `last packet, and ${r.leg.toFixed(2)}u averaged over the flight`);
+  if (!ok) failed++;
+  if (!(r.frozen > 1)) {
+    console.log('  FAIL  the scenario does not actually separate the two');
+    failed++;
+  }
+}
 
 // ---- Throw preview ------------------------------------------------------
 //
@@ -710,6 +1131,7 @@ const solver = eval(`(function () {
   const dodgeSimOut = { x: 0, y: 0 };
   const dodgeSimHit = { nx: 0, ny: 0, pen: 0 };
   const dodgeSimObs = [];
+  const dodgeSimRiverList = [];
   const dodgeThrowRec = { x: 0, y: 0, z: 0, vx: 0, vy: 0, haveVel: true, age: 0, water: false };
   const dodgeSpawnOut = { x: 0, y: 0 };
   const fragSolveOut = { dx: 1, dy: 0, len: 0, x: 0, y: 0, err: Infinity };
@@ -718,6 +1140,13 @@ const solver = eval(`(function () {
   const sameLayerAs = () => true;
   const getObstacles = () => SCENE;
   const dodgeProjInWater = () => false;
+  // dodgeSimRivers reaches the live client map for its river polygons; the
+  // scenario stands in for it, so the shipped gather and point test are the ones
+  // under examination and only the map handle is fake.
+  const capturedGame = null;
+  const findMapOnGame = () => ({ terrain: { rivers: RIVERS } });
+  ${extract('dodgeSimRivers')}
+  ${extract('dodgeSimInWater')}
   ${extract('dodgeSimPen')}
   ${extract('dodgeSimObstacles')}
   ${extract('dodgeSimBlast')}
