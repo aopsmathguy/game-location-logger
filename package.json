@@ -5,7 +5,7 @@
   "description": "survev.io game-state toolkit: a Chrome extension and a local mirror, both loading the same extension/core/ scripts.",
   "scripts": {
     "start": "node webapp/server.js",
-    "test": "node tests/netcode_sim.js && node tests/blast_sim.js && node tests/touch_sim.js && node tests/speed_sim.js",
+    "test": "node tests/netcode_sim.js && node tests/blast_sim.js && node tests/touch_sim.js && node tests/speed_sim.js && node tests/zoom_sim.js",
     "fetch": "python3 tools/fetch_survev_js.py",
     "mangled": "python3 tools/derive_mangled.py",
     "refresh": "npm run fetch && npm run mangled"

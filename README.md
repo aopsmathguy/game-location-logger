@@ -9,8 +9,8 @@ authorized deployment of survev.
 
 The aim helper, enemy overlay, bank shots and auto-quickswap all ship **off**
 and are turned on from the MOD tab; until then the game plays as stock survev.
-The netcode smoothing, ping readout and enemy name tags are on by default —
-none of them touches input or gameplay state.
+The netcode smoothing, ping readout, enemy name tags and the 1.5x zoom are on
+by default — none of them touches input or gameplay state.
 
 - **Enemy overlay** — every visible enemy is drawn as a marker on a canvas
   overlaid on the page, with position, velocity, weapon, and status. Toggled
@@ -98,6 +98,14 @@ none of them touches input or gameplay state.
   player as a one-colour circle at the collision radius, drawn at the same
   smoothed position the sprite would have been. Off by default; see
   [Debug render](docs/debug-render.md#debug-render).
+- **Zoom** — a slider in the MOD tab, 1 to 2, that renders the world that many
+  times smaller: at 2 everything is drawn at half size and four times as much
+  of the map is on screen. It is the same scale change a scope makes — sprites,
+  terrain and the cursor's reach into the world all move together — applied to
+  the two camera methods the whole renderer goes through, so survev's own zoom
+  state machine is untouched and a scope change still animates underneath it.
+  Defaults to **1.5**; dragging it to 1 unwraps both methods and is stock. See
+  [Zoom](docs/zoom.md#zoom).
 - **Position log** — periodic snapshots of self + enemy positions are sent
   to the service worker; click the toolbar icon to export as JSON
   (see `docs/sample.json` for the schema).
@@ -141,7 +149,7 @@ extension/       manifest, content script, service worker
 extension/core/  inject.js + mangled.js — the toolkit, shared by both consumers
 webapp/          reverse-proxy mirror that serves survev with core/ injected
 tools/           fetch_survev_js.py, derive_mangled.py
-tests/           netcode_sim.js, blast_sim.js, touch_sim.js
+tests/           netcode_sim.js, blast_sim.js, touch_sim.js, speed_sim.js, zoom_sim.js
 docs/            design notes, sample log schema
 js_dump/         bundle cache (gitignored) — repopulated by tools/fetch_survev_js.py
 ```
@@ -224,6 +232,7 @@ Each feature's design notes, and why it works the way it does:
 | [docs/netcode.md](docs/netcode.md) | Clock recovery and smoothing, and the trade it makes |
 | [docs/name-tags.md](docs/name-tags.md) | Enemy name tags |
 | [docs/debug-render.md](docs/debug-render.md) | The debug overlay |
+| [docs/zoom.md](docs/zoom.md) | Rendering the world smaller than the game means to |
 | [docs/sample.json](docs/sample.json) | Position-log schema |
 
 ## Notes

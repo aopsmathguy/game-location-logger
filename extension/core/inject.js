@@ -576,10 +576,12 @@
     return probe;
   }
 
-  // Zero-arg function-valued members of the camera, instance first then up
-  // the prototype chain (class methods live on the prototype). Read through
-  // descriptors so we never trip an accessor just by looking.
-  function cameraZeroArgMethodNames(camera) {
+  // Function-valued members of the camera taking exactly `arity` arguments,
+  // instance first then up the prototype chain (class methods live on the
+  // prototype). Read through descriptors so we never trip an accessor just by
+  // looking. Zero-arg finds pixelsPerUnit below; one-arg finds scaleToScreen
+  // for the zoom block.
+  function cameraMethodNames(camera, arity) {
     const out = [];
     const seen = new Set();
     for (let o = camera; o && o !== Object.prototype; o = Object.getPrototypeOf(o)) {
@@ -589,7 +591,7 @@
         if (n === 'constructor' || seen.has(n)) continue;
         seen.add(n);
         const d = Object.getOwnPropertyDescriptor(o, n);
-        if (d && typeof d.value === 'function' && d.value.length === 0) out.push(n);
+        if (d && typeof d.value === 'function' && d.value.length === arity) out.push(n);
       }
     }
     return out;
@@ -620,7 +622,7 @@
       for (let i = 0; i < names.length; i++) {
         if (probe[names[i]] === CAMERA_PPU) { ppuKey = names[i]; break; }
       }
-      const methods = cameraZeroArgMethodNames(probe);
+      const methods = cameraMethodNames(probe, 0);
       for (let i = 0; i < methods.length; i++) {
         const fn = probe[methods[i]];
         let base;
@@ -686,7 +688,12 @@
       const zoom = camera[cachedCameraZoomKey];
       const ppu = cachedCameraPpuKey ? camera[cachedCameraPpuKey] : CAMERA_PPU;
       if (typeof zoom === 'number' && isFinite(zoom) && zoom > 0 &&
-          typeof ppu === 'number' && isFinite(ppu) && ppu > 0) return ppu * zoom;
+          typeof ppu === 'number' && isFinite(ppu) && ppu > 0) {
+        // The zoom hook divides the camera's scale *methods* and leaves
+        // m_zoom alone, so this path — which reads the fields behind them —
+        // is the one place that has to apply the divisor itself.
+        return (ppu * zoom) / zoomDivisor(camera);
+      }
       cachedCameraZoomKey = null;
       cachedCameraPpuKey = null;
     }
@@ -721,6 +728,241 @@
   function getViewportWorldUnits(scope, me, game) {
     return window.innerWidth / getPxPerWorldUnit(scope, me, game);
   }
+
+  // ---------------------------------------------------------------------
+  // Zoom out
+  //
+  // "Zoom" is a divisor on the camera's scale: 1 is stock, 2 draws the world
+  // at half size, which is four times as much of it on screen. It is a
+  // divisor and not a multiplier because seeing *more* is the only direction
+  // worth having — the game already hands out the other one as scopes.
+  //
+  // Every path from the camera to the screen funnels through two methods, and
+  // both have to be divided or the frame comes apart:
+  //
+  //     pixelsPerUnit()  = m_ppu * m_zoom   positions, and the ground and
+  //                                         layer transforms built off
+  //                                         pointToScreen
+  //     scaleToScreen(x) = x * m_zoom       sprite sizes
+  //
+  // Note what scaleToScreen is not: there is no m_ppu in it. Callers holding
+  // world units divide by m_ppu themselves first, as in
+  // `scaleToScreen(2 * rad / m_ppu)`, because m_ppu is the constant the art
+  // was drawn against. So m_ppu — the tempting knob, a hardcoded 16 that
+  // nothing ever writes — would shrink the world transform and *double* every
+  // sprite standing in it.
+  //
+  // m_zoom is the factor the two share, and it is the one number we must not
+  // write. survev rebuilds the camera scale from scratch on every frame of
+  // `game.update` (client/src/game.ts):
+  //
+  //     m_targetZoom = maxScreenDim * 0.5 / (zoomRadius * m_ppu)
+  //     m_zoom       = lerp(dt * rate, m_zoom, m_targetZoom)
+  //
+  // so a write to m_zoom survives exactly one frame, and an accessor that
+  // divides m_zoom on read is worse than useless: the divisor lands inside
+  // that lerp's feedback loop, where the game reads our divided value back
+  // and lerps it toward the undivided target, and the two settle at a scale
+  // that is neither stock nor asked for and that moves with the frame rate.
+  //
+  // So the divisor goes on the two methods, as own properties on the one
+  // camera instance, and the game's zoom state machine is left completely
+  // alone — which is also why a scope change still animates: the real zoom is
+  // still lerping underneath, and we only ever divide what it arrives at.
+  // pointToScreen, screenToPoint and pixels are prototype methods that call
+  // `this.pixelsPerUnit()`, so shadowing it on the instance catches those
+  // three as well: two overrides cover every path the renderer has.
+  //
+  // Nothing downstream needs to know. Every marker the overlay draws is
+  // scaled off readCameraPxPerUnit, i.e. off pixelsPerUnit(), and survev
+  // converts the mouse back into world coordinates through screenToPoint — so
+  // the markers stay glued to the players and the aim path keeps pointing
+  // where the cursor does, at any zoom.
+  // ---------------------------------------------------------------------
+  const ZOOM = {
+    // On by default, unlike the rest of the MOD tab, because it is a display
+    // setting rather than a cheat: it changes what the camera shows and
+    // nothing about input or gameplay state, and 1.5 is the value that buys
+    // most of the view without shrinking a player past the point of reading
+    // what they are holding.
+    //
+    // Dragging it back to 1 unwraps both methods, so the feature is genuinely
+    // absent there rather than dividing by one, and a camera we never
+    // understood is never touched.
+    factor: 1.5,
+  };
+  const ZOOM_MIN = 1;
+  const ZOOM_MAX = 2;
+
+  function zoomFactor() {
+    const v = Number(ZOOM.factor);
+    if (!isFinite(v)) return 1;
+    return Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, v));
+  }
+
+  // The live hook: { camera, factor, scaleName, spriteName, restore }.
+  let zoomHook = null;
+
+  // What the hook is currently dividing this camera by, for the one reader
+  // that goes behind the methods (readCameraPxPerUnit's field fallback).
+  function zoomDivisor(camera) {
+    return zoomHook && zoomHook.camera === camera ? zoomHook.factor : 1;
+  }
+
+  // scaleToScreen, by mangled name: the one-argument method for which f(1) is
+  // exactly m_zoom. The only other one-argument scalar method on the camera is
+  // `pixels`, which is m_ppu — a factor of 16 — bigger, and the rest take a
+  // vector or return nothing. pixelsPerUnit is already identified for us by
+  // identifyCameraScale, which finds it by doubling each candidate scalar on a
+  // clone and seeing whose change the result follows; that is also what tells
+  // us which scalar is m_zoom.
+  //
+  // Both tests are decisive on any single frame, which is the whole point of
+  // choosing them. m_zoom and m_targetZoom are two scalars of identical value
+  // in steady state, so identifying the target by that equality looks just as
+  // principled — but the lerp only converges asymptotically, and it restarts
+  // on every scope change, resize and respawn, so in a real match the two are
+  // very often never equal to a tolerance tight enough to trust. A test that
+  // can only fire between scope changes leaves the view stock for the rest of
+  // the round, which is exactly the failure this replaced.
+  //
+  // Probing the clone rather than the live camera means a method with side
+  // effects — the screen-shake apply — mutates the copy and nothing the game
+  // can see.
+  function findCameraSpriteScaleName(camera) {
+    if (!cachedCameraZoomKey) return null;
+    try {
+      const probe = makeCameraProbe(camera);
+      const zoom = probe[cachedCameraZoomKey];
+      if (typeof zoom !== 'number' || !isFinite(zoom) || zoom <= 0) return null;
+      const names = cameraMethodNames(probe, 1);
+      let hit = null;
+      for (let i = 0; i < names.length; i++) {
+        const fn = probe[names[i]];
+        let one, two;
+        try {
+          one = fn.call(probe, 1);
+          two = fn.call(probe, 2);
+        } catch {
+          continue;
+        }
+        // Linear in the argument and passing through m_zoom at 1. Checking
+        // the second point as well is what separates a scale from a method
+        // that merely happens to return the zoom.
+        if (one !== zoom || two !== zoom * 2) continue;
+        if (hit) return null;   // ambiguous, don't trust it
+        hit = names[i];
+      }
+      return hit;
+    } catch {}
+    return null;
+  }
+
+  // Shadow one method on the instance with a wrapper that divides. The
+  // wrappers declare the same arity as what they wrap, so a later
+  // re-identification finds them exactly where it found the originals.
+  function patchZoomMethod(hook, name, wrap) {
+    const base = hook.camera[name];
+    if (typeof base !== 'function') return false;
+    const own = Object.getOwnPropertyDescriptor(hook.camera, name);
+    try {
+      Object.defineProperty(hook.camera, name, {
+        configurable: true,
+        writable: true,
+        // A prototype method is non-enumerable and stays that way; an own one
+        // (a bundle that stopped using classes) keeps whatever it had.
+        enumerable: own ? own.enumerable : false,
+        value: wrap(base),
+      });
+    } catch {
+      return false;
+    }
+    hook.restore.push({ name, own });
+    return true;
+  }
+
+  function installZoomHook(camera) {
+    const scaleName = cachedCameraScaleFn;
+    const spriteName = findCameraSpriteScaleName(camera);
+    if (!scaleName || !spriteName || scaleName === spriteName) return false;
+    const hook = { camera, factor: 1, scaleName, spriteName, restore: [] };
+    const ok =
+      patchZoomMethod(hook, scaleName,
+        (base) => function () { return base.call(this) / hook.factor; }) &&
+      patchZoomMethod(hook, spriteName,
+        (base) => function (x) { return base.call(this, x) / hook.factor; });
+    if (!ok) {
+      // Half a hook scales positions without scaling the sprites standing in
+      // them, which is worse than no hook at all.
+      restoreZoomMethods(hook);
+      return false;
+    }
+    zoomHook = hook;
+    return true;
+  }
+
+  // Hand the methods back: an own property is put back as it was, a shadowed
+  // prototype method is deleted so the prototype's own shows through again.
+  function restoreZoomMethods(hook) {
+    for (let i = hook.restore.length - 1; i >= 0; i--) {
+      const r = hook.restore[i];
+      try {
+        if (r.own) Object.defineProperty(hook.camera, r.name, r.own);
+        else delete hook.camera[r.name];
+      } catch {}
+    }
+    hook.restore.length = 0;
+  }
+
+  function uninstallZoomHook() {
+    const hook = zoomHook;
+    zoomHook = null;
+    if (hook) restoreZoomMethods(hook);
+  }
+
+  // One frame of zoom. Idle at factor 1 is an arithmetic comparison and
+  // nothing else; once the hook is placed, all a frame does is carry the
+  // slider's current value onto it.
+  function zoomTick() {
+    const want = zoomFactor();
+    const game = capturedGame;
+    const camera = game ? findCameraOnGame(game) : null;
+    // A new round is a new camera, and the hook goes with the old object
+    // rather than being left wrapping methods nothing calls.
+    if (zoomHook && zoomHook.camera !== camera) uninstallZoomHook();
+    if (want === 1) {
+      if (zoomHook) uninstallZoomHook();
+      return;
+    }
+    if (!camera) return;
+    if (!zoomHook) {
+      // Called for its side effect as much as its value: this is what runs
+      // identifyCameraScale, on its own retry cadence, and so what fills
+      // cachedCameraScaleFn and cachedCameraZoomKey.
+      if (!readCameraPxPerUnit(camera)) return;
+      if (!installZoomHook(camera)) return;
+    }
+    zoomHook.factor = want;
+  }
+
+  // `hooked: false` with a camera found means one of the two methods hasn't
+  // been identified — `scaleFn`/`spriteFn` say which — and the view is stock.
+  // `pxPerUnit` is what the game is actually rendering at, divisor included,
+  // so it should be the stock figure over `factor`.
+  window.__zoomDiag = () => {
+    const game = capturedGame;
+    const camera = game ? findCameraOnGame(game) : null;
+    return {
+      factor: zoomFactor(),
+      cameraFound: !!camera,
+      zoomKey: cachedCameraZoomKey,
+      scaleFn: cachedCameraScaleFn,
+      spriteFn: zoomHook ? zoomHook.spriteName
+        : (camera ? findCameraSpriteScaleName(camera) : null),
+      hooked: !!zoomHook && zoomHook.camera === camera,
+      pxPerUnit: camera ? readCameraPxPerUnit(camera) : null,
+    };
+  };
 
   // Standalone zoom logger — fires from sampleLoop unconditionally so we see
   // a value even when buildSample short-circuits (lobby, no roster, no pos).
@@ -958,6 +1200,7 @@
     cachedCameraPpuKey = null;
     cachedCameraZoomKey = null;
     cameraScaleProbedAt = 0;
+    uninstallZoomHook();
   }
 
   function tryCaptureFromCandidate(obj) {
@@ -3936,6 +4179,8 @@
     { id: 'net.renderLag',      store: NETCODE,   key: 'renderLag',      label: 'Playout',   unit: ' tick', min: 0, max: 2,   step: 0.05, decimals: 2 },
     { id: 'hud.ping',           store: PING_UI,   key: 'enabled',        label: 'Ping readout', kind: 'toggle',
       section: 'HUD' },
+    { id: 'zoom.factor',        store: ZOOM,      key: 'factor',         label: 'Zoom',      unit: '\u00d7', min: ZOOM_MIN, max: ZOOM_MAX, step: 0.05, decimals: 2,
+      section: 'Zoom' },
     { id: 'debug.render',       store: DEBUG_RENDER, key: 'enabled',     label: 'Debug', kind: 'toggle',
       section: 'Debug' },
   ];
@@ -12427,6 +12672,7 @@
     // overlay itself off.
     try { debugRenderTick(); } catch {}
     try { espTick(); } catch {}
+    try { zoomTick(); } catch {}
 
     if (!ensureOverlayCanvas()) {
       requestAnimationFrame(overlayFrame);
