@@ -2022,6 +2022,11 @@
     // The user's own left pad, likewise read before the dodge bot replaces it.
     moveTouched: false, userMoveDx: 0, userMoveDy: 0,
 
+    // Tap to aim: whether its readers are installed, and the screen point of
+    // the newest aim finger, left where it lifted the way a cursor is.
+    tapReady: false,
+    tap: { x: 0, y: 0, hasMoved: false },
+
     // What we want the pads to report this frame.
     driveAim: false, owner: null, driveDx: 1, driveDy: 0,
     // A throw's cursor distance in world units, or < 0 to leave the pull alone.
@@ -2091,6 +2096,27 @@
       const res = origMove.call(this, camera);
       try { return touchMoveOverride(this, res); } catch { return res; }
     };
+    // Tap to aim sits one layer further in, on the two readers the methods
+    // above call, so everything they record and override is computed off the
+    // tap layout exactly as it was off the stock one. Looked up rather than
+    // assumed: a bundle without them keeps the stock pads.
+    const origGetAim = t.getAim;
+    const origGetMovement = t.getMovement;
+    if (typeof origGetAim === 'function' && typeof origGetMovement === 'function') {
+      t.getAim = function(isThrowable, camera) {
+        if (TAP_AIM.enabled) {
+          try { const res = tapGetAim(this); if (res) return res; } catch {}
+        }
+        return origGetAim.call(this, isThrowable, camera);
+      };
+      t.getMovement = function(camera) {
+        if (TAP_AIM.enabled) {
+          try { return tapGetMovement(this, camera, origGetMovement); } catch {}
+        }
+        return origGetMovement.call(this, camera);
+      };
+      touchState.tapReady = true;
+    }
     try {
       Object.defineProperty(t, '__elgTouchHooked', { value: true });
     } catch {}
@@ -2243,6 +2269,157 @@
     touchState.moveDy = 0;
   }
 
+  // Tap to aim.
+  //
+  // Stock survev splits the screen down the middle: a finger that lands on the
+  // left half is the movement stick, one on the right half is the aim stick,
+  // and the aim stick only fires once it is pulled most of the way out. This
+  // replaces the right-hand half of that. The stick shrinks to a corner around
+  // its own locked centre, and every other finger is a point on the screen:
+  // the gun points from the player — always drawn at the centre — toward it,
+  // and fires for as long as it is held.
+  //
+  // Which finger is which is decided once, when it lands, and kept until it
+  // lifts:
+  //
+  //   * in the corner, with no stick finger already down: the stick;
+  //   * anywhere else, or anywhere at all while the stick is held: aim + fire.
+  //
+  // So a thumb that drifts out of the corner mid-walk is still walking, and a
+  // second finger that lands in the corner while the first is walking shoots.
+  //
+  // Everything downstream reads the result through the same pad reading it
+  // always did, so the input overrides above, autoshoot, frag aim and
+  // auto-quickswap need nothing new. What does change is what "pointing at"
+  // means — a point with a radius instead of a bearing with a cone, see userAim
+  // — and what a walled-off target does to the trigger, see
+  // touchShotSuppressed.
+  const TAP_AIM = {
+    enabled: 1,
+    // The stick's corner, in pad ranges out from the locked pad centre: that
+    // far right of it and above it, and out to the screen edge the other ways.
+    zone: 2,
+    // How near the finger, in world units, an enemy has to be for the aim
+    // helper to take the shot. Once one is, it widens by TAP_RADIUS_EXIT_MULT
+    // for TOUCH_CONE.holdMs, for the same reason the cone widens.
+    radius: 5,
+  };
+  const TAP_RADIUS_EXIT_MULT = 1.5;
+  window.__tapAim = TAP_AIM;
+
+  // Whether target selection should treat the user as pointing with a tap.
+  function tapAimActive() {
+    return !!TAP_AIM.enabled && touchState.tapReady && touchActive();
+  }
+
+  // Finger → 'move' | 'aim'. Weak, so a finger the game splices out once it
+  // lifts takes its entry with it.
+  const tapRoles = new WeakMap();
+
+  function tapInStickZone(pads, p) {
+    const c = pads.leftLockedPadCenter;
+    if (!c || !p) return false;
+    const reach = touchPadRange(pads) * TAP_AIM.zone;
+    // Never past the middle: the stock reader still decides whether a finger
+    // is on the stick's half, and it only takes the left one.
+    const right = Math.min(c.x + reach, window.innerWidth * 0.5);
+    return p.x < right && p.y >= c.y - reach;
+  }
+
+  // Give every finger that has landed since last frame its role, and return
+  // the game's finger list, or null if there isn't one to read.
+  function tapClassify(pads) {
+    const touches = pads?.input?.touches;
+    if (!Array.isArray(touches)) return null;
+    let stick = false;
+    for (let i = 0; i < touches.length; i++) {
+      const t = touches[i];
+      if (!t.isDead && tapRoles.get(t) === 'move') { stick = true; break; }
+    }
+    for (let i = 0; i < touches.length; i++) {
+      const t = touches[i];
+      if (t.isDead || tapRoles.has(t)) continue;
+      const role = !stick && tapInStickZone(pads, t.posDown) ? 'move' : 'aim';
+      tapRoles.set(t, role);
+      if (role === 'move') stick = true;
+    }
+    return touches;
+  }
+
+  // The stick, read by the stock reader over the stick finger alone. Handing
+  // it a one-finger list rather than redoing its arithmetic keeps the analog
+  // curve, the dead zone, the locked/anywhere style and the pad sprite the
+  // game's own.
+  const tapStickInput = { touches: [] };
+  function tapGetMovement(pads, camera, orig) {
+    const touches = tapClassify(pads);
+    if (!touches) return orig.call(pads, camera);
+    const list = tapStickInput.touches;
+    list.length = 0;
+    for (let i = 0; i < touches.length; i++) {
+      const t = touches[i];
+      if (!t.isDead && tapRoles.get(t) === 'move') { list.push(t); break; }
+    }
+    const input = pads.input;
+    pads.input = tapStickInput;
+    try {
+      return orig.call(pads, camera);
+    } finally {
+      pads.input = input;
+      list.length = 0;
+    }
+  }
+
+  // The aim, off the newest aim finger, so a second tap redirects the shot
+  // without the first having to lift. The bearing is from the middle of the
+  // screen to the finger; the pull is the finger's distance in world units put
+  // through the throttle the input message decodes, so a grenade is thrown to
+  // where the finger is, out to the pad's 18u ceiling; and the trigger is
+  // simply that the finger is down. For a throwable that makes the cook last
+  // exactly as long as the hold, which is what the stock sticky rule was for.
+  function tapGetAim(pads) {
+    const touches = tapClassify(pads);
+    if (!touches || !pads.aimMovement) return null;
+    let finger = null;
+    for (let i = touches.length - 1; i >= 0; i--) {
+      const t = touches[i];
+      if (!t.isDead && tapRoles.get(t) === 'aim') { finger = t; break; }
+    }
+    const touched = !!finger;
+    if (finger) {
+      const tap = touchState.tap;
+      tap.x = finger.pos.x;
+      tap.y = finger.pos.y;
+      tap.hasMoved = true;
+      const px = finger.pos.x - window.innerWidth * 0.5;
+      const py = window.innerHeight * 0.5 - finger.pos.y;
+      const len = Math.hypot(px, py);
+      const scale = getLivePxPerWorldUnit(pageSamples[pageSamples.length - 1]);
+      const units = scale > 0 ? len / scale : 0;
+      const prev = pads.aimMovement.toAimDir;
+      pads.aimMovement = {
+        // A finger right on the player has no bearing; keep the last one.
+        toAimDir: len > 1e-5 ? { x: px / len, y: py / len } : { x: prev.x, y: prev.y },
+        toAimLen: touchPadRange(pads) * Math.min(units / PROJ_MAX_MOUSE_DIST, 1),
+      };
+    }
+    pads.shotDetectedOld = pads.shotDetected;
+    pads.shotDetected = touched;
+    pads.touchingAim = touched;
+    // The right pad's sprites follow the finger rather than sitting on a stick
+    // that no longer does anything, and go off screen with no finger down.
+    const pad = pads.touchPads?.[1];
+    if (pad && pad.touchPos) {
+      const x = touched ? finger.pos.x : -1e4;
+      const y = touched ? finger.pos.y : -1e4;
+      pad.touched = touched;
+      pad.centerPos = { x, y };
+      pad.touchPos.x = x;
+      pad.touchPos.y = y;
+    }
+    return { aimMovement: pads.aimMovement, touched };
+  }
+
   // The user's own trigger, whatever the device gives them to pull it with: a
   // mouse button or a controller, through the bind layer; or a thumb far enough
   // out on the aim pad that survev's own `shotDetected` goes up. The pad half
@@ -2310,12 +2487,18 @@
   // going to fire there, and the crate in the way is exactly what the user
   // wants to shoot. That verdict comes off the aim loop's own solve rather
   // than a second one here — see aimCoverOnly.
+  //
+  // With tap to aim, any wall hands it back, not just a crate. A stick with
+  // nobody to shoot has only a bearing to fire along, and firing along it into
+  // a wall is the thing the handoff was built to stop; a tap is a place the
+  // user asked to shoot, so declining the enemy leaves that as the shot.
   function touchShotSuppressed(player) {
     if (!AIMBOT.enabled || !AUTOSHOOT.enabled) return false;
     const weapon = getCurrentWeapon(player);
     if (!weapon || GUN_FIRE_DELAY[weapon] === undefined) return false;
     const target = touchConeTarget();
-    return !!target && !aimCoverOnly(target.id);
+    if (!target) return false;
+    return tapAimActive() ? !aimBlocked(target.id) : !aimCoverOnly(target.id);
   }
 
   // The enemy the aim helper would pick right now, cone included, or null.
@@ -3387,6 +3570,9 @@
     // and when that was last solved. See aimCoverOnly.
     coverId: null,
     coverAt: 0,
+    // The picked enemy when there is no shot on them at all, whatever is in
+    // the way; solved alongside coverId. See aimBlocked.
+    blockedId: null,
   };
 
   // How long the aim loop's cover verdict stands in for a fresh one: a few
@@ -3401,6 +3587,13 @@
   // which keeps the trigger autoshoot's, the conservative default.
   function aimCoverOnly(id) {
     return aimState.coverId != null && aimState.coverId === id
+      && performance.now() - aimState.coverAt < AIM_COVER_STALE_MS;
+  }
+
+  // Whether the aim loop's latest solve found no shot on `id` at all. The
+  // tap trigger's counterpart to aimCoverOnly, with the same no-verdict answer.
+  function aimBlocked(id) {
+    return aimState.blockedId != null && aimState.blockedId === id
       && performance.now() - aimState.coverAt < AIM_COVER_STALE_MS;
   }
 
@@ -3444,10 +3637,17 @@
   // question can only be scored as an angle. Projecting the bearing out to some
   // invented radius instead would pick whichever enemy happened to be standing
   // at that radius.
-  const userAimOut = { angular: false, x: 0, y: 0, dx: 1, dy: 0, theta: 0 };
+  //
+  // Tap to aim puts it back to a point: a tap is a place on the screen exactly
+  // as a cursor is, and like a cursor it stays where it was last put down once
+  // the finger lifts. `tap` marks it, so selection can hold it to TAP_AIM's
+  // radius where a cursor has no limit.
+  const userAimOut = { angular: false, tap: false, x: 0, y: 0, dx: 1, dy: 0, theta: 0 };
   function userAim(player) {
     const o = userAimOut;
-    if (touchActive()) {
+    const tap = tapAimActive();
+    o.tap = tap;
+    if (touchActive() && !tap) {
       o.angular = true;
       const len = Math.hypot(touchState.aimDx, touchState.aimDy);
       o.dx = len > 1e-6 ? touchState.aimDx / len : 1;
@@ -3459,9 +3659,10 @@
     }
     o.angular = false;
     const scale = getLivePxPerWorldUnit(pageSamples[pageSamples.length - 1]);
-    if (realMouse.hasMoved && scale > 0) {
-      o.x = player.x + (realMouse.x - window.innerWidth / 2) / scale;
-      o.y = player.y - (realMouse.y - window.innerHeight / 2) / scale;
+    const pointer = tap ? touchState.tap : realMouse;
+    if (pointer.hasMoved && scale > 0) {
+      o.x = player.x + (pointer.x - window.innerWidth / 2) / scale;
+      o.y = player.y - (pointer.y - window.innerHeight / 2) / scale;
     } else {
       // Before the mouse has ever moved there is nothing to point with, and our
       // own feet are what every path here has always fallen back to.
@@ -3519,10 +3720,18 @@
   // Whether a pad score — radians off the bearing — is inside the cone, and
   // widen it for the frames that follow if so. Every pickTarget caller shares
   // the one hold, so the aim, the trigger and the overlay's ring agree on it.
-  function touchConeAdmits(score) {
+  // A tap's score is a squared distance from the finger instead, held to
+  // TAP_AIM's radius the same way.
+  function touchConeAdmits(aim, score) {
     const t = performance.now();
     const held = t - touchConeHeldAt < TOUCH_CONE.holdMs;
-    const limit = (held ? TOUCH_CONE.exitDeg : TOUCH_CONE.enterDeg) * Math.PI / 180;
+    let limit;
+    if (aim.tap) {
+      const r = TAP_AIM.radius * (held ? TAP_RADIUS_EXIT_MULT : 1);
+      limit = r * r;
+    } else {
+      limit = (held ? TOUCH_CONE.exitDeg : TOUCH_CONE.enterDeg) * Math.PI / 180;
+    }
     if (!(score <= limit)) return false;
     touchConeHeldAt = t;
     return true;
@@ -3530,7 +3739,7 @@
 
   // Pick the enemy the user is pointing at: the best-scoring live, reachable,
   // non-whitelisted one, by whichever of the two scores this device uses — and
-  // on a pad, only if that one is inside TOUCH_CONE.
+  // on a pad, only if that one is inside TOUCH_CONE, or TAP_AIM's radius.
   function pickTarget(player, enemies, now) {
     const candidates = [];
     for (const e of enemies) {
@@ -3554,7 +3763,7 @@
       const s = scoreOf(candidates[i]);
       if (s < bestScore) { bestScore = s; best = candidates[i]; }
     }
-    if (aim.angular && !touchConeAdmits(bestScore)) return [null, 0];
+    if ((aim.angular || aim.tap) && !touchConeAdmits(aim, bestScore)) return [null, 0];
     return [best, dist(player, best)];
   }
 
@@ -3821,6 +4030,7 @@
     aimState.coverId = (tgt && tgt.blocked && blockedOnlyByDestructibles(
       tgt.fromX, tgt.fromY, tgt.x, tgt.y, player.layer, PLAYER_RADIUS,
     )) ? enemy.id : null;
+    aimState.blockedId = (tgt && tgt.blocked) ? enemy.id : null;
     aimState.coverAt = performance.now();
 
     if (engage) {
@@ -3921,6 +4131,7 @@
     aimState.aimY = null;
     aimState.lastFrameAt = 0;
     aimState.coverId = null;
+    aimState.blockedId = null;
   }
 
   // Whether the aim helper is on this frame. On a desktop that is the bind
@@ -4242,6 +4453,10 @@
     { id: 'aimbot.whitelist', store: AIM_WHITELIST, key: 'names', label: 'Never aim at',
       kind: 'textarea', rows: 4, maxLength: WHITELIST_MAX_CHARS,
       placeholder: 'One player name per line' },
+    { id: 'tap.enabled',  store: TAP_AIM, key: 'enabled', label: 'Tap to aim', kind: 'toggle',
+      section: 'Touch', touchOnly: true },
+    { id: 'tap.zone',     store: TAP_AIM, key: 'zone',    label: 'Stick zone', unit: '×', min: 1, max: 4,  step: 0.25, decimals: 2, touchOnly: true },
+    { id: 'tap.radius',   store: TAP_AIM, key: 'radius',  label: 'Snap radius', unit: 'u',     min: 1, max: 15, step: 0.5,  decimals: 1, touchOnly: true },
     { id: 'esp.enabled',  store: ESP,    key: 'enabled', label: 'ESP overlay', kind: 'toggle',
       section: 'ESP' },
     { id: 'esp.losDim',   store: ESP,    key: 'losDim',  label: 'Dim blocked', kind: 'toggle' },
@@ -4553,7 +4768,11 @@
     list.id = ELG_LIST_ID;
     pane.appendChild(list);
 
+    // The mirror image of the keybind row below: controls only a touchscreen
+    // can use. A touch-capable laptop gets them too, which is harmless.
+    const touchDevice = IS_MOBILE_DEVICE || touchActive() || navigator.maxTouchPoints > 0;
     for (const spec of SETTINGS_SPECS) {
+      if (spec.touchOnly && !touchDevice) continue;
       if (spec.section) {
         const heading = document.createElement('p');
         heading.className = 'slider-text elg-heading';

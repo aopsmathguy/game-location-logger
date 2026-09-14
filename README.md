@@ -111,9 +111,14 @@ by default — none of them touches input or gameplay state.
   (see `docs/sample.json` for the schema).
 - **Mobile** — the aim helper, autoshoot, auto-quickswap, frag aim and the
   dodge bot all work on a touch device, where survev builds its input message
-  from two virtual pads instead of from a mouse and four keys. There is no key
-  to hold, so the **shot is the switch**: pulling the right pad far enough to
-  fire turns the aim helper and autoshoot on together, and is also what
+  from two virtual pads instead of from a mouse and four keys. By default the
+  right pad is replaced by **tap to aim**: hold a finger anywhere to shoot at
+  that spot, with the movement stick shrunk to the bottom-left corner. The aim
+  helper snaps to an enemy within a few units of the finger when there is a
+  line of sight, and otherwise the shot goes where you tap. With it switched
+  off in the MOD tab, the stock pads return. There is no key
+  to hold, so the **shot is the switch**: holding a tap, or pulling the stock
+  right pad far enough to fire, turns the aim helper and autoshoot on together, and is also what
   auto-quickswap takes as the trigger pull. The pull is *only* an activation —
   autoshoot owns the trigger from there, so the gun stays silent when there is
   no shot on, exactly as holding the bind does on a desktop. The dodge bot

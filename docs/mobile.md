@@ -174,6 +174,76 @@ recovery is the right move either way. What the swap can't survive is a pad
 trigger and autoshoot both firing on the same message, and ownership is still
 exclusive frame by frame.
 
+# Tap to aim
+
+On by default, and switchable in the MOD tab's **Touch** section. It replaces
+the right-hand stick: **hold a finger anywhere and the gun fires at that spot**.
+The movement stick shrinks to a corner around its own locked centre.
+
+Each finger gets a role when it lands and keeps it until it lifts:
+
+| where it lands | the stick is | role |
+| --- | --- | --- |
+| in the corner | free | the stick |
+| in the corner | already held | aim + fire |
+| anywhere else | either | aim + fire |
+
+So a thumb that drifts out of the corner mid-walk keeps walking, and a finger
+that slides into the corner keeps shooting. With several aim fingers down, the
+newest one is aimed at.
+
+The corner is `zone` (default 2) pad ranges right of and above the locked pad
+centre, out to the screen edges the other two ways. It follows the game's own
+layout, so portrait and the iOS offsets move it with the pad. It never reaches
+past the middle of the screen, because the stock reader still decides whether a
+finger is on the stick's half.
+
+## How it is wired
+
+It hooks one layer below the pad hooks: `getAim` and `getMovement`, the two
+readers that `getAimMovement` and `getTouchMovement` call. Everything above
+them (the recorded user aim, the driven bearing, the shot suppression, the dodge
+override) runs unchanged on what the tap layer returns.
+
+- **The stick** is the stock `getMovement`, handed a one-finger `input` for the
+  duration of the call. The analog curve, dead zone, locked/anywhere style and
+  pad sprite all stay the game's own.
+- **The aim** is written fresh. The bearing runs from the centre of the screen,
+  where the player is drawn, to the finger. `shotDetected` is simply "an aim
+  finger is down". The pull is the finger's distance in world units, encoded
+  through the same throttle frag aim inverts, so **a grenade is thrown to where
+  you tap**, out to the pad's 18u ceiling, and it cooks for exactly as long as
+  you hold. The right pad's sprites are drawn under the finger.
+
+## Selection: a radius, not a cone
+
+A tap is a point, as a cursor is, so `userAim` goes back to returning one.
+`userAimScore` is the squared distance from the finger again. The limit on it is
+**distance, not angle**: an enemy is only picked within `radius` world units of
+the finger (default 5, widening 1.5× under the same `holdMs` hold the cone
+uses). A player dead on the finger's bearing but far past it is not picked, and
+one at a wide angle right next to the finger is.
+
+## The trigger: the enemy's if there is a shot, the finger's if not
+
+Ownership works as it does on the stick: autoshoot takes the trigger while there
+is a target. The difference is what a walled-off target does. On the stick only
+destructible cover hands the trigger back, because with nobody to shoot the
+stick has only a bearing to fire along. A tap is a place you asked to shoot, so
+**any** block hands it back. The aim loop records `blockedId` next to `coverId`,
+and `aimBlocked` reads it with the same 100ms staleness rule. With no verdict
+yet, on the first frame of a tap, the trigger stays autoshoot's.
+
+In practice:
+
+| | what fires, and where |
+| --- | --- |
+| aimbot off | the finger, at the finger |
+| nobody within the radius | the finger, at the finger |
+| an enemy within it, in line of sight | autoshoot, at the enemy |
+| an enemy within it, walled off | the finger, at the finger |
+| aimbot on, autoshoot off, enemy in sight | the finger, at the enemy |
+
 # Driving the aim
 
 A driven frame **claims the pad**, returning `touched: true` whatever the user's

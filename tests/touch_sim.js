@@ -107,6 +107,10 @@ const elg = eval(`(function () {
   const dodgeDirIndex = () => 0;
   const realBindDown = (binds, input) => !!(binds && binds.realDown(input));
   let capturedGame = null;
+  ${grabBlock('TAP_AIM', '};')}
+  ${grabLine('TAP_RADIUS_EXIT_MULT')}
+  ${grabLine('tapRoles')}
+  ${grabLine('tapStickInput')}
   ${grabBlock('touchState', '};')}
   ${grabLine('touchAimOut')}
   ${grabLine('touchMoveOut')}
@@ -127,6 +131,11 @@ const elg = eval(`(function () {
   ${extract('touchReleaseAim')}
   ${extract('touchDriveMove')}
   ${extract('touchReleaseMove')}
+  ${extract('tapAimActive')}
+  ${extract('tapInStickZone')}
+  ${extract('tapClassify')}
+  ${extract('tapGetMovement')}
+  ${extract('tapGetAim')}
   const PLAYER_NET = 'netData';
   const NET_WEAPON = 'activeWeapon';
   const PLAYER_LOC = 'localData';
@@ -152,6 +161,7 @@ const elg = eval(`(function () {
   ${extract('touchConeAdmits')}
   ${extract('pickTarget')}
   ${extract('aimCoverOnly')}
+  ${extract('aimBlocked')}
   ${extract('touchConeTarget')}
   // The cover sweep, over the scenario's obstacles.
   const getObstacles = () => env.obstacles;
@@ -184,6 +194,9 @@ const elg = eval(`(function () {
     swaps: () => swapsQueued,
     resetSwaps: () => { swapsQueued = 0; autoSwapFireWasDown = false; },
     setAutoSwapEnabled: (v) => { AUTO_SWAP.enabled = v; },
+    TAP_AIM,
+    tapAimActive,
+    resetTap: () => { touchState.tap.x = 0; touchState.tap.y = 0; touchState.tap.hasMoved = false; },
     touchState, DODGE_DIRS, TOUCH_CONE, aimState, AIM_COVER_STALE_MS,
     ensureTouchHook, touchActive, touchDriveAim, touchReleaseAim,
     touchDriveMove, touchReleaseMove, userFireDown,
@@ -240,14 +253,21 @@ class TouchInput {
     this.rightLockedPadCenter = { x: 680, y: 480 };
     this.moveStyle = 'locked';
     this.aimStyle = 'locked';
-    this.touches = [];   // { pos, posDown, isDead }
+    // The fingers live on the game's InputHandler, not on the pads.
+    this.input = { touches: [] };   // { pos, posDown, isDead }
+    const pad = () => ({ touched: false, centerPos: { x: 0, y: 0 }, touchPos: { x: 0, y: 0 } });
+    this.touchPads = [pad(), pad()];
   }
+
+  // Shorthand for the scenarios below.
+  get touches() { return this.input.touches; }
+  set touches(v) { this.input.touches = v; }
 
   isLeftSideTouch(x, camera) { return x < camera.width * 0.5; }
 
   getMovement(camera) {
     this.moveDetected = false;
-    for (const t of this.touches) {
+    for (const t of this.input.touches) {
       if (t.isDead || !this.isLeftSideTouch(t.posDown.x, camera)) continue;
       const center = this.moveStyle === 'anywhere' ? t.posDown : this.leftLockedPadCenter;
       const a = vsub(t.pos, center);
@@ -265,7 +285,7 @@ class TouchInput {
 
   getAim(isThrowable, camera) {
     let touched = false;
-    for (const t of this.touches) {
+    for (const t of this.input.touches) {
       if (t.isDead || this.isLeftSideTouch(t.posDown.x, camera)) continue;
       const center = this.aimStyle === 'anywhere' ? t.posDown : this.rightLockedPadCenter;
       const d = vsub(t.pos, center);
@@ -375,6 +395,10 @@ function newScene() {
   elg.setField(null);
   elg.resetCone();
   elg.aimState.coverId = null;
+  elg.aimState.blockedId = null;
+  // Sections 1–12 are the stock pads; tap to aim has its own section below.
+  elg.TAP_AIM.enabled = 0;
+  elg.resetTap();
   elg.setGame(game);
   env.binds = binds;
   elg.ensureTouchHook(game);
@@ -977,6 +1001,218 @@ const ME = { x: 0, y: 0, layer: 0 };
   ok('device: the desktop path still reads the cursor as a world point',
      aim.angular === false && near(aim.x, 13, 1e-9) && near(aim.y, 14, 1e-9),
      `cursor resolved to (${aim.x.toFixed(2)}, ${aim.y.toFixed(2)}) from player (10, 10)`);
+}
+
+// ---- 13. Tap to aim -----------------------------------------------------
+//
+// The stick shrinks to a corner and every other finger is a point to shoot
+// at. The scene's screen is 800x600 with the player drawn at (400, 300), at
+// env.scale px per world unit; the stick's locked centre is (120, 480) with a
+// 48px range, so at zone 2 the corner is x < 216, y >= 384.
+
+{
+  const scene = newScene();
+  elg.TAP_AIM.enabled = 1;
+  const deg = (r) => (r * 180 / Math.PI).toFixed(1);
+  // A finger kept as one object for as long as it is down, as the game does.
+  const down = (x, y) => ({ pos: { x, y }, posDown: { x, y }, isDead: false });
+  const moveTo = (f, x, y) => { f.pos.x = x; f.pos.y = y; };
+  const fingers = (...fs) => { scene.touch.touches = fs; };
+  // The world bearing from the player to a screen point.
+  const bearingTo = (x, y) => Math.atan2(300 - y, x - 400);
+
+  fingers(down(460, 220));
+  let msg = frame(scene, GUN);
+  ok('tap: a finger on the right aims straight at itself',
+     angDiff(bearingOf(msg.toMouseDir), bearingTo(460, 220)) < 1e-9,
+     `aimed ${deg(bearingOf(msg.toMouseDir))}°, finger at ${deg(bearingTo(460, 220))}°`);
+  ok('tap: ...and fires with no pull at all', msg.shootHold === true && elg.userFireDown() === true,
+     'the hold is the trigger and the activation both');
+  ok('tap: aim mode is on while the pads are being read', elg.tapAimActive() === true, '');
+
+  fingers(down(100, 100));
+  msg = frame(scene, GUN);
+  ok('tap: the left half outside the corner is aim + fire too',
+     msg.shootHold === true && msg.touchMoveLen === 0 &&
+     angDiff(bearingOf(msg.toMouseDir), bearingTo(100, 100)) < 1e-9,
+     `aimed ${deg(bearingOf(msg.toMouseDir))}° with no movement`);
+
+  fingers();
+  msg = frame(scene, GUN);
+  ok('tap: lifting the finger stops firing', msg.shootHold === false, '');
+
+  // The corner, with nothing on the stick.
+  const stick = down(160, 480);
+  fingers(stick);
+  msg = frame(scene, GUN);
+  let v = serverVelocity(msg);
+  ok('stick: a finger in the corner with the stick free walks',
+     vlen(v) > 1 && angDiff(bearingOf(v), 0) < 1e-6 && msg.shootHold === false,
+     `walking ${deg(bearingOf(v))}° at ${vlen(v).toFixed(2)}u/s, not firing`);
+
+  // A second finger in the corner while the first is walking is a shot.
+  const second = down(100, 500);
+  fingers(stick, second);
+  msg = frame(scene, GUN);
+  v = serverVelocity(msg);
+  ok('stick: with the stick held, a finger in the corner shoots instead',
+     msg.shootHold === true && angDiff(bearingOf(msg.toMouseDir), bearingTo(100, 500)) < 1e-9 &&
+     angDiff(bearingOf(v), 0) < 1e-6,
+     `aimed ${deg(bearingOf(msg.toMouseDir))}° while still walking east`);
+
+  // The walking thumb drifting out of the corner keeps walking.
+  fingers(stick);
+  moveTo(stick, 300, 480);
+  msg = frame(scene, GUN);
+  v = serverVelocity(msg);
+  ok('stick: a thumb that drifts out of the corner is still the stick',
+     vlen(v) > 1 && msg.shootHold === false,
+     `thumb at (300, 480), walking ${deg(bearingOf(v))}°`);
+  moveTo(stick, 160, 480);
+
+  // A role is kept for the life of the finger: an aim finger that slides into
+  // the corner still shoots, and one that landed there while the stick was
+  // held still shoots once the stick lifts.
+  const slider = down(600, 300);
+  fingers(slider);
+  frame(scene, GUN);
+  moveTo(slider, 100, 520);
+  msg = frame(scene, GUN);
+  ok('roles: an aim finger that slides into the corner is still aim',
+     msg.shootHold === true && msg.touchMoveLen === 0, '');
+  fingers(second);
+  msg = frame(scene, GUN);
+  ok('roles: a finger that landed in the corner while the stick was held stays aim',
+     msg.shootHold === true && msg.touchMoveLen === 0, 'stick lifted, the other finger never became it');
+
+  // Two aim fingers: the newest wins.
+  const first = down(700, 300);
+  fingers(first);
+  frame(scene, GUN);
+  fingers(first, down(400, 100));
+  msg = frame(scene, GUN);
+  ok('tap: the newest aim finger is the one aimed at',
+     angDiff(bearingOf(msg.toMouseDir), Math.PI / 2) < 1e-9,
+     `aimed ${deg(bearingOf(msg.toMouseDir))}°`);
+
+  // The corner never reaches past the middle, where the stock reader would
+  // refuse the finger as a stick anyway.
+  elg.TAP_AIM.zone = 10;
+  fingers(down(450, 590));
+  msg = frame(scene, GUN);
+  ok('stick: the corner stops at the middle of the screen however large',
+     msg.shootHold === true && msg.touchMoveLen === 0, 'a finger at (450, 590) with zone 10');
+  elg.TAP_AIM.zone = 2;
+
+  // The pad sprite follows the finger and leaves with it.
+  fingers(down(520, 260));
+  frame(scene, GUN);
+  const pad = scene.touch.touchPads[1];
+  ok('tap: the right pad is drawn under the finger',
+     pad.touched && pad.centerPos.x === 520 && pad.touchPos.y === 260, '');
+  fingers();
+  frame(scene, GUN);
+  ok('tap: ...and off screen once it lifts', !pad.touched && pad.centerPos.x < -1000, '');
+
+  // A grenade goes where the finger is, out to the pad's ceiling, and cooks
+  // exactly as long as the finger is down.
+  const scale = env.scale;
+  fingers(down(400 + 9 * scale, 300));
+  msg = frame(scene, NADE);
+  ok('frag: a tap 9u out throws 9u', near(msg.toMouseLen, 9, 1e-9) && scene.touch.shotDetected,
+     `wire carried ${msg.toMouseLen.toFixed(3)}u with the cook up`);
+  fingers(down(400, 300 - 25 * scale));
+  msg = frame(scene, NADE);
+  ok('frag: a tap past 18u throws the full 18u', near(msg.toMouseLen, PROJ_MAX_MOUSE_DIST, 1e-9),
+     `wire carried ${msg.toMouseLen.toFixed(3)}u`);
+  fingers();
+  frame(scene, NADE);
+  ok('frag: lifting throws', scene.touch.shotDetected === false, '');
+
+  // Auto-quickswap's trigger edge is one per tap.
+  elg.resetSwaps();
+  const tapFrame = (f) => { fingers(...(f ? [f] : [])); frame(scene); elg.autoSwapFrameTick(); };
+  const held = down(600, 200);
+  tapFrame(null);
+  tapFrame(held);
+  for (let i = 0; i < 5; i++) tapFrame(held);
+  tapFrame(null);
+  tapFrame(down(600, 200));
+  ok('auto-quickswap: each tap is one trigger pull', elg.swaps() === 2,
+     `${elg.swaps()} queued off two taps, one held for 6 frames`);
+
+  // ---- Selection: distance from the finger, not angle off it ----
+  fingers(down(400 + 8 * scale, 300));   // the finger is at world (8, 0)
+  frame(scene, GUN);
+  const aim = elg.userAim(ME);
+  ok('select: a tap is a world point, not a bearing',
+     aim.angular === false && aim.tap === true && near(aim.x, 8, 1e-9) && near(aim.y, 0, 1e-9),
+     `resolved to (${aim.x.toFixed(2)}, ${aim.y.toFixed(2)})`);
+
+  const pick = (e) => elg.pickTarget(ME, [e], Date.now())[0];
+  const r = elg.TAP_AIM.radius;
+  elg.resetCone();
+  ok('select: an enemy within the radius of the finger is picked',
+     pick({ id: 1, x: 8, y: r - 1 }) !== null, `${r - 1}u from the finger`);
+  elg.resetCone();
+  ok('select: one far down the same bearing is not',
+     pick({ id: 1, x: 8 + r + 4, y: 0 }) === null, `dead on the bearing, ${r + 4}u past the finger`);
+  elg.resetCone();
+  ok('select: a wide angle off the bearing is fine if the finger is close',
+     pick({ id: 1, x: 3, y: 3 }) === null && pick({ id: 1, x: 5, y: 3 }) !== null,
+     '(5, 3) is 31° off the bearing and 4.2u from the finger');
+
+  elg.resetCone();
+  const mid = r * (1 + 1.5) / 2;
+  pick({ id: 1, x: 8, y: r - 1 });
+  ok('select: once engaged, it holds out to the wider exit radius',
+     pick({ id: 1, x: 8, y: mid }) !== null, `${mid}u from the finger`);
+  elg.resetCone();
+  ok('select: ...which is not where an engagement starts',
+     pick({ id: 1, x: 8, y: mid }) === null, `${mid}u cold`);
+
+  // ---- The trigger: the enemy's if there is a shot, the finger's if not ----
+  const pullAt = (enemy) => {
+    elg.setField(ME, enemy ? [enemy] : []);
+    fingers(down(400 + 8 * scale, 300));
+    return frame(scene, GUN);
+  };
+  elg.resetCone();
+  ok('trigger: nobody near the finger, the finger fires', pullAt({ id: 1, x: 30, y: 30 }).shootHold === true, '');
+  elg.resetCone();
+  ok('trigger: someone near it, autoshoot takes it',
+     pullAt({ id: 1, x: 9, y: 1 }).shootHold === false, 'no verdict yet: the conservative default');
+
+  elg.aimState.blockedId = 1;
+  elg.aimState.coverAt = performance.now();
+  ok('trigger: a wall between us hands it back to the finger',
+     pullAt({ id: 1, x: 9, y: 1 }).shootHold === true, 'any cover, not only destructible');
+  elg.aimState.coverAt = performance.now() - (elg.AIM_COVER_STALE_MS + 10);
+  ok('trigger: ...but not off a stale verdict', pullAt({ id: 1, x: 9, y: 1 }).shootHold === false, '');
+  elg.aimState.coverAt = performance.now();
+  elg.aimState.blockedId = 2;
+  ok('trigger: ...or one about somebody else', pullAt({ id: 1, x: 9, y: 1 }).shootHold === false, '');
+  elg.aimState.blockedId = null;
+
+  elg.setAimbotEnabled(0);
+  ok('trigger: with the aimbot off the finger always fires', pullAt({ id: 1, x: 9, y: 1 }).shootHold === true, '');
+  elg.setAimbotEnabled(1);
+
+  // The aim helper's bearing still wins the pad over the finger's.
+  elg.touchDriveAim('aim', 0, -1);
+  msg = pullAt({ id: 1, x: 9, y: 1 });
+  ok('drive: a driven bearing overrides the finger\'s',
+     angDiff(bearingOf(msg.toMouseDir), -Math.PI / 2) < 1e-9, `aimed ${deg(bearingOf(msg.toMouseDir))}°`);
+  elg.touchReleaseAim('aim');
+  elg.setField(null);
+
+  // Switching it off is the stock pads again: a light touch on the right pad
+  // aims without firing.
+  elg.TAP_AIM.enabled = 0;
+  fingers(finger(scene.touch.rightLockedPadCenter, 0.4, 10));
+  msg = frame(scene, GUN);
+  ok('off: switching tap to aim off restores the stock right stick',
+     msg.shootHold === false && elg.userAim(ME).angular === true, 'a 10px pull aims and does not fire');
 }
 
 // ---- Report -------------------------------------------------------------
