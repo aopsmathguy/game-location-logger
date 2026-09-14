@@ -12279,6 +12279,21 @@
   const PING_GOOD_MS = 60;
   const PING_OK_MS = 120;
 
+  // survev's own phone-layout media query, copied from its stylesheet. Under it
+  // `#ui-team` is `position: fixed` with no `top` in landscape, so it sits at
+  // its static position — right where an in-flow readout above it would push
+  // it down onto the counters below — and in portrait the health bar runs along
+  // the top edge where the readout would be drawn. So on that layout the
+  // readout is taken out of flow and set beside the team panel instead, which
+  // is clear in both orientations.
+  const PING_PHONE_MQ = (() => {
+    try { return window.matchMedia('(max-width:850px),(max-width:900px) and (min-resolution:3x)'); } catch { return null; }
+  })();
+  // Past the right edge of the team panel: clear of the 24px downed/dead icon
+  // survev hangs off each row's right side.
+  const PING_PHONE_GAP = 30;
+  const PING_PLACE_MS = 500;
+
   const pingState = {
     el: null,
     dot: null,
@@ -12290,6 +12305,8 @@
     lastText: null,      // last string written, so an unchanged tick writes nothing
     lastDot: null,
     currentMs: null,
+    phone: false,        // which layout the element was built for
+    placedAt: -Infinity, // performance.now() of the last phone-layout placement
   };
 
   // Pull any new RTT samples out of the game's own array. survev sorts it and
@@ -12342,13 +12359,23 @@
   function ensurePingEl() {
     const host = document.getElementById('ui-top-left');
     if (!host) return null;
-    if (pingState.el && pingState.el.isConnected && pingState.el.parentElement === host) {
+    const phone = !!PING_PHONE_MQ?.matches;
+    if (pingState.el && pingState.el.isConnected && pingState.el.parentElement === host
+        && pingState.phone === phone) {
       return pingState.el;
     }
+    // Rotating the phone across the breakpoint changes which layout applies;
+    // rebuild rather than patch the one style that differs.
+    if (pingState.el) pingState.el.remove();
     const el = document.createElement('div');
     el.style.cssText = [
       'display:flex', 'align-items:center', 'gap:6px',
-      'margin:0 0 4px 2px', 'padding:0',
+      // On the phone layout: out of flow, so nothing in #ui-top-left moves.
+      // Still inside it, so it scales and hides with the rest of the HUD.
+      ...(phone
+        ? ['position:absolute', 'left:0', 'top:0', 'margin:0']
+        : ['margin:0 0 4px 2px']),
+      'padding:0',
       'font:700 13px/1.2 system-ui,sans-serif',
       'color:#fff', 'text-shadow:0 1px 2px rgba(0,0,0,0.9)',
       'pointer-events:none', 'user-select:none', 'white-space:nowrap',
@@ -12367,12 +12394,36 @@
     pingState.el = el;
     pingState.dot = dot;
     pingState.text = text;
+    pingState.phone = phone;
+    pingState.placedAt = -Infinity;
     // Fresh nodes carry none of the old ones' content, so the write cache in
     // updatePingUI has to be dropped with them or the rebuilt readout would
     // stay blank until the string happened to change.
     pingState.lastText = null;
     pingState.lastDot = null;
     return el;
+  }
+
+  // Set the out-of-flow readout just right of the team panel, at its top. Both
+  // are children of #ui-top-left, whose transform makes it the containing block
+  // for #ui-team's `position: fixed` as well as for our `absolute`, so the
+  // team panel's own computed `left`/`top` are already in our coordinates.
+  // Re-read on a slow cadence only: it moves when a teammate joins or leaves or
+  // the phone rotates, and reading layout 50 times a second would force one on
+  // every tick survev has touched the HUD.
+  function placePingOnPhone(el) {
+    const now = performance.now();
+    if (now - pingState.placedAt < PING_PLACE_MS) return;
+    pingState.placedAt = now;
+    const team = document.getElementById('ui-team');
+    if (!team) return;
+    const cs = getComputedStyle(team);
+    const left = (parseFloat(cs.left) || 0) + team.offsetWidth + PING_PHONE_GAP;
+    // `top: auto` is landscape: the static position, which is the top of the
+    // container now that nothing in flow sits above it.
+    const top = parseFloat(cs.top) || 0;
+    el.style.left = `${left}px`;
+    el.style.top = `${top}px`;
   }
 
   // Rebuilt on every tick of the sample loop rather than on a redraw timer, so
@@ -12398,21 +12449,15 @@
 
     const el = ensurePingEl();
     if (!el) return;
+    if (pingState.phone) placePingOnPhone(el);
     const ms = smoothedPingMs();
     pingState.currentMs = ms;
 
-    // Clock readout beside the ping: the fitted tick period (slope of the
-    // pseudotime model, ms per packet) and the RMS arrival-vs-pseudotime
-    // residual, i.e. how much jitter the fit is absorbing. Both blank until
-    // the clock has converged.
-    const jitter = clockJitterMs();
-    const clockTxt = netClock.ready
-      ? ` · ${netClock.slope.toFixed(2)} ms/tick${jitter == null ? '' : ` · ±${jitter.toFixed(1)} ms`}`
-      : '';
-
+    // Ping and nothing else. The clock's tick period and jitter are still one
+    // call away in __netcodeDiag for anyone tuning the smoothing.
     // `ms == null` is in a match with no acked input yet — say so rather than
     // showing a stale or invented number.
-    const txt = ms == null ? `– ms${clockTxt}` : `${Math.round(ms)} ms${clockTxt}`;
+    const txt = ms == null ? '– ms' : `${Math.round(ms)} ms`;
     const dot = ms == null ? '#7f8c8d'
       : ms < PING_GOOD_MS ? '#2ecc71' : ms < PING_OK_MS ? '#f1c40f' : '#e74c3c';
 
@@ -12579,10 +12624,22 @@
     }
   });
 
-  // Find the enemy that the cheat is currently locked onto, OR — when the
-  // aimbot key isn't held — the enemy that *would* be picked right now if it
-  // were. This intentionally bypasses stickiness in the preview path so
-  // the circle tracks the user's mouse in real time before they engage.
+  // The enemy the aim is locked onto this frame, or null: the gun aim helper
+  // steering onto them, or frag aim solving a throw at them. The green ring is
+  // drawn from this, so it only ever means "being aimed at". An enemy that
+  // would merely be picked, or one the helper declined because there is no
+  // shot on them, stays an ordinary threat ring.
+  function getLockedAimTarget(sample) {
+    if (!sample?.enemies) return null;
+    const id = fragActive() ? fragState.targetId
+      : aimRafId ? aimState.targetId : null;
+    if (id == null) return null;
+    return sample.enemies.find((e) => e.id === id) || null;
+  }
+
+  // The enemy that *would* be picked right now if the aimbot engaged, for
+  // __aimDiag. This intentionally bypasses stickiness so it tracks the user's
+  // pointer in real time before they engage.
   function getCurrentAimTarget(sample) {
     if (!sample) return null;
     const player = liveSelf(sample);
@@ -13029,7 +13086,7 @@
       // Survev player hitbox is ~1 world unit; 1.6× makes the ring sit just
       // outside the body sprite at default zoom.
       const radius = scale * 1.6;
-      const target = getCurrentAimTarget(sample);
+      const target = getLockedAimTarget(sample);
       const targetId = target ? target.id : null;
       const cx = window.innerWidth / 2;
       const cy = window.innerHeight / 2;
@@ -13037,7 +13094,8 @@
       const losNow = Date.now();
 
       // Draw a ring around every live enemy so the user can see threats at a
-      // glance. The current aim target is drawn last in green so it stays on top.
+      // glance. The enemy the aim is locked onto, if any, is drawn last in green
+      // so it stays on top; with no lock, nobody is green.
       // Downed players get a yellow ring. Enemies on a layer we can't reach
       // (e.g. they're in a bunker while we're aboveground) are dimmed to
       // UNREACHABLE_ALPHA, and enemies whose shot line is walled off with no
@@ -13240,6 +13298,9 @@
     // of how much the link is jittering; if it doesn't, the fit is being
     // dragged by something other than the tick rate.
     tickMs: netClock.ready ? Number(netClock.slope.toFixed(2)) : null,
+    // RMS arrival-vs-pseudotime residual: how much jitter the fit is absorbing.
+    // Used to ride along in the ping readout.
+    clockResidMs: (() => { const j = clockJitterMs(); return j == null ? null : Number(j.toFixed(1)); })(),
     snapRings: netSnapsById.size,
   });
 

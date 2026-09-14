@@ -386,9 +386,11 @@ overlay ring and the frag solver — so they agree on it too. It's tunable live
 through `window.__touchCone`. A desktop has no cone: the cursor is a point, and
 its trigger is a separate finger.
 
-Both the aim helper's selection and the overlay's green preview ring go through
-the one function, so they cannot drift apart —
-[the same reason `isEngageable` is asked in one place](aiming.md#selection-and-declining-to-aim).
+The overlay's green ring is not a preview of that selection. It marks only the
+enemy the aim is actually locked onto this frame: `aimState.targetId` while the
+aim loop is steering, or frag aim's target while it is solving a throw. An enemy
+that would be picked but has no shot on it, or no lock at all, leaves every
+ring red.
 
 # What doesn't change
 
