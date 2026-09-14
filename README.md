@@ -85,8 +85,9 @@ by default — none of them touches input or gameplay state.
   game's own markup and styles. Every value persists in `localStorage` under
   `elg_settings` and is validated against its own spec on load, so a stale or
   hand-edited entry can't drop a `NaN` into the aim or netcode paths.
-- **Ping readout** — live round-trip time above the top-left team panel,
-  colour-coded green/amber/red. Read from the RTT samples survev already
+- **Ping readout** — live round-trip time, and nothing else, above the top-left
+  team panel (beside it on a phone, out of the layout so the minimap, health
+  bar, items and scopes don't move), colour-coded green/amber/red. Read from the RTT samples survev already
   collects (`game.pings`), so it adds no traffic of its own, and averaged with
   the same decayed-moment EWMA the clock regression runs on — an 8-sample
   half-life, so about the twelve samples the old median held, with no window
