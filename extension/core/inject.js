@@ -2295,13 +2295,35 @@
   //   * autoshoot or the aimbot switched off, where nothing else is going to
   //     fire and taking the trigger away would leave the user unarmed.
   //
-  // The cost of the strict reading is that a gun cannot be fired at scenery —
-  // a crate, a door — while both are on. Turning Autoshoot off in the MOD tab
-  // hands the trigger straight back.
+  //
+  // And it is only taken while there is someone to take it *for*. Taken
+  // unconditionally, a gun could never be fired at scenery — a crate, a door —
+  // because no gesture was left that meant "fire at that". So the trigger is
+  // autoshoot's only while pickTarget has an enemy inside the aim cone (see
+  // TOUCH_CONE): point the stick away from everyone and the pull is an ordinary
+  // shot again, aimed by the thumb, since the aim helper has nobody to drive
+  // the pad toward either. Asked through the same pickTarget the aim helper
+  // uses, so the two cannot disagree about whether an enemy is in play.
+  //
+  // One case inside the cone hands it back too: an enemy whose only cover is
+  // destructible. The aim helper declines a blocked target, so nothing is
+  // going to fire there, and the crate in the way is exactly what the user
+  // wants to shoot. That verdict comes off the aim loop's own solve rather
+  // than a second one here — see aimCoverOnly.
   function touchShotSuppressed(player) {
     if (!AIMBOT.enabled || !AUTOSHOOT.enabled) return false;
     const weapon = getCurrentWeapon(player);
-    return !!weapon && GUN_FIRE_DELAY[weapon] !== undefined;
+    if (!weapon || GUN_FIRE_DELAY[weapon] === undefined) return false;
+    const target = touchConeTarget();
+    return !!target && !aimCoverOnly(target.id);
+  }
+
+  // The enemy the aim helper would pick right now, cone included, or null.
+  function touchConeTarget() {
+    const sample = pageSamples[pageSamples.length - 1];
+    const self = sample ? liveSelf(sample) : null;
+    if (!self || !sample.enemies?.length) return null;
+    return pickTarget(self, sample.enemies, Date.now())[0];
   }
 
   function userFireDown(binds) {
@@ -2862,6 +2884,27 @@
     return true;
   }
 
+  // Blocked, but only by things a gun can shoot its way through: at least one
+  // bullet-blocking obstacle on the segment, and every one of them
+  // destructible. Unlike hasLineOfSight this can't stop at the first hit — a
+  // crate in front of a wall is still a wall.
+  function blockedOnlyByDestructibles(x0, y0, x1, y1, layer, minDist = 0) {
+    const obstacles = getObstacles();
+    const loX = Math.min(x0, x1), hiX = Math.max(x0, x1);
+    const loY = Math.min(y0, y1), hiY = Math.max(y0, y1);
+    let any = false;
+    for (let i = 0; i < obstacles.length; i++) {
+      const o = obstacles[i];
+      if (!blocksBullets(o, layer)) continue;
+      if (!colliderNearSegment(o.collider, loX, loY, hiX, hiY)) continue;
+      const d = segHitCollider(x0, y0, x1, y1, o.collider);
+      if (d === null || d < minDist) continue;
+      if (!o.destructible) return false;
+      any = true;
+    }
+    return any;
+  }
+
   // ---------------------------------------------------------------------
   // One-bounce (bank) shots
   // ---------------------------------------------------------------------
@@ -3340,7 +3383,26 @@
     aimX: null,      // current aim point on the world map (null until first engage)
     aimY: null,
     lastFrameAt: 0,  // Date.now() of the previous frame, for dt
+    // The picked enemy, when the only thing between us is destructible cover,
+    // and when that was last solved. See aimCoverOnly.
+    coverId: null,
+    coverAt: 0,
   };
+
+  // How long the aim loop's cover verdict stands in for a fresh one: a few
+  // frames, so a hitch doesn't drop it, and short enough that a verdict from a
+  // pull that has since ended is never read.
+  const AIM_COVER_STALE_MS = 100;
+
+  // Whether the aim loop's latest solve found `id` walled off by destructible
+  // cover and nothing else. Read by the pad trigger, which runs inside the
+  // game's input build and has no solve of its own; with no fresh verdict —
+  // the first frame of a pull, before the aim loop has run — the answer is no,
+  // which keeps the trigger autoshoot's, the conservative default.
+  function aimCoverOnly(id) {
+    return aimState.coverId != null && aimState.coverId === id
+      && performance.now() - aimState.coverAt < AIM_COVER_STALE_MS;
+  }
 
   // The user's real mouse position in screen space, kept up-to-date by the
   // capture-phase mousemove listener even while we're suppressing those
@@ -3435,8 +3497,40 @@
     return Math.abs(angleDelta(aim.theta, Math.atan2(dy, dx))) + d * 1e-6;
   }
 
+  // How far off the pad's bearing an enemy can be and still be the one the user
+  // is pointing at. Without a limit the best score always wins, so a lone
+  // enemy behind us is "pointed at" and the stick can never mean anything else
+  // — and on a pad, where the trigger belongs to autoshoot whenever there is a
+  // target, that left no way to shoot a crate. See touchShotSuppressed.
+  //
+  // Two widths, so a thumb sweeping across the edge doesn't flip the trigger
+  // between the user and autoshoot every frame: a target is picked up inside
+  // `enterDeg`, and once one has been, the limit stays at `exitDeg` until a
+  // whole `holdMs` has gone by without anyone inside it. A desktop has no cone
+  // at all — the cursor is a point, and its trigger is a separate finger.
+  const TOUCH_CONE = {
+    enterDeg: 30,
+    exitDeg: 45,
+    holdMs: 250,
+  };
+  window.__touchCone = TOUCH_CONE;
+  let touchConeHeldAt = -Infinity;
+
+  // Whether a pad score — radians off the bearing — is inside the cone, and
+  // widen it for the frames that follow if so. Every pickTarget caller shares
+  // the one hold, so the aim, the trigger and the overlay's ring agree on it.
+  function touchConeAdmits(score) {
+    const t = performance.now();
+    const held = t - touchConeHeldAt < TOUCH_CONE.holdMs;
+    const limit = (held ? TOUCH_CONE.exitDeg : TOUCH_CONE.enterDeg) * Math.PI / 180;
+    if (!(score <= limit)) return false;
+    touchConeHeldAt = t;
+    return true;
+  }
+
   // Pick the enemy the user is pointing at: the best-scoring live, reachable,
-  // non-whitelisted one, by whichever of the two scores this device uses.
+  // non-whitelisted one, by whichever of the two scores this device uses — and
+  // on a pad, only if that one is inside TOUCH_CONE.
   function pickTarget(player, enemies, now) {
     const candidates = [];
     for (const e of enemies) {
@@ -3460,6 +3554,7 @@
       const s = scoreOf(candidates[i]);
       if (s < bestScore) { bestScore = s; best = candidates[i]; }
     }
+    if (aim.angular && !touchConeAdmits(bestScore)) return [null, 0];
     return [best, dist(player, best)];
   }
 
@@ -3720,6 +3815,14 @@
     const tgt = enemy ? reactionTarget(player, enemy, now) : null;
     const engage = !!tgt && !tgt.blocked;
 
+    // Blocked with no bank, and the block is a crate rather than a wall: the
+    // pad trigger goes back to the user so they can shoot through it. Tested
+    // on the same line reactionTarget found closed.
+    aimState.coverId = (tgt && tgt.blocked && blockedOnlyByDestructibles(
+      tgt.fromX, tgt.fromY, tgt.x, tgt.y, player.layer, PLAYER_RADIUS,
+    )) ? enemy.id : null;
+    aimState.coverAt = performance.now();
+
     if (engage) {
       aimState.targetId = enemy.id;
       // First frame of an engagement: start the glide from where the user is
@@ -3817,6 +3920,7 @@
     aimState.aimX = null;
     aimState.aimY = null;
     aimState.lastFrameAt = 0;
+    aimState.coverId = null;
   }
 
   // Whether the aim helper is on this frame. On a desktop that is the bind

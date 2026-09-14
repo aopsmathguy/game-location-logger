@@ -92,6 +92,7 @@ const env = {
   binds: null,
   realMouse: { x: 0, y: 0, hasMoved: false },
   scale: 20,            // pixels per world unit
+  obstacles: [],
 };
 
 const elg = eval(`(function () {
@@ -135,6 +136,35 @@ const elg = eval(`(function () {
   const AUTOSHOOT = { enabled: 1 };
   ${grabBlock('GUN_FIRE_DELAY', '};')}
   ${extract('getCurrentWeapon')}
+  // Target selection, cone and all. The sample ring is the scenario's, and the
+  // filters pickTarget runs ahead of scoring are reduced to "alive": they are
+  // tested where they live, and nothing here is about them.
+  const isEngageable = (e) => !!e && !e.dead;
+  const isSpoofedEnemy = () => false;
+  const canInteract = () => true;
+  const livePos = (id, e) => e;
+  const liveSelf = (s) => s.self;
+  const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+  ${grabBlock('TOUCH_CONE', '};')}
+  ${grabLine('let touchConeHeldAt')}
+  ${grabBlock('aimState', '};')}
+  ${grabLine('AIM_COVER_STALE_MS')}
+  ${extract('touchConeAdmits')}
+  ${extract('pickTarget')}
+  ${extract('aimCoverOnly')}
+  ${extract('touchConeTarget')}
+  // The cover sweep, over the scenario's obstacles.
+  const getObstacles = () => env.obstacles;
+  const COLLIDER_CIRCLE = ${grabConst('COLLIDER_CIRCLE')};
+  const COLLIDER_AABB = ${grabConst('COLLIDER_AABB')};
+  const BULLET_HEIGHT = ${grabConst('BULLET_HEIGHT')};
+  ${extract('sameLayerAs')}
+  ${extract('blocksBullets')}
+  ${extract('segHitCircle')}
+  ${extract('segHitAabb')}
+  ${extract('segHitCollider')}
+  ${extract('colliderNearSegment')}
+  ${extract('blockedOnlyByDestructibles')}
   ${extract('touchShotSuppressed')}
   ${extract('userFireDown')}
   ${extract('userAim')}
@@ -154,11 +184,20 @@ const elg = eval(`(function () {
     swaps: () => swapsQueued,
     resetSwaps: () => { swapsQueued = 0; autoSwapFireWasDown = false; },
     setAutoSwapEnabled: (v) => { AUTO_SWAP.enabled = v; },
-    touchState, DODGE_DIRS,
+    touchState, DODGE_DIRS, TOUCH_CONE, aimState, AIM_COVER_STALE_MS,
     ensureTouchHook, touchActive, touchDriveAim, touchReleaseAim,
     touchDriveMove, touchReleaseMove, userFireDown,
-    userAim, userAimScore, dodgeUserDirIdx,
+    userAim, userAimScore, dodgeUserDirIdx, pickTarget,
+    blockedOnlyByDestructibles,
     setGame: (g) => { capturedGame = g; },
+    // The scene: our own sample and who is on the field around us.
+    setField: (self, enemies) => {
+      pageSamples.length = 0;
+      if (self) pageSamples.push({ self, enemies });
+    },
+    // Forget the cone's hold, or backdate it by ms as if that long had passed.
+    resetCone: () => { touchConeHeldAt = -Infinity; },
+    ageCone: (ms) => { touchConeHeldAt -= ms; },
   };
 })()`);
 
@@ -333,6 +372,9 @@ function newScene() {
   elg.touchState.owner = null;
   elg.touchState.driveLen = -1;
   elg.touchReleaseMove();
+  elg.setField(null);
+  elg.resetCone();
+  elg.aimState.coverId = null;
   elg.setGame(game);
   env.binds = binds;
   elg.ensureTouchHook(game);
@@ -517,12 +559,20 @@ const GUN = { netData: { activeWeapon: 'mosin' } };        // slow, single-shot
 const MELEE = { netData: { activeWeapon: 'machete' } };
 const NADE = { netData: { activeWeapon: 'frag' }, throwableEquipped: true };
 
+// Somewhere `bearing` radians from us and `range` units out.
+const onBearing = (bearing, range, extra) =>
+  ({ id: 1, x: Math.cos(bearing) * range, y: Math.sin(bearing) * range, ...extra });
+const ME = { x: 0, y: 0, layer: 0 };
+
 {
   const scene = newScene();
   const range = scene.touch.padPosRange / scene.touch.shotPadDetectMult;
   const hold = () => {
     scene.touch.touches = [finger(scene.touch.rightLockedPadCenter, 0.4, range + 5)];
   };
+  // Everything in this section is an engagement: someone is standing where
+  // the thumb points. With nobody there the pull is the user's — section 7.
+  elg.setField(ME, [onBearing(0.4, 20)]);
 
   hold();
   const msg = frame(scene, GUN);
@@ -567,7 +617,136 @@ const NADE = { netData: { activeWeapon: 'frag' }, throwableEquipped: true };
      frame(scene, MELEE).shootHold === true, '');
 }
 
-// ---- 7. A cooking grenade keeps its trigger -----------------------------
+// ---- 7. ...but only when there is someone to shoot -----------------------
+//
+// Taking the trigger unconditionally left no gesture that meant "fire at that
+// crate". So it is autoshoot's only while an enemy is inside the aim cone;
+// point away from everyone and the pull is an ordinary shot again.
+
+{
+  const scene = newScene();
+  const range = scene.touch.padPosRange / scene.touch.shotPadDetectMult;
+  const THUMB = 0.4;
+  const deg = (d) => d * Math.PI / 180;
+  // A frame with the thumb pulled all the way out at THUMB and one enemy at
+  // `offDeg` degrees off it (or nobody), holding a gun.
+  const pullAt = (offDeg, extra) => {
+    elg.setField(ME, offDeg == null ? [] : [onBearing(THUMB + deg(offDeg), 20, extra)]);
+    scene.touch.touches = [finger(scene.touch.rightLockedPadCenter, THUMB, range + 5)];
+    return frame(scene, GUN);
+  };
+  const { enterDeg, exitDeg, holdMs } = elg.TOUCH_CONE;
+
+  ok('scenery: with nobody on the field the pull fires the gun',
+     pullAt(null).shootHold === true && elg.userFireDown() === true,
+     'shot reaches the wire, and it is still the activation');
+
+  elg.resetCone();
+  ok('scenery: an enemy well outside the cone does not take the trigger',
+     pullAt(enterDeg + 30).shootHold === true,
+     `enemy ${enterDeg + 30}° off the thumb`);
+
+  elg.resetCone();
+  ok('cone: an enemy inside it does',
+     pullAt(enterDeg - 5).shootHold === false,
+     `enemy ${enterDeg - 5}° off the thumb`);
+
+  // The same enemy drifting out past the entry width, but not the exit one,
+  // stays engaged — the thumb sweeping over the edge must not flip the trigger
+  // between the user and autoshoot every frame.
+  ok('cone: once engaged, it holds out to the wider exit width',
+     pullAt((enterDeg + exitDeg) / 2).shootHold === false,
+     `${(enterDeg + exitDeg) / 2}° off, between ${enterDeg}° and ${exitDeg}°`);
+  ok('cone: ...and lets go past it',
+     pullAt(exitDeg + 5).shootHold === true,
+     `${exitDeg + 5}° off`);
+
+  // Picked up cold, that in-between angle is outside.
+  elg.resetCone();
+  ok('cone: the wider width is not where an engagement starts',
+     pullAt((enterDeg + exitDeg) / 2).shootHold === true,
+     `${(enterDeg + exitDeg) / 2}° off with no engagement in the last ${holdMs}ms`);
+
+  // ...and the hold runs out.
+  pullAt(enterDeg - 5);
+  elg.ageCone(holdMs + 10);
+  ok('cone: the hold expires after holdMs without anyone inside',
+     pullAt((enterDeg + exitDeg) / 2).shootHold === true,
+     `${holdMs + 10}ms since the last engagement`);
+
+  // The aim and the trigger ask the same question, so they cannot disagree.
+  elg.resetCone();
+  elg.setField(ME, [onBearing(THUMB + deg(enterDeg + 30), 20)]);
+  ok('cone: the aim helper picks nobody outside it either',
+     elg.pickTarget(ME, [onBearing(THUMB + deg(enterDeg + 30), 20)], Date.now())[0] === null, '');
+
+  // A throwable is still the cook, cone or no cone.
+  elg.resetCone();
+  elg.setField(ME, []);
+  scene.touch.touches = [finger(scene.touch.rightLockedPadCenter, THUMB, range + 5)];
+  frame(scene, NADE);
+  ok('scenery: a grenade still cooks with nobody around',
+     scene.touch.shotDetected === true, '');
+  scene.touch.touches = [];
+  frame(scene, NADE);
+}
+
+// ---- 8. An enemy behind a crate hands the trigger back -------------------
+//
+// The aim helper declines a blocked target, so nothing is going to fire at
+// them — and the crate in the way is exactly what the user wants to shoot.
+
+{
+  const scene = newScene();
+  const range = scene.touch.padPosRange / scene.touch.shotPadDetectMult;
+  const pull = () => {
+    scene.touch.touches = [finger(scene.touch.rightLockedPadCenter, 0.4, range + 5)];
+    return frame(scene, GUN);
+  };
+  elg.setField(ME, [onBearing(0.4, 20)]);
+
+  ok('cover: with no verdict from the aim loop the trigger stays autoshoot\'s',
+     pull().shootHold === false, 'the first frame of a pull, before the aim loop has run');
+
+  elg.aimState.coverId = 1;
+  elg.aimState.coverAt = performance.now();
+  ok('cover: destructible cover in the way hands it back',
+     pull().shootHold === true, '');
+
+  elg.aimState.coverAt = performance.now() - (elg.AIM_COVER_STALE_MS + 10);
+  ok('cover: a stale verdict is not read',
+     pull().shootHold === false, `${elg.AIM_COVER_STALE_MS + 10}ms old`);
+
+  elg.aimState.coverId = 2;
+  elg.aimState.coverAt = performance.now();
+  ok('cover: a verdict about somebody else is not read',
+     pull().shootHold === false, 'cover verdict for id 2, cone target id 1');
+  elg.aimState.coverId = null;
+
+  // The sweep. A box collider from (x0,y0) to (x1,y1).
+  const box = (x0, y0, x1, y1, destructible) => ({
+    active: true, dead: false, collidable: true, isWindow: false, height: 1,
+    layer: 0, destructible,
+    collider: { type: 1, min: { x: x0, y: y0 }, max: { x: x1, y: y1 } },
+  });
+  const crate = box(9, -1, 11, 1, true);
+  const wall = box(14, -3, 15, 3, false);
+  const sweep = () => elg.blockedOnlyByDestructibles(0, 0, 20, 0, 0, 1);
+
+  env.obstacles = [];
+  ok('cover sweep: a clear line is not "blocked by cover"', sweep() === false, '');
+  env.obstacles = [crate];
+  ok('cover sweep: a crate alone is', sweep() === true, '');
+  env.obstacles = [crate, wall];
+  ok('cover sweep: a crate in front of a wall is still a wall', sweep() === false, '');
+  env.obstacles = [wall, crate];
+  ok('cover sweep: ...in either pool order', sweep() === false, '');
+  env.obstacles = [{ ...crate, dead: true }, wall];
+  ok('cover sweep: a broken crate in front of a wall is just the wall', sweep() === false, '');
+  env.obstacles = [];
+}
+
+// ---- 9. A cooking grenade keeps its trigger -----------------------------
 //
 // For a throwable `shotDetected` is not a trigger at all — it *is* the cook,
 // held up by a stickiness rule for as long as a finger is down. Dropping it
@@ -606,7 +785,7 @@ const NADE = { netData: { activeWeapon: 'frag' }, throwableEquipped: true };
   elg.touchReleaseAim('frag');
 }
 
-// ---- 8. Auto-quickswap's fire edge --------------------------------------
+// ---- 10. Auto-quickswap's fire edge --------------------------------------
 //
 // The swap itself already reaches the wire on a pad: the loop that copies
 // pressed equip inputs onto the message runs outside the touch branch, off the
@@ -669,7 +848,7 @@ const NADE = { netData: { activeWeapon: 'frag' }, throwableEquipped: true };
      `${elg.swaps()} queued`);
 }
 
-// ---- 9. Dodge movement drives all eight headings ------------------------
+// ---- 11. Dodge movement drives all eight headings ------------------------
 
 {
   const scene = newScene();
@@ -705,7 +884,7 @@ const NADE = { netData: { activeWeapon: 'frag' }, throwableEquipped: true };
      `walking ${(bearingOf(back) * 180 / Math.PI).toFixed(1)}° at ${vlen(back).toFixed(2)}u/s`);
 }
 
-// ---- 10. The bot reads the user's heading, not its own -------------------
+// ---- 12. The bot reads the user's heading, not its own -------------------
 
 {
   const scene = newScene();
@@ -739,7 +918,7 @@ const NADE = { netData: { activeWeapon: 'frag' }, throwableEquipped: true };
   elg.touchReleaseMove();
 }
 
-// ---- 11. Target selection without a cursor -------------------------------
+// ---- 13. Target selection without a cursor -------------------------------
 
 {
   const scene = newScene();
@@ -774,7 +953,7 @@ const NADE = { netData: { activeWeapon: 'frag' }, throwableEquipped: true };
      elg.userAimScore(aim, player, { x: 1, y: 1 }), '');
 }
 
-// ---- 12. A desktop is untouched -----------------------------------------
+// ---- 14. A desktop is untouched -----------------------------------------
 
 {
   const scene = newScene();

@@ -85,8 +85,9 @@ against the world we actually saw and any ping lead is pure overshoot.
 
 The target is **whichever enemy is nearest the cursor**, recomputed every
 frame, with no commitment. On a touch device there is no cursor to be nearest
-to, and the question is scored as an angle off the aim pad's bearing instead —
-see [Selection: a bearing, not a point](mobile.md#selection-a-bearing-not-a-point).
+to, and the question is scored as an angle off the aim pad's bearing instead,
+with anyone more than 30° off it (45° once engaged) not picked at all — see
+[Selection: a bearing, not a point](mobile.md#selection-a-bearing-not-a-point).
 
 A just-killed enemy stays in play for `deadLingerMs` (the "Linger" slider,
 600ms by default) and inside that window is treated as a live player in every

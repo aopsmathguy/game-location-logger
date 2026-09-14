@@ -140,10 +140,39 @@ to take:
 | A melee | Autoshoot doesn't swing. |
 | Autoshoot or the aimbot switched off | Nothing else is going to fire, and taking the trigger away would leave you unarmed. |
 
-The cost of the strict reading is real and worth knowing: **you cannot shoot
-scenery** — a crate, a door — while both switches are on, because there is no
-gesture left that means "fire at that". Turning Autoshoot off in the MOD tab
-hands the trigger straight back.
+## ...but only when there is someone to shoot
+
+Taken unconditionally, the trigger left no gesture that meant "fire at that",
+so a crate or a door could never be shot with both switches on. So autoshoot
+only owns the trigger while **an enemy is inside the aim cone** — see
+[Selection](#selection-a-bearing-not-a-point). Point the stick away from
+everyone and the pull is an ordinary shot again, aimed by your thumb, since the
+aim helper has nobody to drive the pad toward either. Point it at someone and
+it's autoshoot's, blocked shots and all.
+
+`touchShotSuppressed` asks that through the same `pickTarget` the aim helper
+calls, from inside the pad hook, so on the very first frame of a pull the two
+already agree — there is no frame where a manual shot slips out before the aim
+loop has run.
+
+One case inside the cone hands the trigger back as well: **an enemy whose only
+cover is destructible**. The aim helper declines a blocked target, so nothing
+was going to fire there, and the crate in the way is exactly what you want to
+shoot. `blockedOnlyByDestructibles` sweeps the same line `reactionTarget` found
+closed and says yes only if every obstacle on it is `destructible` — a crate in
+front of a wall is still a wall. That sweep runs in the aim loop, which already
+has the solve, and the pad hook reads its verdict through `aimCoverOnly`. With
+no fresh verdict (the first frame of a pull, or one over 100ms old) the answer
+is no, so the trigger stays autoshoot's. Once the crate breaks the line is
+clear, the aim engages, and autoshoot takes over.
+
+The handoff between the two needs no special care for the slow-gun swap. A
+manual shot fired just before an enemy enters the cone can land its magazine
+drop after autoshoot's first reading, and autoshoot will read that as its own
+shot confirmed and swap. But the gun really did fire, so swapping out of its
+recovery is the right move either way. What the swap can't survive is a pad
+trigger and autoshoot both firing on the same message, and ownership is still
+exclusive frame by frame.
 
 # Driving the aim
 
@@ -265,6 +294,25 @@ the bearing out to some invented radius would pick whichever enemy happened to
 be standing at that radius, so the score becomes the angle off the bearing
 instead, with distance folded in at a millionth of a radian per unit purely to
 break ties between two enemies on the same line.
+
+And the best score still has to be **inside a cone** (`TOUCH_CONE`), or nobody
+is picked. Without one, a lone enemy directly behind you is "pointed at", and
+since the pad trigger belongs to autoshoot whenever there is a target, that
+left no way to shoot anything else — see
+[...but only when there is someone to shoot](#but-only-when-there-is-someone-to-shoot).
+It has two widths so a thumb sweeping across the edge doesn't hand the trigger
+back and forth every frame:
+
+| | |
+| --- | --- |
+| `enterDeg` 30° | an engagement starts inside this |
+| `exitDeg` 45° | once one has, the limit widens to this |
+| `holdMs` 250 | and narrows again after this long with nobody inside |
+
+The hold is shared by every `pickTarget` caller — the aim, the trigger, the
+overlay ring and the frag solver — so they agree on it too. It's tunable live
+through `window.__touchCone`. A desktop has no cone: the cursor is a point, and
+its trigger is a separate finger.
 
 Both the aim helper's selection and the overlay's green preview ring go through
 the one function, so they cannot drift apart —
