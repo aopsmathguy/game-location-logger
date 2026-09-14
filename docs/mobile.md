@@ -213,7 +213,9 @@ override) runs unchanged on what the tap layer returns.
   finger is down". The pull is the finger's distance in world units, encoded
   through the same throttle frag aim inverts, so **a grenade is thrown to where
   you tap**, out to the pad's 18u ceiling, and it cooks for exactly as long as
-  you hold. The right pad's sprites are drawn under the finger.
+  you hold. No right pad is drawn. The game shows both pads' sprites every
+  frame no matter what, so the only way to hide this one is to put it off
+  screen.
 
 ## Selection: a radius, not a cone
 

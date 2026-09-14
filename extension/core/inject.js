@@ -2406,16 +2406,15 @@
     pads.shotDetectedOld = pads.shotDetected;
     pads.shotDetected = touched;
     pads.touchingAim = touched;
-    // The right pad's sprites follow the finger rather than sitting on a stick
-    // that no longer does anything, and go off screen with no finger down.
+    // There is no right stick any more, so none is drawn: the game shows both
+    // pads' sprites unconditionally every frame, and the only say we have over
+    // where is the position it draws them at, which goes off screen.
     const pad = pads.touchPads?.[1];
     if (pad && pad.touchPos) {
-      const x = touched ? finger.pos.x : -1e4;
-      const y = touched ? finger.pos.y : -1e4;
       pad.touched = touched;
-      pad.centerPos = { x, y };
-      pad.touchPos.x = x;
-      pad.touchPos.y = y;
+      pad.centerPos = { x: -1e4, y: -1e4 };
+      pad.touchPos.x = -1e4;
+      pad.touchPos.y = -1e4;
     }
     return { aimMovement: pads.aimMovement, touched };
   }

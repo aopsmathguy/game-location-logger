@@ -1104,15 +1104,17 @@ const ME = { x: 0, y: 0, layer: 0 };
      msg.shootHold === true && msg.touchMoveLen === 0, 'a finger at (450, 590) with zone 10');
   elg.TAP_AIM.zone = 2;
 
-  // The pad sprite follows the finger and leaves with it.
+  // No joystick is drawn for an aim finger, held or not.
+  const pad = scene.touch.touchPads[1];
+  const offScreen = () => pad.centerPos.x < -1000 && pad.centerPos.y < -1000
+    && pad.touchPos.x < -1000 && pad.touchPos.y < -1000;
   fingers(down(520, 260));
   frame(scene, GUN);
-  const pad = scene.touch.touchPads[1];
-  ok('tap: the right pad is drawn under the finger',
-     pad.touched && pad.centerPos.x === 520 && pad.touchPos.y === 260, '');
+  ok('tap: no joystick is drawn while aiming and shooting', pad.touched && offScreen(),
+     `pad sprites at (${pad.centerPos.x}, ${pad.centerPos.y})`);
   fingers();
   frame(scene, GUN);
-  ok('tap: ...and off screen once it lifts', !pad.touched && pad.centerPos.x < -1000, '');
+  ok('tap: ...or with no finger down', !pad.touched && offScreen(), '');
 
   // A grenade goes where the finger is, out to the pad's ceiling, and cooks
   // exactly as long as the finger is down.
