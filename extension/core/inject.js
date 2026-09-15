@@ -5035,11 +5035,10 @@
 
   // Never auto-swap on these, no matter how low the threshold goes.
   // Burst-fire guns would have their remaining shots truncated by a swap
-  // mid-burst; the flare gun and bugle are utility items where the user
-  // wants the gun they already had, not a quickswitch.
+  // mid-burst; the flare gun is a utility item where the user wants the gun
+  // they already had, not a quickswitch.
   const AUTO_SWAP_NEVER = new Set([
     'ump9', 'famas', 'm93r', 'm93r_dual', 'an94',
-    'flare_gun', 'flare_gun_dual', 'bugle',
   ]);
 
   function isSlowFireGun(weapon) {
