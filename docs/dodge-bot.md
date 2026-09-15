@@ -1401,7 +1401,7 @@ The gate is the cook state itself, which is exactly "the pin is out and it has
 not left our hand" and ends by itself the moment the throw goes out.
 
 The user's real mouse is suppressed while this drives, the same way it is while
-the gun aimbot's key is held, but it is still *recorded* — target selection
+the gun aimbot is engaged, but it is still *recorded* — target selection
 reads it, so moving the invisible cursor still chooses who to throw at. When the
 takeover ends their real position is replayed once, so the aim snaps back to
 where their mouse actually is rather than holding the last thing we sent.

@@ -2163,8 +2163,8 @@
     touchState.shot = !!touch?.shotDetected;
     // Recorded above, then taken off the game: while autoshoot is the one
     // pulling, the pad's pull is an activation and nothing else. See
-    // touchShotSuppressed.
-    if (touch && touchState.shot && touchShotSuppressed(player)) {
+    // userShotSuppressed.
+    if (touch && touchState.shot && userShotSuppressed(player)) {
       touch.shotDetected = false;
     }
 
@@ -2309,6 +2309,14 @@
   // Whether target selection should treat the user as pointing with a tap.
   function tapAimActive() {
     return !!TAP_AIM.enabled && touchState.tapReady && touchActive();
+  }
+
+  // Whether the user points with a point — a tap, or a desktop's cursor — as
+  // opposed to the stock pad's bearing. A mouse click is treated exactly as a
+  // tap: the enemy nearest the cursor within TAP_AIM.radius is selected, and
+  // the trigger is handed over the same way. See userShotSuppressed.
+  function pointAimActive() {
+    return touchActive() ? tapAimActive() : true;
   }
 
   // Finger → 'move' | 'aim'. Weak, so a finger the game splices out once it
@@ -2491,9 +2499,12 @@
   // isn't, nothing fires at all, crate or wall. With autoshoot off the finger
   // is still the trigger, but only once the aim has actually locked on, so it
   // too never fires at a selected enemy it can't hit.
-  function touchShotSuppressed(player) {
+  //
+  // A desktop click is a tap: the same rules, asked from the Fire bind hook
+  // instead of the pad hook — see desktopFireTaken.
+  function userShotSuppressed(player) {
     if (!AIMBOT.enabled) return false;
-    const tap = tapAimActive();
+    const tap = pointAimActive();
     if (!AUTOSHOOT.enabled && !tap) return false;
     const weapon = getCurrentWeapon(player);
     if (!weapon || GUN_FIRE_DELAY[weapon] === undefined) return false;
@@ -2522,27 +2533,21 @@
   }
   requestAnimationFrame(touchFrameTick);
 
-  // Hold-to-aim. While the aimbot key is held, real mousemove events are
-  // swallowed at the capture phase and a solved screen-space aim point
-  // is dispatched to the canvas every animation frame. Survev keeps the
-  // local player viewport-centered and derives aim from
+  // Click-to-aim. While Fire is held — a mouse button, or a finger on a pad —
+  // real mousemove events are swallowed at the capture phase and a solved
+  // screen-space aim point is dispatched to the canvas every animation frame.
+  // Survev keeps the local player viewport-centered and derives aim from
   // (mouseScreenPos − playerScreenPos), so a screen-space offset translates
   // directly into world-space aim direction.
-  let aimHeld = false;
   let aimRafId = 0;
   const AIM_CURSOR_RADIUS = 400; // pixels from viewport center; well outside the player
 
-  // Aimbot master switch and activation key. The bind is stored the way survev
-  // stores its own — a legacy `KeyboardEvent.keyCode` — so the row can share
-  // its markup, its naming and its capture rules; `null` means unbound, which
-  // is what Backspace does on survev's rows and is equivalent to switching the
-  // aimbot off. Declared up here, rather than beside the settings panel,
-  // because SETTINGS_SPECS binds rows to it and would hit the temporal dead
-  // zone. Off by default: the cheats stay inert until they are turned on in
-  // the MOD tab, so a fresh profile plays as stock survev.
+  // Aimbot master switch. There is no activation key: on every device the
+  // trigger itself is the activation, see aimEngaged. Declared up here, rather
+  // than beside the settings panel, because SETTINGS_SPECS binds rows to it and
+  // would hit the temporal dead zone.
   const AIMBOT = {
     enabled: 1,
-    bind: 16, // Shift. keyCode doesn't distinguish left from right, so both work.
   };
 
   // What the overlay fades an enemy to when it can't be shot because it is on
@@ -2592,42 +2597,6 @@
     enabled: 1,
   };
 
-  // True while the MOD tab is waiting for the user to press their new bind, so
-  // the handlers below don't treat that press as an activation. Both listeners
-  // are capture-phase on window and ours is registered first (at load), so the
-  // flag is the only thing that can keep them apart.
-  let bindCapture = false;
-
-  // keyCode → display name, transcribed from the bundle's own table so our row
-  // reads exactly like survev's ("ESC", "Space", "←", "Numpad 1"). Letters,
-  // digits, numpad digits and function keys are derived instead of listed —
-  // the table's entries across those ranges are just the obvious name — and
-  // anything unlisted falls back to `Key <code>`, which is its fallback too.
-  const KEY_NAMES = {
-    8: 'Backspace', 9: 'Tab', 12: 'Clear', 13: 'Enter', 16: 'Shift', 17: 'Control',
-    18: 'Alt', 19: 'Pause', 20: 'Capslock', 27: 'ESC', 32: 'Space', 33: 'Page Up',
-    34: 'Page Down', 35: 'End', 36: 'Home', 37: '←', 38: '↑', 39: '→', 40: '↓',
-    41: 'Select', 42: 'Print', 43: 'Execute', 44: 'Printscreen', 45: 'Insert',
-    46: 'Delete', 91: 'Windows Key', 93: 'Context Menu', 95: 'Sleep', 106: '*',
-    107: '+', 108: 'Separator', 109: '-', 110: '.', 111: '/', 144: 'Num Lock',
-    145: 'Scroll Lock', 186: ';', 187: '=', 188: ',', 189: '-', 190: '.',
-    191: '/', 192: 'Backquote', 219: '[', 220: '\\', 221: ']', 222: "'",
-    224: 'Meta',
-  };
-
-  function keyName(code) {
-    if (code == null) return '';
-    if (code >= 48 && code <= 57) return String(code - 48);
-    if (code >= 65 && code <= 90) return String.fromCharCode(code);
-    if (code >= 96 && code <= 105) return `Numpad ${code - 96}`;
-    if (code >= 112 && code <= 123) return `F${code - 111}`;
-    return KEY_NAMES[code] || `Key ${code}`;
-  }
-
-  // Keys survev refuses to bind: bare modifiers that never arrive alone in a
-  // usable way, the OS menu keys, and the function row. Pressing one leaves
-  // the row armed rather than binding it, exactly as in the Keybinds tab.
-  const UNBINDABLE = new Set([17, 18, 91, 93, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123]);
   function dist(a, b){
     return ((a["x"] - b["x"]) ** 2 + (a["y"] - b["y"]) ** 2) ** 0.5
   }
@@ -3637,7 +3606,7 @@
   const userAimOut = { angular: false, tap: false, x: 0, y: 0, dx: 1, dy: 0, theta: 0 };
   function userAim(player) {
     const o = userAimOut;
-    const tap = tapAimActive();
+    const tap = pointAimActive();
     o.tap = tap;
     if (touchActive() && !tap) {
       o.angular = true;
@@ -3651,7 +3620,7 @@
     }
     o.angular = false;
     const scale = getLivePxPerWorldUnit(pageSamples[pageSamples.length - 1]);
-    const pointer = tap ? touchState.tap : realMouse;
+    const pointer = touchActive() ? touchState.tap : realMouse;
     if (pointer.hasMoved && scale > 0) {
       o.x = player.x + (pointer.x - window.innerWidth / 2) / scale;
       o.y = player.y - (pointer.y - window.innerHeight / 2) / scale;
@@ -4059,12 +4028,15 @@
       aimState.aimY = null;
     }
 
+    // Frag aim owns the aim while a grenade is cooking — it is solving for a
+    // throw, and the cursor distance (or pad pull) that encodes the throw's
+    // strength is the same number a gun bearing would overwrite. Holding Fire
+    // is what cooks, so the two are always engaged together.
+    if (fragActive()) return;
+
     if (touchActive()) {
       // No cursor to move: the aim goes onto the pad reading the input message
-      // is actually built from. Frag aim owns that pad while a grenade is
-      // cooking — it is solving for a throw, and the pull that encodes the
-      // throw's strength is the same number a gun bearing would overwrite.
-      if (fragActive()) return;
+      // is actually built from.
       if (engage) touchDriveAim('aim', Math.cos(aimState.theta), Math.sin(aimState.theta));
       else touchReleaseAim('aim');
       return;
@@ -4077,7 +4049,7 @@
       y = Math.round(window.innerHeight / 2 - Math.sin(aimState.theta) * AIM_CURSOR_RADIUS);
     } else {
       // The user's own cursor, replayed. Their real mousemoves are being
-      // swallowed for as long as the key is held, so the game sees only what
+      // swallowed for as long as Fire is held, so the game sees only what
       // we send it — sending their position straight back is what "no aimbot"
       // has to mean here. Before they have ever moved the mouse there is no
       // position to replay, so nothing is sent and the game keeps the aim it
@@ -4100,18 +4072,14 @@
   }
 
   function aimFrame() {
-    // Switching the aimbot off mid-hold drops the hold here rather than
-    // leaving the loop spinning until the key comes up.
-    if (!aimEngaged() || !AIMBOT.enabled) { releaseAim(); return; }
+    // Letting go of Fire, or switching the aimbot off mid-hold, drops the hold.
+    if (!aimEngaged()) { releaseAim(); return; }
     dispatchAim();
     aimRafId = requestAnimationFrame(aimFrame);
   }
 
-  // Drop the hold and every bit of state it accumulated. Also called when the
-  // bind changes out from under a held key, where no keyup for the old bind is
-  // ever going to arrive.
+  // Drop the hold and every bit of state it accumulated.
   function releaseAim() {
-    aimHeld = false;
     touchReleaseAim('aim');
     if (aimRafId) { cancelAnimationFrame(aimRafId); aimRafId = 0; }
     aimState.targetId = null;
@@ -4121,61 +4089,36 @@
     aimState.coverId = null;
   }
 
-  // Whether the aim helper is on this frame. On a desktop that is the bind
-  // being held. A touch device has no bind to hold, so the trigger itself is
-  // the activation: pulling the right pad far enough to shoot turns the aim
-  // helper and autoshoot on together, which is the only spare gesture a phone
-  // has. See userFireDown.
+  // Whether the aim helper is on this frame: the user's own trigger is down.
+  // There is no key to hold on any device — a desktop click works exactly like
+  // a tap on a phone, turning the aim helper and autoshoot on together, with
+  // the trigger handed to autoshoot whenever it has someone to shoot. See
+  // userShotSuppressed and userFireDown.
   function aimEngaged() {
-    return touchActive() ? userFireDown() : aimHeld;
+    return !!AIMBOT.enabled && userFireDown();
   }
 
-  // The desktop loop is started by the keydown that begins the hold; a pad has
-  // no such edge to hang it off, so poll for one. Restarting is always a fresh
-  // engagement because releaseAim has already dropped the glide seed.
-  function aimTouchTick() {
+  // The trigger has no event of ours to hang the loop off — a mouse button
+  // reaches the game through its own listeners, a pad through its own reader —
+  // so poll for it. Restarting is always a fresh engagement because releaseAim
+  // has already dropped the glide seed.
+  function aimTriggerTick() {
     try {
-      if (AIMBOT.enabled && !aimRafId && touchActive() && userFireDown()) {
-        aimRafId = requestAnimationFrame(aimFrame);
-      }
+      if (!aimRafId && aimEngaged()) aimRafId = requestAnimationFrame(aimFrame);
     } catch {}
-    requestAnimationFrame(aimTouchTick);
+    requestAnimationFrame(aimTriggerTick);
   }
-  requestAnimationFrame(aimTouchTick);
+  requestAnimationFrame(aimTriggerTick);
 
-  // True while the caret is in one of our own multi-line boxes. This listener
-  // is capture-phase on window, so it runs *before* the event reaches the box
-  // and cannot be stopped from there — it has to ask. Without it, a bind on a
-  // printable key (or Shift, the default) would engage the aimbot mid-word and
-  // swallow the character with its preventDefault.
+  // True while the caret is in one of our own multi-line boxes. Capture-phase
+  // key listeners on window run *before* the event reaches the box and cannot
+  // be stopped from there, so they have to ask.
   function typingInElgField() {
     const el = document.activeElement;
     return !!el && el.tagName === 'TEXTAREA' && el.classList.contains(ELG_TEXTAREA_CLASS);
   }
 
-  window.addEventListener('keydown', (e) => {
-    if (bindCapture || typingInElgField()) return;
-    if (!AIMBOT.enabled || AIMBOT.bind == null || e.keyCode !== AIMBOT.bind) return;
-    if (!aimHeld) {
-      aimHeld = true;
-      // Fresh hold: drop the prior aim point so dispatchAim re-seeds the glide
-      // from wherever the user's real cursor currently points.
-      aimState.aimX = null;
-      aimState.aimY = null;
-      aimState.lastFrameAt = 0;
-      if (!aimRafId) aimRafId = requestAnimationFrame(aimFrame);
-    }
-    // Suppress the browser's default behavior for the bind so it doesn't steal
-    // focus from the canvas.
-    e.preventDefault();
-  }, true);
-
-  window.addEventListener('keyup', (e) => {
-    if (AIMBOT.bind == null || e.keyCode !== AIMBOT.bind) return;
-    releaseAim();
-  }, true);
-
-  // Capture-phase mousemove suppressor: while the aimbot key is held, drop any real
+  // Capture-phase mousemove suppressor: while Fire is held, drop any real
   // (trusted) mouse movement so only our per-frame synthetic events reach
   // the game. Synthetic events (isTrusted === false) pass through. We also
   // *record* the real mouse position on every trusted move (even when
@@ -4429,66 +4372,35 @@
   // pane is re-attached on demand because the menu markup can be rebuilt.
   // ---------------------------------------------------------------------
 
-  // One row per tunable. `kind: 'toggle'` renders a button, `kind: 'keybind'` a
-  // survev-style keybind row, anything else a slider; `section` starts a new
-  // heading above the row. `id` is the settled name the value is persisted
-  // under, so renaming a store or a field doesn't silently orphan saved values.
+  // One row per setting. `kind: 'toggle'` renders a button, `kind: 'textarea'`
+  // a multi-line box, anything else a slider; `section` starts a new heading
+  // above the row. `id` is the settled name the value is persisted under, so
+  // renaming a store or a field doesn't silently orphan saved values.
+  //
+  // Only the switches a player actually reaches for are here. Every tuning knob
+  // keeps its coded default and is still live on its store (`window.__aimHuman`,
+  // `window.__tapAim`, ...) for anyone who needs to retune one.
   const SETTINGS_SPECS = [
     { id: 'aimbot.enabled', store: AIMBOT, key: 'enabled', label: 'Aimbot', kind: 'toggle',
       section: 'Aimbot' },
-    { id: 'aimbot.bind',  store: AIMBOT, key: 'bind', label: 'Aimbot key', kind: 'keybind' },
+    { id: 'autoshoot.enabled', store: AUTOSHOOT, key: 'enabled', label: 'Autoshoot', kind: 'toggle' },
+    { id: 'tap.radius',   store: TAP_AIM, key: 'radius',  label: 'Snap radius', unit: 'u',     min: 1, max: 15, step: 0.5,  decimals: 1 },
     { id: 'aimbot.whitelist', store: AIM_WHITELIST, key: 'names', label: 'Never aim at',
       kind: 'textarea', rows: 4, maxLength: WHITELIST_MAX_CHARS,
       placeholder: 'One player name per line' },
     { id: 'tap.enabled',  store: TAP_AIM, key: 'enabled', label: 'Tap to aim', kind: 'toggle',
       section: 'Touch', touchOnly: true },
-    { id: 'tap.zone',     store: TAP_AIM, key: 'zone',    label: 'Stick zone', unit: '×', min: 1, max: 4,  step: 0.25, decimals: 2, touchOnly: true },
-    { id: 'tap.radius',   store: TAP_AIM, key: 'radius',  label: 'Snap radius', unit: 'u',     min: 1, max: 15, step: 0.5,  decimals: 1, touchOnly: true },
-    { id: 'esp.enabled',  store: ESP,    key: 'enabled', label: 'ESP overlay', kind: 'toggle',
-      section: 'ESP' },
-    { id: 'esp.losDim',   store: ESP,    key: 'losDim',  label: 'Dim blocked', kind: 'toggle' },
-    { id: 'esp.blockedAlpha', store: ESP, key: 'blockedAlpha', label: 'Blocked fade',      min: 0,    max: 1,    step: 0.05, decimals: 2 },
-    { id: 'esp.esp', store: ESP, key: 'esp', label: 'ESP', kind: 'toggle' },
-    { id: 'names.enemy',  store: NAME_TAGS, key: 'enabled', label: 'Enemy names', kind: 'toggle',
-      section: 'Name tags' },
     { id: 'bank.enabled', store: BANK,  key: 'enabled', label: 'Bank shots', kind: 'toggle',
-      section: 'Bank shots' },
-    { id: 'bank.prefer',  store: BANK,  key: 'prefer',  label: 'Prefer banks', kind: 'toggle' },
-    { id: 'autoshoot.enabled', store: AUTOSHOOT, key: 'enabled', label: 'Autoshoot', kind: 'toggle',
-      section: 'Autoshoot' },
-    { id: 'dodge.enabled',  store: DODGE, key: 'enabled',   label: 'Dodge bot', kind: 'toggle',
-      section: 'Dodge bot' },
-    { id: 'dodge.path',     store: DODGE, key: 'path',      label: 'Show plan', kind: 'toggle' },
-    { id: 'dodge.rings',    store: DODGE, key: 'rings',     label: 'Grenade rings', kind: 'toggle' },
-    { id: 'frag.enabled',   store: FRAGBOT, key: 'enabled',  label: 'Frag aim', kind: 'toggle' },
-    { id: 'dodge.horizon',  store: DODGE, key: 'horizon',   label: 'Horizon',      unit: 's',  min: 0.2,  max: 2,    step: 0.05, decimals: 2 },
-    { id: 'dodge.clearance', store: DODGE, key: 'clearance', label: 'Clearance',               min: 0.05, max: 1.5,  step: 0.05, decimals: 2 },
-    { id: 'dodge.halfLife', store: DODGE, key: 'halfLife',  label: 'Hit half-life', unit: 's', min: 0.1,  max: 5,    step: 0.05, decimals: 2 },
-    { id: 'dodge.leadK',    store: DODGE, key: 'leadK',     label: 'Ping lead',                min: 0,    max: 2,    step: 0.05, decimals: 2 },
-    { id: 'dodge.follow',   store: DODGE, key: 'follow',    label: 'Follow input',             min: 0,    max: 5,    step: 0.1,  decimals: 1 },
-    { id: 'dodge.phantom',  store: DODGE, key: 'phantom',   label: 'Firing lines',             min: 0,    max: 1,    step: 0.05, decimals: 2 },
-    { id: 'dodge.blast',    store: DODGE, key: 'blast',     label: 'Grenades',                 min: 0,    max: 1,    step: 0.05, decimals: 2 },
-    { id: 'dodge.stepS',    store: DODGE, key: 'stepS',     label: 'Step',         unit: 's',  min: 0.03, max: 0.3,  step: 0.01, decimals: 2 },
-    { id: 'dodge.cell',     store: DODGE, key: 'cell',      label: 'Grid',         unit: 'u',  min: 0.05, max: 0.5,  step: 0.05, decimals: 2 },
-    { id: 'aim.reactionMs',     store: AIM_HUMAN, key: 'reactionMs',     label: 'Reaction',  unit: 'ms', min: 0,    max: 400,  step: 5,    decimals: 0,
-      section: 'Aim humanization' },
-    { id: 'aim.followFraction', store: AIM_HUMAN, key: 'followFraction', label: 'Follow',                min: 0.01, max: 1,    step: 0.01, decimals: 2 },
-    { id: 'aim.deadLingerMs',   store: AIM_HUMAN, key: 'deadLingerMs',   label: 'Linger',    unit: 'ms', min: 0,    max: 2000, step: 50,   decimals: 0 },
-    { id: 'aim.pingLeadK',      store: AIM_HUMAN, key: 'pingLeadK',      label: 'Ping lead',             min: 0,    max: 1.5,  step: 0.05, decimals: 2 },
-    { id: 'swap.enabled',       store: AUTO_SWAP, key: 'enabled',        label: 'Auto-quickswap', kind: 'toggle',
-      section: 'Auto-quickswap' },
-    { id: 'swap.slowFire',      store: AUTO_SWAP, key: 'slowFireThreshold', label: 'Slow-fire', unit: 's', min: 0.1, max: 2,   step: 0.05, decimals: 2 },
-    { id: 'net.enabled',        store: NETCODE,   key: 'enabled',        label: 'Smoothing', kind: 'toggle',
-      section: 'Netcode smoothing' },
-    { id: 'net.jitterK',        store: NETCODE,   key: 'jitterK',        label: 'Jitter buf',            min: 0,    max: 5,    step: 0.1,  decimals: 1 },
-    { id: 'net.clockHalfLife',  store: NETCODE,   key: 'clockHalfLife',  label: 'Clock',     unit: ' pkt', min: 5,  max: 400,  step: 5,    decimals: 0 },
-    { id: 'net.renderLag',      store: NETCODE,   key: 'renderLag',      label: 'Playout',   unit: ' tick', min: 0, max: 2,   step: 0.05, decimals: 2 },
-    { id: 'hud.ping',           store: PING_UI,   key: 'enabled',        label: 'Ping readout', kind: 'toggle',
-      section: 'HUD' },
-    { id: 'zoom.factor',        store: ZOOM,      key: 'factor',         label: 'Zoom',      unit: '\u00d7', min: ZOOM_MIN, max: ZOOM_MAX, step: 0.05, decimals: 2,
-      section: 'Zoom' },
-    { id: 'debug.render',       store: DEBUG_RENDER, key: 'enabled',     label: 'Debug', kind: 'toggle',
-      section: 'Debug' },
+      section: 'Combat' },
+    { id: 'swap.enabled', store: AUTO_SWAP, key: 'enabled', label: 'Auto-quickswap', kind: 'toggle' },
+    { id: 'dodge.enabled', store: DODGE, key: 'enabled', label: 'Dodge bot', kind: 'toggle' },
+    { id: 'frag.enabled', store: FRAGBOT, key: 'enabled', label: 'Frag aim', kind: 'toggle' },
+    { id: 'esp.enabled',  store: ESP,    key: 'enabled', label: 'ESP overlay', kind: 'toggle',
+      section: 'Visuals' },
+    { id: 'esp.esp',      store: ESP,    key: 'esp',     label: 'ESP', kind: 'toggle' },
+    { id: 'names.enemy',  store: NAME_TAGS, key: 'enabled', label: 'Enemy names', kind: 'toggle' },
+    { id: 'hud.ping',     store: PING_UI, key: 'enabled', label: 'Ping readout', kind: 'toggle' },
+    { id: 'zoom.factor',  store: ZOOM,   key: 'factor',  label: 'Zoom', unit: '\u00d7', min: ZOOM_MIN, max: ZOOM_MAX, step: 0.05, decimals: 2 },
   ];
 
   // ---------------------------------------------------------------------
@@ -4521,11 +4433,7 @@
     for (const spec of SETTINGS_SPECS) {
       if (!(spec.id in saved)) continue;
       const v = saved[spec.id];
-      if (spec.kind === 'keybind') {
-        // null is a real value here — it is what an unbound row saves as.
-        if (v === null) { spec.store[spec.key] = null; continue; }
-        if (Number.isInteger(v) && v >= 0 && v <= 255 && !UNBINDABLE.has(v)) spec.store[spec.key] = v;
-      } else if (spec.kind === 'toggle') {
+      if (spec.kind === 'toggle') {
         if (v === 0 || v === 1) spec.store[spec.key] = v;
       } else if (spec.kind === 'textarea') {
         // Truncated rather than rejected, for the same reason a slider clamps:
@@ -4755,8 +4663,7 @@
     list.id = ELG_LIST_ID;
     pane.appendChild(list);
 
-    // The mirror image of the keybind row below: controls only a touchscreen
-    // can use. A touch-capable laptop gets them too, which is harmless.
+    // Controls only a touchscreen can use. A touch-capable laptop gets them too, which is harmless.
     const touchDevice = IS_MOBILE_DEVICE || touchActive() || navigator.maxTouchPoints > 0;
     for (const spec of SETTINGS_SPECS) {
       if (spec.touchOnly && !touchDevice) continue;
@@ -4765,68 +4672,6 @@
         heading.className = 'slider-text elg-heading';
         heading.textContent = spec.section;
         list.appendChild(heading);
-      }
-
-      // Keybind rows are survev's own markup, class for class: a
-      // `.ui-keybind-container` holding a `.btn-keybind-desc` anchor and a
-      // `.btn-keybind-display` box, with `.btn-keybind-desc-selected` applied
-      // while armed. That gets the shipped stylesheet to lay ours out exactly
-      // like the rows in the Keybinds tab, and the behaviour matches too:
-      // Escape cancels, Backspace unbinds, and the keys survev won't take
-      // leave the row armed instead of binding.
-      //
-      // Capture is a capture-phase window listener so the key never reaches the
-      // game, and `bindCapture` keeps the aimbot's own listener — registered
-      // first, at load, so it runs first — from engaging on the press.
-      if (spec.kind === 'keybind') {
-        // A phone has no key to hold: the trigger is the activation there, so
-        // the row would be a dead control. See aimEngaged.
-        if (IS_MOBILE_DEVICE || touchActive()) continue;
-        const row = document.createElement('div');
-        row.className = 'ui-keybind-container';
-        const desc = document.createElement('a');
-        desc.className = 'btn-game-menu btn-darken btn-keybind-desc';
-        desc.textContent = spec.label;
-        const display = document.createElement('div');
-        display.className = 'btn-keybind-display';
-        let listening = false;
-        const paint = () => {
-          display.textContent = keyName(spec.store[spec.key]);
-          desc.classList.toggle('btn-keybind-desc-selected', listening);
-        };
-        const stop = () => {
-          listening = false;
-          bindCapture = false;
-          window.removeEventListener('keydown', onCapture, true);
-          paint();
-        };
-        function onCapture(ev) {
-          ev.preventDefault();
-          ev.stopImmediatePropagation();
-          // Rejected key: stay armed and wait for another, as survev does.
-          if (UNBINDABLE.has(ev.keyCode)) return;
-          if (ev.keyCode !== 27) {
-            // A held old bind will never get its keyup once this changes, so
-            // drop the hold rather than leaving the aim loop running forever.
-            releaseAim();
-            spec.store[spec.key] = ev.keyCode === 8 ? null : ev.keyCode;
-            saveSettings();
-          }
-          stop();
-        }
-        paint();
-        desc.addEventListener('click', (e) => {
-          e.stopPropagation();
-          if (listening) { stop(); return; }
-          listening = true;
-          bindCapture = true;
-          paint();
-          window.addEventListener('keydown', onCapture, true);
-        });
-        row.appendChild(desc);
-        row.appendChild(display);
-        list.appendChild(row);
-        continue;
       }
 
       // Toggles reuse the menu-button look; sliders reuse the volume-slider
@@ -4976,9 +4821,6 @@
       // panes do. Falling back to append keeps this working if that button is
       // ever renamed or removed.
       const resume = document.getElementById('btn-game-resume');
-      // A rebuild throws away whatever row was mid-capture along with its
-      // listener, so clear the flag it owns or the bind would stay swallowed.
-      bindCapture = false;
       const pane = buildElgPane();
       if (resume && resume.parentElement === menu) menu.insertBefore(pane, resume);
       else menu.appendChild(pane);
@@ -5144,12 +4986,12 @@
         return true;
       }
       if (suppressedInputs.has(input)) return false;
-      return origPressed.call(this, input);
+      return origPressed.call(this, input) && !desktopFireTaken(input);
     };
     binds.isBindDown = function(input) {
       if (heldInputs.has(input)) return true;
       if (suppressedInputs.has(input)) return false;
-      return origDown.call(this, input);
+      return origDown.call(this, input) && !desktopFireTaken(input);
     };
     // Only wrapped when it exists, so a re-mangle that renames it degrades to
     // "the arrow keys still work while the dodge bot drives" rather than to a
@@ -5164,6 +5006,24 @@
     origIsBindPressed = origPressed;
     origIsBindDown = origDown;
     bindHookTarget = binds;
+  }
+
+  // A desktop click is a tap. On a pad the user's pull is taken off the message
+  // inside the pad hook; a mouse button's Fire comes through here instead, so
+  // this is where it is taken, by the same userShotSuppressed rules: while an
+  // enemy is selected near the cursor, the click is only the activation and
+  // autoshoot owns the trigger — firing if there's a shot on them, nothing if
+  // they're walled off. With nobody selected the click fires where it points.
+  // Asked from inside the input build, so the first frame of a click already
+  // agrees with the aim loop. Autoshoot's own presses never reach this: they
+  // are answered by the synthetic sets above before the real bind is read.
+  function desktopFireTaken(input) {
+    if (input !== AUTO_SWAP_INPUT_FIRE || touchActive()) return false;
+    try {
+      return userShotSuppressed(findLocalPlayerOnGame(capturedGame));
+    } catch {
+      return false;
+    }
   }
 
   // The user's own state of an input, with our synthetic layer bypassed.
@@ -10322,10 +10182,10 @@
   }
 
   window.addEventListener('keydown', (e) => {
-    // Never while a bind is being captured or the caret is in one of our own
+    // Never while the caret is in one of our own
     // fields — Tab is how you leave a form, and stealing it there would trap
     // the user in the settings pane.
-    if (e.keyCode !== DEBUG_HUD_KEY || bindCapture || typingInElgField()) return;
+    if (e.keyCode !== DEBUG_HUD_KEY || typingInElgField()) return;
     e.preventDefault();
     if (debugHud.held) return;          // key repeat
     debugHud.held = true;
@@ -12622,7 +12482,7 @@
   // still fades when there is no shot on them.
   function getLockedAimTarget(sample) {
     if (!sample?.enemies) return null;
-    if (!fragActive() && aimRafId && tapAimActive()) return touchConeTarget();
+    if (!fragActive() && aimRafId && pointAimActive()) return touchConeTarget();
     const id = fragActive() ? fragState.targetId
       : aimRafId ? aimState.targetId : null;
     if (id == null) return null;
@@ -13297,7 +13157,7 @@
   });
 
   // What the aim path is doing right now, for the enemy it would engage if
-  // Shift went down this instant. `source: 'sample'` means the clock declined
+  // Fire went down this instant. `source: 'sample'` means the clock declined
   // the lookup and it fell back to the 20ms ring — expected for the first
   // second of a round or an enemy that just came into view, a standing problem
   // otherwise. `leadMs` is reactionTarget's lead broken into its parts: the

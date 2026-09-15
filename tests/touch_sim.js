@@ -131,6 +131,7 @@ const elg = eval(`(function () {
   ${extract('touchDriveMove')}
   ${extract('touchReleaseMove')}
   ${extract('tapAimActive')}
+  ${extract('pointAimActive')}
   ${extract('tapInStickZone')}
   ${extract('tapClassify')}
   ${extract('tapGetMovement')}
@@ -173,7 +174,7 @@ const elg = eval(`(function () {
   ${extract('segHitCollider')}
   ${extract('colliderNearSegment')}
   ${extract('blockedOnlyByDestructibles')}
-  ${extract('touchShotSuppressed')}
+  ${extract('userShotSuppressed')}
   ${extract('userFireDown')}
   ${extract('userAim')}
   ${extract('userAimScore')}

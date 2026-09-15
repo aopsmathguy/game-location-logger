@@ -94,8 +94,8 @@ is the same precaution
 [auto-quickswap](#auto-quickswap-one-half-of-it-needed-moving) takes with its
 fire-edge detector, for the same reason.
 
-The "Aimbot key" row disappears from the MOD tab on a touch device, since it
-would be a dead control.
+A desktop now works the same way: there is no aimbot key, and a mouse click is
+treated exactly as a tap — see [Tap to aim](#tap-to-aim).
 
 ## ...and only the aimbot
 

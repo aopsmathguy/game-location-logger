@@ -6,7 +6,7 @@ isn't. Off by default; "Autoshoot" in the MOD tab.
 It rides on the aim helper rather than standing alone: the aimbot decides where
 the crosshair points and whether a shot exists at all, and autoshoot only
 decides whether to pull. So it does nothing unless the aimbot is enabled **and
-its key is held** — without that the crosshair isn't on anyone and "can the
+Fire is held** — without that the crosshair isn't on anyone and "can the
 enemy be hit" has no meaning.
 
 None of what follows has a mobile variant. Everything here presses through

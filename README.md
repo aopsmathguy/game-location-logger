@@ -31,12 +31,14 @@ by default — none of them touches input or gameplay state.
   one-bounce path off a reflecting surface and takes that instead. Off by
   default, as is "Prefer banks", which hunts for a bounce even when the direct
   line is open; see [Bank shots](docs/bank-shots.md#bank-shots).
-- **Aim helper** — once enabled by the "Aimbot" button in the MOD tab, holding
-  the aimbot key (Shift by default, rebindable on the row below it; on a phone
-  it is the trigger itself — see [On a phone](docs/mobile.md#on-a-phone)) suppresses
-  real mouse events and dispatches aim points each frame, onto whichever enemy
-  is nearest the user's cursor — recomputed every frame, with no commitment,
-  and counting a just-killed one as alive until its linger timer is up. If that
+- **Aim helper** — there is no aimbot key. With the "Aimbot" button on in the
+  MOD tab, a click works exactly like a tap on a phone (see
+  [On a phone](docs/mobile.md#on-a-phone)): while Fire is held, the enemy nearest
+  the cursor within the snap radius (10u by default, "Snap radius" in the MOD
+  tab) is selected. With a shot on them the aim locks on and autoshoot owns the
+  trigger; walled off, nothing fires; with nobody in the radius the click is an
+  ordinary shot at the cursor. Real mouse events are suppressed while engaged and
+  aim points dispatched each frame instead. If the selected
   enemy has no shot on them, it does nothing at all and
   replays the real cursor instead. Target positions, velocities and the lead
   point are all computed on the recovered server clock and led by the measured
@@ -80,8 +82,10 @@ by default — none of them touches input or gameplay state.
   players against that instead, which removes the stutter and the freezing
   without touching input or gameplay state. Live knobs are in the MOD tab;
   see [Netcode smoothing](docs/netcode.md#netcode-smoothing) below.
-- **Settings tab** — all live-tunable knobs live in a third tab ("MOD") in
-  survev's own Escape menu, alongside Settings and Keybinds, built from the
+- **Settings tab** — the feature switches, the snap radius, the whitelist and
+  zoom live in a third tab ("MOD") in survev's own Escape menu, alongside
+  Settings and Keybinds; every tuning knob keeps its coded default and stays
+  live on its `window.__*` store, built from the
   game's own markup and styles. Every value persists in `localStorage` under
   `elg_settings` and is validated against its own spec on load, so a stale or
   hand-edited entry can't drop a `NaN` into the aim or netcode paths.
@@ -247,12 +251,7 @@ Each feature's design notes, and why it works the way it does:
   the page's own JS context (required to read non-extension-exposed objects).
 - The overlay canvas is appended to the page body; it doesn't interfere
   with the game's own canvas.
-- The aim helper defaults to **Shift** (hold to engage) and is rebindable from
-  the Aimbot row in the MOD tab, which is survev's own keybind row — same
-  markup, same key names, same rules: click to arm, Escape cancels, Backspace
-  unbinds (leaving the aimbot off), and Ctrl/Alt/Win/Menu/F1–F12 are refused.
-  Binds are stored as legacy `keyCode`, so left and right modifiers are one
-  key. Mouse buttons aren't bindable — survev's rows accept them, ours don't.
+- The aim helper is engaged by the Fire bind itself — there is no separate key.
   The auto-quickswap is keybind-agnostic and triggers off the user's real
   Fire bind.
 - Netcode smoothing swaps three fields for accessors — the camera's

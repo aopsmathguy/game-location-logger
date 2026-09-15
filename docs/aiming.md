@@ -111,7 +111,7 @@ either — the aim helper does nothing at all. It does not fall through to the
 next-nearest enemy and it does not drag the crosshair onto someone unreachable;
 it replays the user's own cursor position and gets out of the way. That replay
 is necessary rather than cosmetic: real mousemoves are being swallowed for as
-long as the key is held, so the game sees only what we send it, and sending
+long as Fire is held, so the game sees only what we send it, and sending
 their position straight back is what "no aimbot" has to mean. The glide anchor
 is dropped at the same time, so re-engaging starts from where the mouse is now
 rather than sweeping across from wherever the last target stood.
