@@ -2302,7 +2302,7 @@
     // How near the finger, in world units, the nearest enemy has to be to be
     // selected. Selected means ringed green and, with a shot on them, locked
     // onto; see touchShotSuppressed for what happens without one.
-    radius: 5,
+    radius: 10,
   };
   window.__tapAim = TAP_AIM;
 

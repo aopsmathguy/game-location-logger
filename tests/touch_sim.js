@@ -1158,8 +1158,8 @@ const ME = { x: 0, y: 0, layer: 0 };
      pick({ id: 1, x: 8 + r + 4, y: 0 }) === null, `dead on the bearing, ${r + 4}u past the finger`);
   elg.resetCone();
   ok('select: a wide angle off the bearing is fine if the finger is close',
-     pick({ id: 1, x: 3, y: 3 }) === null && pick({ id: 1, x: 5, y: 3 }) !== null,
-     '(5, 3) is 31° off the bearing and 4.2u from the finger');
+     pick({ id: 1, x: 8, y: r + 1 }) === null && pick({ id: 1, x: 5, y: 3 }) !== null,
+     `(5, 3) is 31° off the bearing and 4.2u from the finger; (8, ${r + 1}) is outside the radius`);
 
   pick({ id: 1, x: 8, y: r - 1 });
   ok('select: the radius is a plain threshold, with no hold after an engagement',

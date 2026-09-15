@@ -222,7 +222,7 @@ override) runs unchanged on what the tap layer returns.
 A tap is a point, as a cursor is, so `userAim` goes back to returning one.
 `userAimScore` is the squared distance from the finger again. The limit on it is
 **distance, not angle**: the enemy nearest the finger is picked only if they are
-within `radius` world units of it (default 5). It is a plain threshold, with no
+within `radius` world units of it (default 10). It is a plain threshold, with no
 hold widening it after an engagement. A player dead on the finger's bearing but
 far past it is not picked, and one at a wide angle right next to the finger is.
 
