@@ -2299,12 +2299,11 @@
     // The stick's corner, in pad ranges out from the locked pad centre: that
     // far right of it and above it, and out to the screen edge the other ways.
     zone: 2,
-    // How near the finger, in world units, an enemy has to be for the aim
-    // helper to take the shot. Once one is, it widens by TAP_RADIUS_EXIT_MULT
-    // for TOUCH_CONE.holdMs, for the same reason the cone widens.
+    // How near the finger, in world units, the nearest enemy has to be to be
+    // selected. Selected means ringed green and, with a shot on them, locked
+    // onto; see touchShotSuppressed for what happens without one.
     radius: 5,
   };
-  const TAP_RADIUS_EXIT_MULT = 1.5;
   window.__tapAim = TAP_AIM;
 
   // Whether target selection should treat the user as pointing with a tap.
@@ -2487,17 +2486,21 @@
   // wants to shoot. That verdict comes off the aim loop's own solve rather
   // than a second one here — see aimCoverOnly.
   //
-  // With tap to aim, any wall hands it back, not just a crate. A stick with
-  // nobody to shoot has only a bearing to fire along, and firing along it into
-  // a wall is the thing the handoff was built to stop; a tap is a place the
-  // user asked to shoot, so declining the enemy leaves that as the shot.
+  // Tap to aim is stricter: with an enemy selected the finger never fires.
+  // If there is a shot on them the aim locks on and autoshoot fires; if there
+  // isn't, nothing fires at all, crate or wall. With autoshoot off the finger
+  // is still the trigger, but only once the aim has actually locked on, so it
+  // too never fires at a selected enemy it can't hit.
   function touchShotSuppressed(player) {
-    if (!AIMBOT.enabled || !AUTOSHOOT.enabled) return false;
+    if (!AIMBOT.enabled) return false;
+    const tap = tapAimActive();
+    if (!AUTOSHOOT.enabled && !tap) return false;
     const weapon = getCurrentWeapon(player);
     if (!weapon || GUN_FIRE_DELAY[weapon] === undefined) return false;
     const target = touchConeTarget();
     if (!target) return false;
-    return tapAimActive() ? !aimBlocked(target.id) : !aimCoverOnly(target.id);
+    if (tap) return AUTOSHOOT.enabled || aimState.targetId !== target.id;
+    return !aimCoverOnly(target.id);
   }
 
   // The enemy the aim helper would pick right now, cone included, or null.
@@ -3569,9 +3572,6 @@
     // and when that was last solved. See aimCoverOnly.
     coverId: null,
     coverAt: 0,
-    // The picked enemy when there is no shot on them at all, whatever is in
-    // the way; solved alongside coverId. See aimBlocked.
-    blockedId: null,
   };
 
   // How long the aim loop's cover verdict stands in for a fresh one: a few
@@ -3586,13 +3586,6 @@
   // which keeps the trigger autoshoot's, the conservative default.
   function aimCoverOnly(id) {
     return aimState.coverId != null && aimState.coverId === id
-      && performance.now() - aimState.coverAt < AIM_COVER_STALE_MS;
-  }
-
-  // Whether the aim loop's latest solve found no shot on `id` at all. The
-  // tap trigger's counterpart to aimCoverOnly, with the same no-verdict answer.
-  function aimBlocked(id) {
-    return aimState.blockedId != null && aimState.blockedId === id
       && performance.now() - aimState.coverAt < AIM_COVER_STALE_MS;
   }
 
@@ -3720,17 +3713,14 @@
   // widen it for the frames that follow if so. Every pickTarget caller shares
   // the one hold, so the aim, the trigger and the overlay's ring agree on it.
   // A tap's score is a squared distance from the finger instead, held to
-  // TAP_AIM's radius the same way.
+  // TAP_AIM's radius.
   function touchConeAdmits(aim, score) {
+    // A tap is a plain threshold with no hold: the enemy nearest the finger is
+    // selected exactly when they are within the radius of it.
+    if (aim.tap) return score <= TAP_AIM.radius * TAP_AIM.radius;
     const t = performance.now();
     const held = t - touchConeHeldAt < TOUCH_CONE.holdMs;
-    let limit;
-    if (aim.tap) {
-      const r = TAP_AIM.radius * (held ? TAP_RADIUS_EXIT_MULT : 1);
-      limit = r * r;
-    } else {
-      limit = (held ? TOUCH_CONE.exitDeg : TOUCH_CONE.enterDeg) * Math.PI / 180;
-    }
+    const limit = (held ? TOUCH_CONE.exitDeg : TOUCH_CONE.enterDeg) * Math.PI / 180;
     if (!(score <= limit)) return false;
     touchConeHeldAt = t;
     return true;
@@ -4029,7 +4019,6 @@
     aimState.coverId = (tgt && tgt.blocked && blockedOnlyByDestructibles(
       tgt.fromX, tgt.fromY, tgt.x, tgt.y, player.layer, PLAYER_RADIUS,
     )) ? enemy.id : null;
-    aimState.blockedId = (tgt && tgt.blocked) ? enemy.id : null;
     aimState.coverAt = performance.now();
 
     if (engage) {
@@ -4130,7 +4119,6 @@
     aimState.aimY = null;
     aimState.lastFrameAt = 0;
     aimState.coverId = null;
-    aimState.blockedId = null;
   }
 
   // Whether the aim helper is on this frame. On a desktop that is the bind
@@ -12629,8 +12617,13 @@
   // drawn from this, so it only ever means "being aimed at". An enemy that
   // would merely be picked, or one the helper declined because there is no
   // shot on them, stays an ordinary threat ring.
+  //
+  // Tap to aim rings the selection instead, blocked or not, for as long as an
+  // aim finger is down: the enemy nearest it within TAP_AIM.radius. The ring
+  // still fades when there is no shot on them.
   function getLockedAimTarget(sample) {
     if (!sample?.enemies) return null;
+    if (!fragActive() && aimRafId && tapAimActive()) return touchConeTarget();
     const id = fragActive() ? fragState.targetId
       : aimRafId ? aimState.targetId : null;
     if (id == null) return null;

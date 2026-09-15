@@ -108,7 +108,6 @@ const elg = eval(`(function () {
   const realBindDown = (binds, input) => !!(binds && binds.realDown(input));
   let capturedGame = null;
   ${grabBlock('TAP_AIM', '};')}
-  ${grabLine('TAP_RADIUS_EXIT_MULT')}
   ${grabLine('tapRoles')}
   ${grabLine('tapStickInput')}
   ${grabBlock('touchState', '};')}
@@ -161,7 +160,6 @@ const elg = eval(`(function () {
   ${extract('touchConeAdmits')}
   ${extract('pickTarget')}
   ${extract('aimCoverOnly')}
-  ${extract('aimBlocked')}
   ${extract('touchConeTarget')}
   // The cover sweep, over the scenario's obstacles.
   const getObstacles = () => env.obstacles;
@@ -395,7 +393,6 @@ function newScene() {
   elg.setField(null);
   elg.resetCone();
   elg.aimState.coverId = null;
-  elg.aimState.blockedId = null;
   // Sections 1–12 are the stock pads; tap to aim has its own section below.
   elg.TAP_AIM.enabled = 0;
   elg.resetTap();
@@ -1164,16 +1161,13 @@ const ME = { x: 0, y: 0, layer: 0 };
      pick({ id: 1, x: 3, y: 3 }) === null && pick({ id: 1, x: 5, y: 3 }) !== null,
      '(5, 3) is 31° off the bearing and 4.2u from the finger');
 
-  elg.resetCone();
-  const mid = r * (1 + 1.5) / 2;
   pick({ id: 1, x: 8, y: r - 1 });
-  ok('select: once engaged, it holds out to the wider exit radius',
-     pick({ id: 1, x: 8, y: mid }) !== null, `${mid}u from the finger`);
-  elg.resetCone();
-  ok('select: ...which is not where an engagement starts',
-     pick({ id: 1, x: 8, y: mid }) === null, `${mid}u cold`);
+  ok('select: the radius is a plain threshold, with no hold after an engagement',
+     pick({ id: 1, x: 8, y: r + 0.5 }) === null, `${r + 0.5}u right after one at ${r - 1}u`);
+  ok('select: of several, the one nearest the finger wins',
+     elg.pickTarget(ME, [{ id: 1, x: 8, y: 3 }, { id: 2, x: 9, y: 1 }], Date.now())[0]?.id === 2, '');
 
-  // ---- The trigger: the enemy's if there is a shot, the finger's if not ----
+  // ---- The trigger: autoshoot's if there is a shot, nobody's if not ----
   const pullAt = (enemy) => {
     elg.setField(ME, enemy ? [enemy] : []);
     fingers(down(400 + 8 * scale, 300));
@@ -1185,16 +1179,23 @@ const ME = { x: 0, y: 0, layer: 0 };
   ok('trigger: someone near it, autoshoot takes it',
      pullAt({ id: 1, x: 9, y: 1 }).shootHold === false, 'no verdict yet: the conservative default');
 
-  elg.aimState.blockedId = 1;
+  elg.aimState.coverId = 1;
   elg.aimState.coverAt = performance.now();
-  ok('trigger: a wall between us hands it back to the finger',
-     pullAt({ id: 1, x: 9, y: 1 }).shootHold === true, 'any cover, not only destructible');
-  elg.aimState.coverAt = performance.now() - (elg.AIM_COVER_STALE_MS + 10);
-  ok('trigger: ...but not off a stale verdict', pullAt({ id: 1, x: 9, y: 1 }).shootHold === false, '');
-  elg.aimState.coverAt = performance.now();
-  elg.aimState.blockedId = 2;
-  ok('trigger: ...or one about somebody else', pullAt({ id: 1, x: 9, y: 1 }).shootHold === false, '');
-  elg.aimState.blockedId = null;
+  ok('trigger: a walled-off selection fires nothing, not even at a crate',
+     pullAt({ id: 1, x: 9, y: 1 }).shootHold === false, 'the stick would hand this one back');
+  elg.aimState.coverId = null;
+
+  elg.setAutoshootEnabled(0);
+  elg.aimState.targetId = null;
+  ok('trigger: autoshoot off, a selection with no lock fires nothing',
+     pullAt({ id: 1, x: 9, y: 1 }).shootHold === false, '');
+  elg.aimState.targetId = 1;
+  ok('trigger: autoshoot off, once locked on the finger fires',
+     pullAt({ id: 1, x: 9, y: 1 }).shootHold === true, '');
+  ok('trigger: autoshoot off, nobody near the finger, the finger fires',
+     pullAt({ id: 1, x: 30, y: 30 }).shootHold === true, '');
+  elg.aimState.targetId = null;
+  elg.setAutoshootEnabled(1);
 
   elg.setAimbotEnabled(0);
   ok('trigger: with the aimbot off the finger always fires', pullAt({ id: 1, x: 9, y: 1 }).shootHold === true, '');

@@ -221,20 +221,27 @@ override) runs unchanged on what the tap layer returns.
 
 A tap is a point, as a cursor is, so `userAim` goes back to returning one.
 `userAimScore` is the squared distance from the finger again. The limit on it is
-**distance, not angle**: an enemy is only picked within `radius` world units of
-the finger (default 5, widening 1.5× under the same `holdMs` hold the cone
-uses). A player dead on the finger's bearing but far past it is not picked, and
-one at a wide angle right next to the finger is.
+**distance, not angle**: the enemy nearest the finger is picked only if they are
+within `radius` world units of it (default 5). It is a plain threshold, with no
+hold widening it after an engagement. A player dead on the finger's bearing but
+far past it is not picked, and one at a wide angle right next to the finger is.
 
-## The trigger: the enemy's if there is a shot, the finger's if not
+While an aim finger is down, the picked enemy gets the green ring **whether or
+not there is a shot on them**. The ring fades when they are walled off, as
+every blocked ring does.
+
+## The trigger: the enemy's if there is a shot, nobody's if not
 
 Ownership works as it does on the stick: autoshoot takes the trigger while there
-is a target. The difference is what a walled-off target does. On the stick only
-destructible cover hands the trigger back, because with nobody to shoot the
-stick has only a bearing to fire along. A tap is a place you asked to shoot, so
-**any** block hands it back. The aim loop records `blockedId` next to `coverId`,
-and `aimBlocked` reads it with the same 100ms staleness rule. With no verdict
-yet, on the first frame of a tap, the trigger stays autoshoot's.
+is a target. The difference is what a walled-off target does. On the stick,
+destructible cover hands the trigger back so the crate can be shot. On a tap,
+**nothing** hands it back: a selected enemy with no shot on them means no shot
+at all. To shoot scenery near an enemy, tap far enough from them that they
+aren't selected.
+
+With autoshoot off, the finger is still the trigger, but while an enemy is
+selected it only fires once the aim has locked on (`aimState.targetId`), so it
+never fires at a selected enemy it can't hit either.
 
 In practice:
 
@@ -243,8 +250,9 @@ In practice:
 | aimbot off | the finger, at the finger |
 | nobody within the radius | the finger, at the finger |
 | an enemy within it, in line of sight | autoshoot, at the enemy |
-| an enemy within it, walled off | the finger, at the finger |
+| an enemy within it, walled off | nothing |
 | aimbot on, autoshoot off, enemy in sight | the finger, at the enemy |
+| aimbot on, autoshoot off, enemy walled off | nothing |
 
 # Driving the aim
 
@@ -386,7 +394,9 @@ overlay ring and the frag solver — so they agree on it too. It's tunable live
 through `window.__touchCone`. A desktop has no cone: the cursor is a point, and
 its trigger is a separate finger.
 
-The overlay's green ring is not a preview of that selection. It marks only the
+On the stick, the overlay's green ring is not a preview of that selection
+(tap to aim is different, see
+[Selection: a radius, not a cone](#selection-a-radius-not-a-cone)). It marks only the
 enemy the aim is actually locked onto this frame: `aimState.targetId` while the
 aim loop is steering, or frag aim's target while it is solving a throw. An enemy
 that would be picked but has no shot on it, or no lock at all, leaves every
